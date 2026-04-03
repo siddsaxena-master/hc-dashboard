@@ -1637,8 +1637,9 @@ initKeyUI();initOwner();loadEvents();render();
 // ☁️  JSONBIN.IO CLOUD SYNC
 // ══════════════════════════════════════════════
 const JB_MASTER_KEY='$2a$10$u.rxXODnJDj/K3vQ33MIG.e8MJDtjUkLLFaYkcfOVF5KdiOqXLDoS';
+const JB_BIN_ID='69d01c2036566621a8785b92';
 let jbMasterKey=JB_MASTER_KEY;
-let jbBinId=localStorage.getItem('hc_jb_bin')||'';
+let jbBinId=JB_BIN_ID;
 let jbSyncing=false;
 
 // Auto-connect on load
@@ -1652,15 +1653,11 @@ let jbSyncing=false;
     if(inp)inp.style.display='none';
     if(connectBtn)connectBtn.style.display='none';
   }
-  if(jbBinId){
-    // Already have a bin — show connected UI and pull latest
-    updateJbUI(true);
-    jbPull();
-  } else {
-    // First time on this device — create the bin
-    setSyncStatus('<span class="sync-spinner"></span> Setting up cloud sync...','');
-    jbConnect();
-  }
+  // Bin ID is hardcoded — always connect and pull immediately
+  jbBinId=JB_BIN_ID;
+  localStorage.setItem('hc_jb_bin',JB_BIN_ID);
+  updateJbUI(true);
+  jbPull();
 })();
 
 function setSyncStatus(msg,type){
@@ -1685,42 +1682,13 @@ function updateJbUI(connected){
 }
 
 async function jbConnect(){
-  const key=jbMasterKey||JB_MASTER_KEY;
-  if(!key){alert('No API key found.');return;}
-  jbMasterKey=key;
-  localStorage.setItem('hc_jb_key',key);
-  setSyncStatus('<span class="sync-spinner"></span> Connecting...','');
-  // Try to find existing bin named 'hc_events'
-  try{
-    const listResp=await fetch('https://api.jsonbin.io/v3/b?collectionId=&limit=20',{
-      headers:{'X-Master-Key':jbMasterKey,'X-Bin-Name':'hc_events'}
-    });
-    // Just try to create/use a bin
-    if(!jbBinId){
-      // Create a new bin
-      const createResp=await fetch('https://api.jsonbin.io/v3/b',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','X-Master-Key':jbMasterKey,'X-Bin-Name':'hc_events','X-Bin-Private':'true'},
-        body:JSON.stringify({events:events})
-      });
-      if(!createResp.ok){
-        const err=await createResp.json();
-        throw new Error(err.message||'Could not create bin ('+createResp.status+')');
-      }
-      const createData=await createResp.json();
-      jbBinId=createData.metadata.id;
-      localStorage.setItem('hc_jb_bin',jbBinId);
-      updateJbUI(true);
-      setSyncStatus('✓ Connected! New cloud storage created. Auto-syncing...','ok');
-    } else {
-      // Pull existing data
-      await jbPull();
-      updateJbUI(true);
-    }
-  }catch(err){
-    setSyncStatus('Connection failed: '+err.message,'err');
-    console.error(err);
-  }
+  // Bin is pre-configured — just pull latest data
+  jbMasterKey=JB_MASTER_KEY;
+  jbBinId=JB_BIN_ID;
+  localStorage.setItem('hc_jb_key',JB_MASTER_KEY);
+  localStorage.setItem('hc_jb_bin',JB_BIN_ID);
+  updateJbUI(true);
+  await jbPull();
 }
 
 async function jbPush(silent=false){
