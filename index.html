@@ -1653,6 +1653,16 @@ function checkPin(){
     pinBuffer='';
     updatePinDots();
     render();
+    // Auto-pull latest cloud data after PIN unlock
+    jbPull();
+    // Start periodic background sync every 30 seconds
+    if(!window._jbSyncInterval){
+      window._jbSyncInterval=setInterval(()=>{
+        if(currentRole&&jbBinId&&jbMasterKey&&!jbSyncing){
+          jbPull();
+        }
+      },30000);
+    }
     // Show role badge in topbar
     const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
     document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
@@ -1692,6 +1702,15 @@ function initOwner(){
     document.getElementById('pin-overlay').classList.add('hidden');
     const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
     document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
+    // Auto-pull on session restore + start background sync
+    jbPull();
+    if(!window._jbSyncInterval){
+      window._jbSyncInterval=setInterval(()=>{
+        if(currentRole&&jbBinId&&jbMasterKey&&!jbSyncing){
+          jbPull();
+        }
+      },30000);
+    }
   }
 }
 function lockOwner(){
@@ -1810,7 +1829,7 @@ async function jbPush(silent=false){
 }
 
 async function jbPull(){
-  if(!jbMasterKey||!jbBinId){alert('Not connected. Enter your key and click Connect first.');return;}
+  if(!jbMasterKey||!jbBinId){return;} // silently skip if not connected
   setSyncStatus('<span class="sync-spinner"></span> Loading from cloud...','');
   try{
     const resp=await fetch('https://api.jsonbin.io/v3/b/'+jbBinId+'/latest',{
