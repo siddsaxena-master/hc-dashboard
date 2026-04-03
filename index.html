@@ -1,0 +1,1784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hamptons Coconuts — Event Tracker</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=DM+Serif+Display:ital@0;1&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --green:#1a3a2a;--green-mid:#2d5c42;--green-light:#22503a;--green-pale:#d4ede0;--green-wash:#eef7f2;--green-mid2:#a3d9b8;
+  --bg:#f5f3ee;--surface:#ffffff;--border:#e4dfd6;--border-mid:#cec8be;
+  --text:#1a1917;--text-muted:#6b6760;--text-hint:#a09c95;
+  --amber:#f59e0b;--amber-pale:#fef3c7;--amber-dark:#92400e;
+  --red:#dc2626;--red-pale:#fee2e2;--red-dark:#991b1b;
+  --fire:#ff4500;
+  --radius:10px;--radius-lg:16px;--radius-xl:20px;
+}
+body{font-family:'DM Sans',sans-serif;font-size:14px;color:var(--text);background:var(--bg);min-height:100vh}
+
+/* TOPBAR */
+.topbar{background:var(--green);padding:0 28px;display:flex;align-items:center;justify-content:space-between;height:58px;position:sticky;top:0;z-index:20;box-shadow:0 2px 12px rgba(0,0,0,0.18)}
+.brand{display:flex;align-items:center;gap:12px}
+.brand-icon{width:34px;height:34px;background:rgba(255,255,255,0.12);border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.brand-name{font-family:'DM Serif Display',serif;font-size:18px;color:#e8f5ec}
+.brand-sub{font-size:10px;color:#7bbf9a;letter-spacing:0.8px;text-transform:uppercase}
+.topbar-right{display:flex;align-items:center;gap:8px}
+.view-toggle{display:flex;background:rgba(0,0,0,0.2);border-radius:8px;padding:3px;gap:2px}
+.vt-btn{background:none;border:none;color:rgba(255,255,255,0.5);padding:5px 12px;border-radius:6px;font-size:12px;font-weight:500;font-family:'DM Sans',sans-serif;cursor:pointer;transition:all 0.15s}
+.vt-btn.active{background:rgba(255,255,255,0.15);color:#e8f5ec}
+.add-btn{background:#4ade80;color:#0d2418;border:none;border-radius:var(--radius);padding:8px 16px;font-size:13px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;transition:all 0.15s}
+.add-btn:hover{background:#86efac}
+.topbar-actions{display:flex;gap:6px}
+.icon-btn{background:rgba(255,255,255,0.1);border:none;color:#9fc9b0;border-radius:var(--radius);padding:7px 10px;font-size:12px;font-family:'DM Sans',sans-serif;cursor:pointer}
+.icon-btn:hover{background:rgba(255,255,255,0.18);color:#e8f5ec}
+
+/* API KEY BAR */
+.apikey-bar{background:#fffbeb;border-bottom:1px solid #fde68a;padding:8px 28px;display:flex;align-items:center;gap:10px;font-size:13px;flex-wrap:wrap}
+.apikey-bar input{flex:1;max-width:300px;font-size:13px;padding:6px 10px;border:1px solid #fcd34d;border-radius:7px;font-family:'DM Sans',sans-serif;background:#fff}
+.save-key{background:#f59e0b;color:#fff;border:none;border-radius:7px;padding:6px 12px;font-size:13px;font-family:'DM Sans',sans-serif;cursor:pointer;font-weight:500}
+.key-ok{color:#065f46;font-weight:500}
+
+/* URGENT BANNER */
+@keyframes pulse-bg{0%,100%{background:#fff1ee}50%{background:#ffe4dc}}
+.urgent-banner{border-bottom:2px solid var(--fire);display:none}
+.urgent-banner.has-alerts{display:block;animation:pulse-bg 2s ease-in-out infinite}
+.urgent-inner{max-width:1100px;margin:0 auto;padding:10px 28px;display:flex;align-items:flex-start;gap:12px}
+.urgent-icon{font-size:20px;flex-shrink:0}
+.urgent-title{font-size:12px;font-weight:600;color:var(--fire);margin-bottom:3px;letter-spacing:0.2px;text-transform:uppercase}
+.urgent-items{display:flex;flex-direction:column;gap:2px}
+.urgent-item{font-size:12px;color:#7f1d1d;display:flex;align-items:center;gap:6px;cursor:pointer}
+.urgent-item:hover{color:var(--fire)}
+.days-left{background:var(--fire);color:#fff;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700}
+
+/* STATS */
+.stats-area{padding:20px 28px 0;max-width:1100px;margin:0 auto}
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px 18px;position:relative;overflow:hidden}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.stat-card.c-green::before{background:linear-gradient(90deg,#4ade80,#16a34a)}
+.stat-card.c-blue::before{background:linear-gradient(90deg,#60a5fa,#2563eb)}
+.stat-card.c-amber::before{background:linear-gradient(90deg,#fbbf24,#d97706)}
+.stat-card.c-purple::before{background:linear-gradient(90deg,#c084fc,#9333ea)}
+.stat-icon{font-size:20px;margin-bottom:8px;display:block}
+.stat-val{font-size:24px;font-weight:600;letter-spacing:-0.5px;line-height:1}
+.stat-lbl{font-size:11px;color:var(--text-muted);margin-top:3px;text-transform:uppercase;letter-spacing:0.5px;font-weight:500}
+
+/* TWO-COLUMN LAYOUT */
+.two-col{max-width:1100px;margin:0 auto;padding:0 28px 32px;display:grid;grid-template-columns:1fr 1fr;gap:20px}
+
+/* SECTION HEADERS */
+.section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.section-title{font-family:'DM Serif Display',serif;font-size:17px;color:var(--green);display:flex;align-items:center;gap:8px}
+.section-badge{background:var(--green-pale);color:var(--green);border-radius:20px;padding:2px 9px;font-size:11px;font-weight:600;font-family:'DM Sans',sans-serif}
+.section-add{background:none;border:1px solid var(--border);border-radius:7px;padding:5px 10px;font-size:12px;font-family:'DM Sans',sans-serif;cursor:pointer;color:var(--text-muted)}
+.section-add:hover{background:var(--bg);color:var(--green);border-color:var(--green)}
+
+/* RECURRING ACCOUNT CARD */
+.account-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px 16px;margin-bottom:10px;cursor:pointer;transition:all 0.15s;border-left:4px solid transparent}
+.account-card:hover{border-color:var(--border-mid);box-shadow:0 3px 12px rgba(0,0,0,0.07);transform:translateY(-1px)}
+.account-card.market-ny{border-left-color:#3b82f6}
+.account-card.market-miami{border-left-color:#f43f5e}
+.account-card.urgent{animation:pulse-border 2s ease-in-out infinite}
+@keyframes pulse-border{0%,100%{box-shadow:0 0 0 2px rgba(255,69,0,0.1)}50%{box-shadow:0 0 0 3px rgba(255,69,0,0.2)}}
+.account-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}
+.account-name{font-size:14px;font-weight:600;letter-spacing:-0.2px}
+.account-venue{font-size:12px;color:var(--text-muted);margin-top:1px}
+.account-right{text-align:right;flex-shrink:0}
+.next-order{font-size:11px;color:var(--text-muted)}
+.next-date{font-size:12px;font-weight:600;color:var(--text)}
+.account-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.account-stats{display:flex;gap:12px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted)}
+.account-stat strong{color:var(--text);font-weight:600}
+.freq-badge{background:#e0e7ff;color:#3730a3;border-radius:20px;padding:2px 8px;font-size:10px;font-weight:600}
+
+/* ONE-TIME EVENT CARD */
+.event-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px 16px;margin-bottom:10px;cursor:pointer;transition:all 0.15s;border-left:4px solid transparent}
+.event-card:hover{border-color:var(--border-mid);box-shadow:0 3px 12px rgba(0,0,0,0.07);transform:translateY(-1px)}
+.event-card.market-ny{border-left-color:#3b82f6}
+.event-card.market-miami{border-left-color:#f43f5e}
+.event-card.pay-none{border-top:2px solid #cbd5e1}
+.event-card.pay-deposit{border-top:2px solid #fde047}
+.event-card.pay-partial{border-top:2px solid #fdba74}
+.event-card.pay-full{border-top:2px solid #86efac}
+.event-card.pay-done{border-top:2px solid #d1fae5}
+.event-card.urgent{animation:pulse-border 2s ease-in-out infinite}
+.event-card-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}
+.event-name{font-size:14px;font-weight:600;letter-spacing:-0.2px}
+.event-venue{font-size:12px;color:var(--text-muted);margin-top:1px}
+.event-date-block{text-align:right;flex-shrink:0}
+.event-date{font-size:12px;font-weight:600;color:var(--text)}
+.days-badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;margin-top:3px}
+.days-badge.soon{background:var(--red-pale);color:var(--red-dark)}
+.days-badge.upcoming{background:var(--green-pale);color:var(--green)}
+.days-badge.past{background:#f0ede8;color:var(--text-muted)}
+.event-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.event-pay{display:flex;align-items:center;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted)}
+.chk{color:#16a34a;font-weight:600}.xm{color:var(--red);font-weight:600}
+
+/* BADGES */
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:600}
+.b-lead{background:#ede9fe;color:#5b21b6}
+.b-deposit{background:#fef9c3;color:#854d0e;border:1px solid #fde047}
+.b-partial{background:#ffedd5;color:#9a3412;border:1px solid #fdba74}
+.b-stamp{background:#fdf4ff;color:#7e22ce;border:1px solid #e9d5ff}
+.b-paid{background:#dcfce7;color:#14532d;border:1px solid #86efac}
+.b-done{background:#f0ede8;color:var(--text-muted)}
+.b-passed{background:#f3f4f6;color:#9ca3af;border:1px solid #e5e7eb}
+.b-passed{background:#f3f4f6;color:#9ca3af;border:1px solid #e5e7eb;text-decoration:line-through}
+.b-overdue{background:var(--red-pale);color:var(--red-dark)}
+.b-stamp-none{background:#f0ede8;color:var(--text-muted)}
+.b-stamp-ordered{background:var(--amber-pale);color:var(--amber-dark)}
+.b-stamp-done{background:#dcfce7;color:#166534}
+.b-stamp-urgent{background:#fff1ee;color:var(--fire);border:1px solid #fca5a5}
+.b-png-ok{background:#dcfce7;color:#166534}
+.b-png-no{background:#fef9c3;color:#713f12;border:1px solid #fde047}
+.past-event{opacity:0.6;filter:grayscale(20%)}
+.passed-event{opacity:0.4;filter:grayscale(60%);border-left-color:#9ca3af!important}
+.passed-event:hover{opacity:0.7;filter:grayscale(20%)}
+.past-event:hover{opacity:0.85;filter:none}
+.passed-event{opacity:0.4;filter:grayscale(60%);border-left-color:#9ca3af!important}
+.passed-event:hover{opacity:0.65}
+.b-passed{background:#f3f4f6;color:#6b7280;border:1px solid #d1d5db}
+.past-event:hover{opacity:0.85;filter:none}
+.past-event .event-name::after{content:' — Past';font-size:10px;font-weight:400;color:var(--text-hint);margin-left:4px}
+.passed-event{opacity:0.4;filter:grayscale(50%);border-left-color:#d1d5db!important}
+.passed-event:hover{opacity:0.6}
+.passed-event .event-name,.passed-event .account-name{text-decoration:line-through;color:var(--text-muted)}
+.todo-panel{max-width:1100px;margin:0 auto;padding:0 28px 16px}
+.todo-inner{background:#fff;border:1px solid var(--border);border-radius:var(--radius-lg);overflow:hidden}
+.todo-header{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid var(--border);background:var(--bg)}
+.todo-title{font-size:13px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px}
+.todo-count{background:var(--red);color:#fff;border-radius:20px;padding:1px 8px;font-size:10px;font-weight:700}
+.todo-count.empty{background:var(--green-pale);color:var(--green)}
+.todo-item{display:flex;align-items:flex-start;gap:12px;padding:11px 18px;border-bottom:1px solid var(--border);cursor:pointer;transition:background 0.1s}
+.todo-item:last-child{border-bottom:none}
+.todo-item:hover{background:var(--bg)}
+.todo-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:4px}
+.todo-dot.urgent{background:var(--fire)}
+.todo-dot.warn{background:var(--amber)}
+.todo-dot.info{background:#3b82f6}
+.todo-dot.done{background:var(--green)}
+.todo-text{font-size:12px;color:var(--text);line-height:1.4;flex:1}
+.todo-text strong{font-weight:600}
+.todo-tag{font-size:10px;font-weight:600;padding:1px 7px;border-radius:20px;flex-shrink:0;margin-top:2px}
+.todo-tag.stamp{background:#fef3c7;color:#92400e}
+.todo-tag.payment{background:#dcfce7;color:#166534}
+.todo-tag.logo{background:#f3e8ff;color:#7e22ce}
+.todo-tag.delivery{background:#e0f2fe;color:#075985}
+.todo-tag.lead{background:#ede9fe;color:#5b21b6}
+.todo-tag.coi{background:#fef9c3;color:#713f12}
+.todo-empty{padding:14px 18px;font-size:12px;color:var(--green);font-weight:500;display:flex;align-items:center;gap:8px}
+
+/* MARKET PILLS */
+.m-ny{background:#1e3a5f;color:#bfdbfe;border:1px solid #3b82f6;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700}
+.m-miami{background:#7c1d1d;color:#fecdd3;border:1px solid #f43f5e;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700}
+.m-other{background:#3b1f6e;color:#e9d5ff;border:1px solid #8b5cf6;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700}
+
+/* EMPTY STATE */
+.empty-col{text-align:center;padding:32px 20px;color:var(--text-muted);font-size:13px;background:var(--surface);border:1px dashed var(--border);border-radius:var(--radius-lg)}
+.empty-col button{margin-top:10px;background:var(--green);color:#e8f5ec;border:none;border-radius:8px;padding:7px 16px;font-size:12px;font-weight:500;font-family:'DM Sans',sans-serif;cursor:pointer}
+
+/* CALENDAR VIEW */
+.cal-wrap{max-width:1100px;margin:0 auto;padding:0 28px 32px}
+.cal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.cal-title{font-family:'DM Serif Display',serif;font-size:22px;color:var(--green)}
+.cal-nav{display:flex;gap:8px}
+.cal-nav button{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 14px;font-size:13px;font-family:'DM Sans',sans-serif;cursor:pointer;font-weight:500}
+.cal-nav .today-btn{background:var(--green);color:#e8f5ec;border-color:var(--green)}
+.cal-grid-header{display:grid;grid-template-columns:repeat(7,1fr);margin-bottom:2px}
+.cal-day-name{text-align:center;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;padding:7px 0}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.cal-cell{background:var(--surface);min-height:96px;padding:7px;border-radius:7px}
+.cal-cell.other-month{opacity:0.45}
+.cal-cell.today{background:var(--green-wash);box-shadow:inset 0 0 0 2px var(--green-pale)}
+.cal-cell.today .cal-date{background:var(--green);color:#e8f5ec;border-radius:50%}
+.cal-date{font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:3px;width:22px;height:22px;display:flex;align-items:center;justify-content:center}
+.cal-ev{border-radius:3px;padding:2px 6px;font-size:10px;margin-bottom:2px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;border-left:2px solid transparent}
+.cal-ev.type-recurring{background:#e0e7ff;color:#3730a3;border-left-color:#6366f1}
+.cal-ev.type-event.market-ny{background:#eff6ff;color:#1e40af;border-left-color:#3b82f6}
+.cal-ev.type-event.market-miami{background:#ecfdf5;color:#065f46;border-left-color:#10b981}
+.cal-ev.type-event{background:var(--green-pale);color:var(--green);border-left-color:#16a34a}
+.cal-ev.cal-urgent{background:#fff1ee!important;color:var(--fire)!important;border-left-color:var(--fire)!important}
+.cal-more{font-size:9px;color:var(--text-hint);padding:1px 3px;font-weight:500}
+.cal-legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px;font-size:11px;color:var(--text-muted);align-items:center}
+
+/* MODAL */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:100;display:flex;align-items:flex-start;justify-content:center;padding:32px 16px;overflow-y:auto;backdrop-filter:blur(2px)}
+.modal{background:var(--surface);border-radius:var(--radius-xl);width:100%;max-width:580px;padding:26px;position:relative;margin-bottom:40px;box-shadow:0 24px 64px rgba(0,0,0,0.18)}
+.modal-title{font-family:'DM Serif Display',serif;font-size:20px;margin-bottom:6px;color:var(--green)}
+.modal-type-toggle{display:flex;gap:6px;margin-bottom:20px}
+.mtt-btn{flex:1;padding:8px;border-radius:8px;border:1px solid var(--border);background:#fff;font-size:12px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;color:var(--text-muted);transition:all 0.15s;text-align:center}
+.mtt-btn.active{background:var(--green);color:#e8f5ec;border-color:var(--green)}
+.modal-close{position:absolute;top:18px;right:20px;background:var(--bg);border:none;font-size:16px;cursor:pointer;color:var(--text-muted);width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center}
+.modal-close:hover{background:var(--border)}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.full{grid-column:1/-1}
+.field{display:flex;flex-direction:column;gap:4px}
+.flbl{font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px}
+input[type=text],input[type=email],input[type=tel],input[type=number],input[type=date],select,textarea{font-family:'DM Sans',sans-serif;font-size:13px;padding:8px 11px;border:1px solid var(--border);border-radius:var(--radius);background:#fff;color:var(--text);width:100%;outline:none;transition:border-color 0.15s}
+input:focus,select:focus,textarea:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(26,58,42,0.07)}
+textarea{resize:vertical;min-height:58px}
+.sec-hdr{font-size:10px;font-weight:700;color:var(--text-hint);text-transform:uppercase;letter-spacing:1px;grid-column:1/-1;padding-bottom:6px;border-bottom:1px solid var(--border);margin-top:8px}
+.modal-footer{display:flex;justify-content:flex-end;gap:8px;margin-top:20px;padding-top:16px;border-top:1px solid var(--border)}
+.btn{font-family:'DM Sans',sans-serif;font-size:13px;font-weight:500;padding:8px 18px;border-radius:var(--radius);cursor:pointer;border:1px solid var(--border);background:#fff;color:var(--text);transition:all 0.15s}
+.btn:hover{background:var(--bg)}
+.btn-primary{background:var(--green);color:#e8f5ec;border-color:var(--green)}
+.btn-primary:hover{background:var(--green-light)}
+.btn-danger{color:var(--red);border-color:transparent}
+.btn-danger:hover{background:var(--red-pale)}
+.inv-section{grid-column:1/-1;background:var(--green-wash);border:1px solid var(--green-pale);border-radius:var(--radius-lg);padding:14px 16px;display:flex;align-items:center;gap:12px}
+.pick-btn{background:var(--green);color:#e8f5ec;border:none;border-radius:var(--radius);padding:8px 16px;font-size:13px;font-family:'DM Sans',sans-serif;cursor:pointer;white-space:nowrap;flex-shrink:0;font-weight:500}
+.inv-hint{font-size:12px;color:var(--green-mid);line-height:1.5}
+.parsing-bar{grid-column:1/-1;background:var(--green-wash);border:1px solid var(--green-pale);border-radius:var(--radius);padding:11px 14px;display:flex;align-items:center;gap:9px;font-size:13px;color:var(--green-mid)}
+.spinner{width:15px;height:15px;border:2px solid var(--green-pale);border-top-color:var(--green);border-radius:50%;animation:spin 0.7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.ok-banner{grid-column:1/-1;background:var(--green-pale);border:1px solid var(--green-mid2);border-radius:var(--radius);padding:10px 14px;font-size:13px;color:var(--green);font-weight:500}
+.err-banner{grid-column:1/-1;background:var(--red-pale);border:1px solid #fca5a5;border-radius:var(--radius);padding:10px 14px;font-size:13px;color:var(--red-dark)}
+.err-detail{font-size:11px;margin-top:4px;opacity:0.75;word-break:break-all;font-family:monospace}
+input.autofilled{border-color:var(--green)!important;background:#f0faf5!important}
+.owner-lock{display:none}
+.owner-unlocked .owner-lock{display:block}
+.owner-hide{display:block}
+.owner-unlocked .owner-hide{display:none}
+.profit-card{background:linear-gradient(135deg,#0d2418,#1a3a2a);border-radius:var(--radius-lg);padding:16px 18px;margin-top:10px;color:#e8f5ec}
+.profit-card .p-label{font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:#7bbf9a;font-weight:600;margin-bottom:3px}
+.profit-card .p-val{font-size:22px;font-weight:700;color:#4ade80;letter-spacing:-0.5px}
+.profit-card .p-val.loss{color:#f87171}
+.profit-card .p-margin{font-size:12px;color:#9fc9b0;margin-top:2px}
+.cost-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.owner-banner{background:#0d2418;border-bottom:1px solid #1a3a2a;padding:8px 28px;display:flex;align-items:center;gap:10px;font-size:12px;color:#7bbf9a}
+.owner-banner input{width:100px;font-size:12px;padding:5px 8px;border:1px solid #2d5c42;border-radius:6px;background:#1a3a2a;color:#e8f5ec;font-family:'DM Sans',sans-serif}
+.owner-banner input::placeholder{color:#4a7c5f}
+.owner-banner button{background:#4ade80;color:#0d2418;border:none;border-radius:6px;padding:5px 12px;font-size:12px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer}
+.owner-badge{background:#4ade80;color:#0d2418;border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700;letter-spacing:0.5px}
+
+/* SYNC BAR */
+.sync-bar{background:#e8f5ff;border-bottom:1px solid #bfdbfe;padding:7px 28px;display:flex;align-items:center;gap:10px;font-size:12px;flex-wrap:wrap}
+.sync-btn{background:#1d4ed8;color:#fff;border:none;border-radius:7px;padding:6px 14px;font-size:12px;font-family:'DM Sans',sans-serif;cursor:pointer;font-weight:600;display:flex;align-items:center;gap:6px}
+.sync-btn:hover{background:#1e40af}
+.sync-btn:disabled{background:#93c5fd;cursor:not-allowed}
+.sync-status{font-size:12px;color:#1e40af;font-weight:500}
+.sync-ok{color:#065f46;font-weight:600}
+.sync-err{color:#991b1b;font-weight:600}
+.sync-spinner{width:13px;height:13px;border:2px solid #bfdbfe;border-top-color:#1d4ed8;border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block}
+.sheet-link{font-size:11px;color:#1d4ed8;text-decoration:none;font-weight:500}
+.sheet-link:hover{text-decoration:underline}
+
+.logo-preview{width:100%;max-height:120px;object-fit:contain;border-radius:8px;border:1px solid var(--border);background:#fafafa;padding:8px;cursor:pointer}
+.logo-upload-area{grid-column:1/-1;border:1.5px dashed var(--border-mid);border-radius:var(--radius-lg);padding:16px;text-align:center;cursor:pointer;transition:all 0.2s;background:#fafafa;position:relative}
+.logo-upload-area:hover{border-color:var(--green);background:var(--green-wash)}
+.logo-modal{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;cursor:pointer}
+.logo-modal img{max-width:90vw;max-height:90vh;border-radius:12px;object-fit:contain}
+
+/* ── MOBILE RESPONSIVE ── */
+@media (max-width: 768px) {
+  /* Topbar */
+  .topbar{padding:0 14px;height:52px}
+  .brand-name{font-size:16px}
+  .brand-sub{display:none}
+  .topbar-actions{display:none}
+  .view-toggle .vt-btn{padding:4px 9px;font-size:11px}
+  .add-btn{padding:7px 12px;font-size:12px}
+
+  /* API key bar */
+  .apikey-bar{padding:8px 14px;gap:8px}
+  .apikey-bar input{max-width:180px;font-size:12px}
+
+  /* Urgent banner */
+  .urgent-inner{padding:10px 14px}
+
+  /* Stats grid — 2x2 on mobile */
+  .stats-area{padding:14px 14px 0}
+  .stats-grid{grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+  .stat-card{padding:12px 14px}
+  .stat-icon{font-size:16px;margin-bottom:6px}
+  .stat-val{font-size:20px}
+  .stat-lbl{font-size:10px}
+
+  /* Two-col → single col */
+  .two-col{grid-template-columns:1fr;gap:0;padding:0 14px 24px}
+
+  /* Section heads */
+  .section-head{margin-bottom:8px;margin-top:16px}
+  .section-title{font-size:15px}
+
+  /* Cards */
+  .account-card,.event-card{padding:12px 14px;margin-bottom:8px}
+  .account-name,.event-name{font-size:13px}
+  .account-venue,.event-venue{font-size:11px}
+  .account-stats{gap:8px;font-size:10px;flex-wrap:wrap}
+  .badge{font-size:10px;padding:2px 7px}
+  .event-pay{font-size:10px;flex-wrap:wrap;gap:4px}
+
+  /* Calendar */
+  .cal-wrap{padding:0 14px 24px}
+  .cal-title{font-size:18px}
+  .cal-cell{min-height:60px;padding:4px}
+  .cal-ev{font-size:9px;padding:1px 4px}
+  .cal-day-name{font-size:9px;padding:5px 0}
+  .cal-legend{gap:8px;font-size:10px;margin-top:10px}
+
+  /* Reports */
+  #report-wrap{padding:0 14px 24px}
+  #report-wrap .stats-grid{grid-template-columns:1fr 1fr}
+  #report-wrap > div > div[style*="grid-template-columns: 1fr 1fr"]{
+    display:block !important;
+  }
+  #report-wrap > div > div[style*="grid-template-columns: 1fr 1fr"] > div{
+    margin-bottom:12px;
+  }
+
+  /* Modal */
+  .overlay{padding:16px 10px}
+  .modal{padding:18px 16px}
+  .modal-title{font-size:17px;margin-bottom:4px}
+  .form-grid{grid-template-columns:1fr;gap:10px}
+  .full{grid-column:1}
+  .sec-hdr{margin-top:6px}
+  .modal-type-toggle{gap:4px}
+  .mtt-btn{font-size:11px;padding:7px}
+  .modal-footer{gap:6px}
+  .btn{padding:8px 14px;font-size:12px}
+}
+
+@media (max-width: 380px) {
+  /* Tiny phones */
+  .stats-grid{grid-template-columns:1fr 1fr;gap:6px}
+  .stat-val{font-size:18px}
+  .topbar-right{gap:6px}
+  .view-toggle .vt-btn{padding:4px 7px;font-size:10px}
+}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-icon">🥥</div>
+    <div><div class="brand-name">Hamptons Coconuts</div><div class="brand-sub">Ops Dashboard</div></div>
+  </div>
+  <div class="topbar-right">
+    <div class="view-toggle">
+      <button class="vt-btn active" id="vt-list" onclick="setView('list')">≡ Dashboard</button>
+      <button class="vt-btn" id="vt-cal" onclick="setView('cal')">▦ Calendar</button>
+      <button class="vt-btn" id="vt-report" onclick="setView('report')">📊 Reports</button>
+    </div>
+    <div class="topbar-actions">
+      <button class="icon-btn owner-lock" onclick="lockOwner()" title="Lock owner view" style="color:#4ade80">🔒 Lock</button>
+      <button class="icon-btn" onclick="exportData()" title="Backup data">↓ Backup</button>
+      <button class="icon-btn" onclick="importData()" title="Restore data">↑ Restore</button>
+    </div>
+    <button class="add-btn" onclick="openNew()">+ New</button>
+  </div>
+</div>
+
+<div class="apikey-bar">
+  <span>🔑 Anthropic API key:</span>
+  <input type="password" id="apikey-input" placeholder="sk-ant-..." autocomplete="off">
+  <button class="save-key" onclick="saveKey()">Save</button>
+  <span id="key-status" style="font-size:12px;color:var(--text-muted)">Stored locally in your browser only</span>
+</div>
+
+<div class="owner-banner" id="owner-banner">
+  <span>🔐 Owner view:</span>
+  <input type="password" id="owner-pin-input" placeholder="Enter PIN" autocomplete="off" onkeydown="if(event.key==='Enter')checkOwnerPin()">
+  <button onclick="checkOwnerPin()">Unlock</button>
+  <span id="owner-status" style="color:#4a7c5f">Locked — profit data hidden</span>
+</div>
+<div class="sync-bar" id="sync-bar">
+  <span style="font-size:14px">☁️</span>
+  <span style="font-size:12px;color:#1e40af;font-weight:600">Cloud Sync:</span>
+  <span id="sync-status" class="sync-status">Connecting...</span>
+  <span style="flex:1"></span>
+  <button id="sync-now-btn" onclick="jbPush()" style="display:none;background:none;border:1px solid #bfdbfe;border-radius:6px;padding:4px 10px;font-size:11px;font-family:'DM Sans',sans-serif;cursor:pointer;color:#1d4ed8;font-weight:500">↑ Push</button>
+  <button id="sync-pull-btn" onclick="jbPull()" style="display:none;background:none;border:1px solid #bfdbfe;border-radius:6px;padding:4px 10px;font-size:11px;font-family:'DM Sans',sans-serif;cursor:pointer;color:#1d4ed8;font-weight:500">↓ Pull</button>
+</div>
+
+<div class="urgent-banner" id="urgent-banner">
+  <div class="urgent-inner">
+    <div class="urgent-icon">🚨</div>
+    <div>
+      <div class="urgent-title">Action required</div>
+      <div class="urgent-items" id="urgent-items"></div>
+    </div>
+  </div>
+</div>
+
+<div id="dashboard-view">
+  <div class="todo-panel" id="todo-panel">
+  <div class="todo-inner">
+    <div class="todo-header">
+      <div class="todo-title">✅ To-Do <span class="todo-count" id="todo-count">0</span></div>
+      <div style="font-size:11px;color:var(--text-muted)">Auto-generated from your events</div>
+    </div>
+    <div id="todo-list"></div>
+  </div>
+</div>
+<div class="stats-area"><div class="stats-grid" id="stats-grid"></div></div>
+  <div class="two-col">
+    <!-- RECURRING ACCOUNTS -->
+    <div>
+      <div class="section-head">
+        <div class="section-title">🔄 Recurring Accounts <span class="section-badge" id="recurring-count">0</span></div>
+        <button class="section-add" onclick="openNew('recurring')">+ Add account</button>
+      </div>
+      <div id="recurring-list"></div>
+    </div>
+    <!-- ONE-TIME EVENTS -->
+    <div>
+      <div class="section-head">
+        <div class="section-title">🎉 One-Time Events <span class="section-badge" id="events-count">0</span></div>
+        <button class="section-add" onclick="openNew('event')">+ Add event</button>
+      </div>
+      <div id="events-list"></div>
+    </div>
+  </div>
+</div>
+
+<div id="cal-wrap" class="cal-wrap" style="display:none"></div>
+<div id="report-wrap" style="display:none;max-width:1100px;margin:0 auto;padding:0 28px 32px"></div>
+
+<script>
+const STAGES=[
+  {id:'lead',label:'Lead'},
+  {id:'deposit_paid',label:'Deposit Paid'},
+  {id:'stamp_ordered',label:'Stamp Ordered'},
+  {id:'payment_full',label:'Fully Paid'},
+  {id:'completed',label:'Completed'},
+  {id:'passed',label:'Customer Passed'},
+];
+const STAMP_STATUSES=['Not ordered','Ordered — pending','Received'];
+const DAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
+const FREQ_OPTIONS=['Weekly','Bi-weekly','Monthly','Seasonal'];
+const SOURCE_OPTIONS=['Google Search','Cold Email Outreach','Referral — Event','Referral — Venue','WeddingPro / The Knot','Instagram / Social','Word of Mouth','Other'];
+const VENUE_TYPES=['Beach Club','Nightclub','Restaurant','Hotel','Country Club','Rooftop Bar','Yacht Club','Private Residence','Other'];
+const EVENT_TYPES=['Wedding','Corporate Event','Wellness Event','Birthday Party','Holiday Party','Networking Event','Product Launch','Charity Event','Bachelor/Bachelorette','Other'];
+
+let events=[], currentView='list', editingId=null;
+let calYear=new Date().getFullYear(), calMonth=new Date().getMonth();
+
+// ── API KEY
+function getKey(){return localStorage.getItem('hc_apikey')||'';}
+function saveKey(){
+  const k=document.getElementById('apikey-input').value.trim();
+  if(!k.startsWith('sk-')){alert('Should start with sk-ant-');return;}
+  localStorage.setItem('hc_apikey',k);
+  document.getElementById('key-status').textContent='✓ Key saved';
+  document.getElementById('key-status').className='key-ok';
+  document.getElementById('apikey-input').value='sk-ant-••••••••••••';
+}
+function initKeyUI(){
+  const k=getKey();
+  if(k){document.getElementById('apikey-input').value='sk-ant-••••••••••••';document.getElementById('key-status').textContent='✓ Key saved';document.getElementById('key-status').className='key-ok';}
+}
+
+// ── STORAGE
+const SEED=[
+  {id:'ev_seed_rafa',type:'event',name:'Rafael Ingannamorte — Another A Story',venue:'Another A Story',contact:'Rafael Ingannamorte',email:'',phone:'',event_date:'2026-04-08',coconuts:'24',stage:'payment_full',stamp_design:'Custom Logo Equipment',stamp_status:'Received',logo_received:'Yes',logo_data_url:'',source:'Referral — Event',event_end_date:'',coi_requested:false,debrief_issues:'',debrief_next:'',debrief_rating:'',crack_straw:'12',crack_circle:'',crack_whole:'12',pre_tax_amount:'761.23',tax_amount:'0',total_amount:'761.23',deposit_amount:'761.23',balance_amount:'0',pay_notes:'Paid in full',invoice_name:'Rafa_Event_HC_Invoice.pdf',invoice_url:'',delivery_date:'2026-04-08',delivery_time:'',delivery_notes:'216 Lafayette St, New York, NY',market:'ny',venue_type:'',event_type:'Corporate Event',followup_added:'',notes:'Invoice #1918'},
+  {id:'ev_seed_erin',type:'event',name:'Erin Cintron — Indian Creek Country Club',venue:'Indian Creek Country Club',contact:'Erin Cintron',email:'',phone:'',event_date:'2026-03-28',coconuts:'100',stage:'lead',stamp_design:'Custom Logo Equipment',stamp_status:'Not ordered',logo_received:'No',logo_data_url:'',source:'',event_end_date:'',coi_requested:false,debrief_issues:'Stamp size incorrect | No customer phone number | No walk-in cooler at venue',debrief_next:'Always confirm stamp dimensions before fabricating. Collect customer mobile at booking (mandatory). Confirm walk-in cooler availability with venue before delivery day.',debrief_rating:'2',crack_straw:'',crack_circle:'',crack_whole:'',pre_tax_amount:'1202.68',tax_amount:'0',total_amount:'1202.68',deposit_amount:'0',balance_amount:'0',pay_notes:'Payment pending',invoice_name:'Erin_Cintron_HC_Invoice.png',invoice_url:'',delivery_date:'2026-03-28',delivery_time:'',delivery_notes:'Indian Creek Country Club, Indian Creek, FL',market:'miami',venue_type:'Country Club',event_type:'',followup_added:'2026-03-22',notes:'Invoice #1890'}
+];
+
+function loadEvents(){
+  try{const r=localStorage.getItem('hc_events');if(r){events=JSON.parse(r);return;}}catch(e){}
+  events=SEED;saveEvents();
+}
+function saveEvents(){
+  localStorage.setItem('hc_events',JSON.stringify(events));
+  // Auto-sync to JSONBin if connected
+  if(jbBinId&&jbMasterKey){jbPush(true);}
+}
+
+// ── BACKUP / RESTORE
+function exportData(){
+  const blob=new Blob([JSON.stringify(events,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download='hc_backup_'+new Date().toISOString().slice(0,10)+'.json';a.click();URL.revokeObjectURL(url);
+}
+function importData(){
+  const inp=document.createElement('input');inp.type='file';inp.accept='.json';
+  inp.addEventListener('change',function(){
+    if(!this.files||!this.files[0])return;
+    const r=new FileReader();
+    r.onload=function(e){
+      try{
+        const imp=JSON.parse(e.target.result);
+        if(!Array.isArray(imp)){alert('Invalid backup file.');return;}
+        if(!confirm(`Import ${imp.length} events? This will replace your current ${events.length} events.`))return;
+        events=imp;saveEvents();render();alert('✓ '+imp.length+' events restored!');
+      }catch(err){alert('Could not read file: '+err.message);}
+    };r.readAsText(this.files[0]);
+  });inp.click();
+}
+
+// ── DATE HELPERS
+function parseLocalDate(s){if(!s)return null;const[y,m,d]=s.split('-').map(Number);return new Date(y,m-1,d);}
+function daysUntil(dateStr){
+  if(!dateStr)return null;
+  const today=new Date();today.setHours(0,0,0,0);
+  const d=parseLocalDate(dateStr);
+  return Math.round((d-today)/(1000*60*60*24));
+}
+function isStampUrgent(e){
+  if(e.stage==='completed')return false;
+  const d=daysUntil(e.event_date||e.delivery_date);
+  return d!==null&&d>=0&&d<=7&&e.stamp_status==='Not ordered';
+}
+
+// ── VIEW
+function setView(v){
+  currentView=v;
+  document.getElementById('vt-list').className='vt-btn'+(v==='list'?' active':'');
+  document.getElementById('vt-cal').className='vt-btn'+(v==='cal'?' active':'');
+  document.getElementById('vt-report').className='vt-btn'+(v==='report'?' active':'');
+  document.getElementById('dashboard-view').style.display=v==='list'?'block':'none';
+  document.getElementById('cal-wrap').style.display=v==='cal'?'block':'none';
+  document.getElementById('report-wrap').style.display=v==='report'?'block':'none';
+  if(v==='cal')renderCal();
+  if(v==='report')renderReports();
+}
+
+// ── RENDER
+
+function renderTodos(){
+  const today=new Date();today.setHours(0,0,0,0);
+  const todos=[];
+
+  events.filter(e=>e.stage!=='completed'&&e.stage!=='passed').forEach(e=>{
+    const evDate=parseLocalDate(e.event_date);
+    const days=evDate?Math.round((evDate-today)/(1000*60*60*24)):null;
+    const dep=parseFloat(e.deposit_amount)||0;
+    const tot=parseFloat(e.total_amount)||0;
+    const bal=parseFloat(e.balance_amount)||0;
+    const paid=dep+bal;
+    const hasPaid=dep>0||bal>0;
+
+    // 1. Stamp needs ordering — deposit or full payment received, stamp not ordered
+    if(hasPaid && e.stamp_status==='Not ordered' && e.logo_received!=='unbranded'){
+      const urgency=days!==null&&days<=7?'urgent':'warn';
+      todos.push({urgency,tag:'stamp',text:`<strong>Order stamp</strong> for ${e.name}${days!==null?' — event in '+days+' day'+(days===1?'':'s'):''}`,id:e.id});
+    }
+
+    // 2. Logo PNG not received but stamp not yet ordered
+    if(hasPaid && e.logo_received==='No' && e.stamp_status==='Not ordered'){
+      todos.push({urgency:'warn',tag:'logo',text:`<strong>Chase logo PNG</strong> from ${e.name} — needed before stamp can be ordered`,id:e.id});
+    }
+
+    // 3. COI requested but not yet sent (stage not completed)
+    if(e.coi_requested){
+      todos.push({urgency:'info',tag:'coi',text:`<strong>Send COI</strong> to ${e.name}`,id:e.id});
+    }
+
+    // 4. Balance still owed and event is upcoming within 14 days
+    if(days!==null&&days<=14&&days>=0&&tot>0&&paid<tot){
+      const owed=tot-paid;
+      todos.push({urgency:'warn',tag:'payment',text:`<strong>Collect balance</strong> from ${e.name} — $${owed.toLocaleString()} outstanding, event in ${days} day${days===1?'':'s'}`,id:e.id});
+    }
+
+    // 5. Delivery date set but no delivery time/address
+    if((e.delivery_date||e.event_date)&&(!e.delivery_time||!e.delivery_notes)){
+      const missing=[];
+      if(!e.delivery_time)missing.push('delivery window');
+      if(!e.delivery_notes)missing.push('delivery address');
+      if(days!==null&&days<=14&&days>=0){
+        todos.push({urgency:days<=3?'urgent':'info',tag:'delivery',text:`<strong>Confirm ${missing.join(' & ')}</strong> for ${e.name}`,id:e.id});
+      }
+    }
+
+    // 6. Lead with no follow-up activity and no recent contact
+    if(e.stage==='lead'&&e.followup_added){
+      const added=parseLocalDate(e.followup_added);
+      const daysSince=Math.round((today-added)/(1000*60*60*24));
+      if(daysSince>=7){
+        todos.push({urgency:'info',tag:'lead',text:`<strong>Follow up</strong> with ${e.name} — lead added ${daysSince} days ago`,id:e.id});
+      }
+    }
+
+    // 7. Event is tomorrow or today and stamp not received
+    if(days!==null&&days<=1&&days>=0&&e.stamp_status!=='Received'){
+      todos.push({urgency:'urgent',tag:'stamp',text:`<strong>${days===0?'TODAY':'TOMORROW'}: Stamp not received</strong> for ${e.name}`,id:e.id});
+    }
+  });
+
+  // Sort: urgent first, then warn, then info
+  const order={urgent:0,warn:1,info:2};
+  todos.sort((a,b)=>order[a.urgency]-order[b.urgency]);
+
+  const countEl=document.getElementById('todo-count');
+  const listEl=document.getElementById('todo-list');
+  if(!countEl||!listEl)return;
+
+  countEl.textContent=todos.length;
+  countEl.className='todo-count'+(todos.length===0?' empty':'');
+
+  if(!todos.length){
+    listEl.innerHTML='<div class="todo-empty">🎉 All clear — nothing urgent right now</div>';
+    return;
+  }
+
+  listEl.innerHTML=todos.map(t=>`<div class="todo-item" onclick="openEdit('${t.id}')">
+    <div class="todo-dot ${t.urgency}"></div>
+    <div class="todo-text">${t.text}</div>
+    <span class="todo-tag ${t.tag}">${t.tag==='stamp'?'Stamp':t.tag==='payment'?'Payment':t.tag==='logo'?'Logo':t.tag==='delivery'?'Delivery':t.tag==='lead'?'Lead':'COI'}</span>
+  </div>`).join('');
+}
+
+function render(){renderUrgent();renderTodos();renderStats();renderLists();if(currentView==='cal')renderCal();if(currentView==='report')renderReports();}
+
+function renderUrgent(){
+  const banner=document.getElementById('urgent-banner');
+  const itemsEl=document.getElementById('urgent-items');
+  const urgent=events.filter(e=>e.stage!=='passed'&&isStampUrgent(e)).sort((a,b)=>daysUntil(a.event_date||a.delivery_date)-daysUntil(b.event_date||b.delivery_date));
+  const leads=events.filter(e=>{
+    if(e.stage!=='lead'||!e.followup_added)return false;
+    const added=parseLocalDate(e.followup_added);const today=new Date();today.setHours(0,0,0,0);
+    const days=Math.round((today-added)/(1000*60*60*24));
+    return days>0&&days%7===0;
+  });
+  if(!urgent.length&&!leads.length){banner.classList.remove('has-alerts');return;}
+  banner.classList.add('has-alerts');
+  let html='';
+  urgent.forEach(e=>{
+    const d=daysUntil(e.event_date||e.delivery_date);
+    const lbl=d===0?'TODAY':d===1?'TOMORROW':`${d} DAYS`;
+    html+=`<div class="urgent-item" onclick="openEdit('${e.id}')"><span class="days-left">${lbl}</span><strong>${esc(e.name)}</strong> — stamp not ordered</div>`;
+  });
+  if(leads.length){
+    html+=`<div style="margin-top:${urgent.length?'6px':'0'}">`;
+    leads.forEach(e=>{html+=`<div class="urgent-item" onclick="openEdit('${e.id}')"><span class="days-left" style="background:#b45309">FOLLOW UP</span><strong>${esc(e.name)}</strong> — weekly follow-up due</div>`;});
+    html+='</div>';
+  }
+  itemsEl.innerHTML=html;
+}
+
+function renderStats(){
+  const recurring=events.filter(e=>e.type==='recurring'&&e.stage!=='passed');
+  const oneTime=events.filter(e=>e.type!=='recurring'&&e.stage!=='passed'&&e.stage!=='passed');
+  const nuts=events.reduce((s,e)=>s+(parseInt(e.coconuts)||0),0);
+  const coll=events.reduce((s,e)=>s+(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0),0);
+  const pend=events.filter(e=>e.stage!=='completed').reduce((s,e)=>s+Math.max(0,(parseFloat(e.total_amount)||0)-(parseFloat(e.deposit_amount)||0)-(parseFloat(e.balance_amount)||0)),0);
+  const costedEvents=events.filter(hasProfit);
+  const totalProfit=costedEvents.reduce((s,e)=>{const p=calcProfit(e);return s+p.profit;},0);
+  const ownerUnlocked=document.body.classList.contains('owner-unlocked');
+  document.getElementById('stats-grid').innerHTML=`
+    <div class="stat-card c-green"><span class="stat-icon">🔄</span><div class="stat-val">${recurring.length}</div><div class="stat-lbl">Recurring accounts</div></div>
+    <div class="stat-card c-blue"><span class="stat-icon">🎉</span><div class="stat-val">${oneTime.length}</div><div class="stat-lbl">One-time events</div></div>
+    <div class="stat-card c-amber"><span class="stat-icon">💰</span><div class="stat-val">$${Math.round(coll).toLocaleString()}</div><div class="stat-lbl">Revenue collected</div></div>
+    ${ownerUnlocked&&costedEvents.length
+      ?`<div class="stat-card owner-lock" style="background:linear-gradient(135deg,#0d2418,#1a3a2a);border-color:#2d5c42"><span class="stat-icon">📈</span><div class="stat-val" style="color:#4ade80">$${Math.round(totalProfit).toLocaleString()}</div><div class="stat-lbl" style="color:#7bbf9a">Est. profit</div></div>`
+      :`<div class="stat-card c-purple"><span class="stat-icon">⏳</span><div class="stat-val">$${Math.round(pend).toLocaleString()}</div><div class="stat-lbl">Pending payment</div></div>`
+    }`;
+}
+
+function stageBadge(stage){
+  const map={lead:'b-lead',deposit_paid:'b-deposit',partial_paid:'b-partial',stamp_ordered:'b-stamp',payment_full:'b-paid',completed:'b-done',passed:'b-passed',dnb:'b-dnb'};
+  const labels={lead:'⚪ Lead',deposit_paid:'🟡 Deposit',partial_paid:'🟠 Partial',stamp_ordered:'🔵 Stamp Ordered',payment_full:'🟢 Fully Paid',completed:'✓ Done',passed:'✕ Passed',dnb:'🚫 DNB'};
+  return `<span class="badge ${map[stage]||'b-lead'}">${labels[stage]||stage}</span>`;
+}
+function stampBadge(e,urgent){
+  if(urgent)return`<span class="badge b-stamp-urgent">🚨 ORDER STAMP</span>`;
+  if(e.stamp_status==='Received')return`<span class="badge b-stamp-done">✓ Stamp</span>`;
+  if(e.stamp_status==='Ordered — pending')return`<span class="badge b-stamp-ordered">⏳ Stamp</span>`;
+  return`<span class="badge b-stamp-none">No stamp</span>`;
+}
+function marketBadge(market){
+  if(market==='ny')return`<span class="m-ny">🗽 NY</span>`;
+  if(market==='miami')return`<span class="m-miami">🌴 MIA</span>`;
+  if(market==='other')return`<span class="m-other">📍 Other</span>`;
+  return'';
+}
+function sourceBadge(e){
+  if(!e.source)return'';
+  const icons={'Google Search':'🔍','Cold Email Outreach':'📧','Referral — Event':'🤝','Referral — Venue':'🤝','WeddingPro / The Knot':'💍','Instagram / Social':'📱','Word of Mouth':'💬','Other':'📌'};
+  const icon=icons[e.source]||'📌';
+  return`<span class="badge" style="background:#f8faff;color:#374151;border:1px solid #d1d5db">${icon} ${esc(e.source)}</span>`;
+}
+function debriefBadge(e){
+  if(!e.debrief_issues&&!e.debrief_rating)return'';
+  const stars={'5':'⭐⭐⭐⭐⭐','4':'⭐⭐⭐⭐','3':'⭐⭐⭐','2':'⭐⭐','1':'⭐'};
+  const s=stars[e.debrief_rating]||'';
+  return`<span class="badge" style="background:#fffbeb;color:#b45309;border:1px solid #fde68a" title="${esc(e.debrief_issues||'')}">${s} Debriefed</span>`;
+}
+function coiBadge(e){
+  if(!e.coi_requested)return'';
+  return'<span class="badge" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe">📋 COI requested</span>';
+}
+function logoBadge(e){
+  if(e.logo_received==='Yes')return`<span class="badge b-png-ok">✓ PNG</span>`;
+  if(e.logo_received==='No')return`<span class="badge b-png-no">⏳ PNG</span>`;
+  return'';
+}
+
+function renderLists(){
+  const recurring=events.filter(e=>e.type==='recurring').sort((a,b)=>a.name.localeCompare(b.name));
+  const today=new Date();today.setHours(0,0,0,0);
+  const oneTime=events.filter(e=>e.type!=='recurring').sort((a,b)=>{
+    const da=parseLocalDate(a.event_date)||new Date('9999-01-01');
+    const db=parseLocalDate(b.event_date)||new Date('9999-01-01');
+    const daEnd=a.event_end_date?parseLocalDate(a.event_end_date):da;
+    const dbEnd=b.event_end_date?parseLocalDate(b.event_end_date):db;
+    // Assign sort weight: 0=upcoming, 1=past, 2=passed, 3=dnb
+    function weight(e,endDate){
+      if(e.stage==='dnb')return 3;
+      if(e.stage==='passed')return 2;
+      if(endDate<today)return 1;
+      return 0;
+    }
+    const wa=weight(a,daEnd), wb=weight(b,dbEnd);
+    if(wa!==wb)return wa-wb;
+    return da-db;
+  });
+
+  document.getElementById('recurring-count').textContent=recurring.filter(e=>e.stage!=='passed'&&e.stage!=='dnb').length;
+  document.getElementById('events-count').textContent=oneTime.filter(e=>e.stage!=='passed'&&e.stage!=='dnb').length;
+
+  // Recurring accounts
+  const rl=document.getElementById('recurring-list');
+  if(!recurring.length){
+    rl.innerHTML=`<div class="empty-col"><div style="font-size:28px;margin-bottom:8px">🔄</div><p>No recurring accounts yet</p><p style="font-size:11px;margin-top:4px;color:var(--text-hint)">Venues that order weekly or regularly</p><button onclick="openNew('recurring')">+ Add account</button></div>`;
+  } else {
+    rl.innerHTML=recurring.map(e=>{
+      const urg=isStampUrgent(e);
+      const isAccPassed=e.stage==='passed';
+      const nextDate=e.next_order_date?parseLocalDate(e.next_order_date):null;
+      const d=daysUntil(e.next_order_date);
+      const dep=parseFloat(e.deposit_amount)||0,tot=parseFloat(e.total_amount)||0;
+      return `<div class="account-card market-${e.market||''}${urg?' urgent':''}${isAccPassed?' passed-event':''}" onclick="openEdit('${e.id}')">
+        <div class="account-top">
+          <div>
+            <div class="account-name">${esc(e.name||'Unnamed')}</div>
+            <div class="account-venue">${esc(e.venue||'')}${e.contact?' · '+esc(e.contact):''}</div>
+          </div>
+          <div class="account-right">
+            ${e.frequency?`<div class="freq-badge">${esc(e.frequency)}</div>`:''}
+            ${nextDate?`<div class="next-order" style="margin-top:4px">Next order</div><div class="next-date">${nextDate.toLocaleDateString('en-US',{month:'short',day:'numeric'})}</div>`:''}
+          </div>
+        </div>
+        <div class="account-meta">
+          ${marketBadge(e.market)}${e.venue_type?`<span class="badge" style="background:#f0f9ff;color:#075985;border:1px solid #bae6fd">${esc(e.venue_type)}</span>`:''}
+          ${stageBadge(e.stage)}${stampBadge(e,urg)}${logoBadge(e)}${coiBadge(e)}${debriefBadge(e)}${sourceBadge(e)}
+          ${e.coconuts?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🥥 ${e.coconuts} · 📦 ${(parseInt(e.coconuts)/9).toFixed(1)}box</span>`:''}
+        </div>
+        <div class="account-stats">
+          ${tot>0?`<span>Per order: <strong>$${parseFloat(tot).toLocaleString()}</strong></span>`:''}
+          ${e.market?`<span>Market: <strong>${e.market==='ny'?'Greater NY':e.market==='miami'?'Miami':'Other'}</strong></span>`:''}
+          ${e.notes?`<span style="margin-left:auto;color:var(--text-hint);font-style:italic">${esc(e.notes.slice(0,40))}${e.notes.length>40?'…':''}</span>`:''}
+        </div>
+        ${(function(){
+          if(!(e.cost_per_box||e.cost_labor||e.cost_other))return'';
+          if(!document.body.classList.contains('owner-unlocked'))return'';
+          const p=calcProfit(e);
+          var otherStr=p.other?' · Other $'+Math.round(p.other).toLocaleString():'';
+          var pc='<div class="profit-card">'
+            +'<div style="display:flex;justify-content:space-between;align-items:flex-start">'
+            +'<div><div class="p-label">Est. Profit</div>'
+            +'<div class="p-val '+(p.profit<0?'loss':'')+'">'+(p.profit<0?'-':'')+'$'+Math.abs(Math.round(p.profit)).toLocaleString()+'</div>'
+            +'<div class="p-margin">'+p.margin+'% margin &middot; $'+Math.round(p.revenue).toLocaleString()+' revenue</div></div>'
+            +'<div style="text-align:right"><div class="p-label">Cost breakdown</div>'
+            +'<div style="font-size:11px;color:#9fc9b0;margin-top:2px">COGS $'+Math.round(p.cogs).toLocaleString()+' &middot; Labor $'+Math.round(p.labor).toLocaleString()+otherStr+'</div>'
+            +'<div style="font-size:11px;color:#9fc9b0;margin-top:1px">Total cost: $'+Math.round(p.totalCost).toLocaleString()+'</div>'
+            +'</div></div></div>';
+          return pc;
+        })()}
+      </div>`;
+    }).join('');
+  }
+
+  // One-time events
+  const el=document.getElementById('events-list');
+  if(!oneTime.length){
+    el.innerHTML='<div class="empty-col"><div style="font-size:28px;margin-bottom:8px">🎉</div><p>No one-time events yet</p><p style="font-size:11px;margin-top:4px;color:var(--text-hint)">Private parties, corporate events, weddings</p><button onclick="openNew(\'event\')">+ Add event</button></div>';
+  } else {
+    const upcomingCount=oneTime.filter(e=>{const d=parseLocalDate(e.event_date);return d&&d>=today;}).length;
+    const noDateCount=oneTime.filter(e=>!e.event_date).length;
+    el.innerHTML=oneTime.map((e,i)=>{
+      const d=parseLocalDate(e.event_date);
+      const isPastItem=d&&d<today;
+      const prevE=oneTime[i-1];
+      const prevD=prevE?parseLocalDate(prevE.event_date):null;
+      const prevPast=prevD&&prevD<today;
+      // Insert divider when transitioning from upcoming to past
+      const isPassedItem=e.stage==='passed';
+      const isDnbItem=e.stage==='dnb';
+      const prevPassed=prevE&&prevE.stage==='passed';
+      const prevDnb=prevE&&prevE.stage==='dnb';
+      const divider=isDnbItem&&!prevDnb
+        ?'<div style="display:flex;align-items:center;gap:8px;margin:12px 0 8px;color:#dc2626;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.6px"><div style="flex:1;height:1px;background:#fecaca"></div>🚫 Do Not Book<div style="flex:1;height:1px;background:#fecaca"></div></div>'
+        :isPassedItem&&!prevPassed&&!prevDnb
+        ?'<div style="display:flex;align-items:center;gap:8px;margin:12px 0 8px;color:#9ca3af;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.6px"><div style="flex:1;height:1px;background:#e5e7eb"></div>Did not book<div style="flex:1;height:1px;background:#e5e7eb"></div></div>'
+        :(isPastItem&&!isPassedItem&&!isDnbItem&&(i===0||!prevPast||prevPassed))
+        ?'<div style="display:flex;align-items:center;gap:8px;margin:12px 0 8px;color:var(--text-hint);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.6px"><div style="flex:1;height:1px;background:var(--border)"></div>Past events<div style="flex:1;height:1px;background:var(--border)"></div></div>'
+        :'';
+      const urg=isStampUrgent(e);
+      const evDate=parseLocalDate(e.event_date);
+      const days=daysUntil(e.event_date);
+      const dep=parseFloat(e.deposit_amount)||0,bal=parseFloat(e.balance_amount)||0,tot=parseFloat(e.total_amount)||0;
+      let daysBadge='';
+      if(days!==null){
+        if(days<0)daysBadge=`<span class="days-badge past">${Math.abs(days)}d ago</span>`;
+        else if(days===0)daysBadge=`<span class="days-badge soon">Today</span>`;
+        else if(days<=7)daysBadge=`<span class="days-badge soon">${days}d</span>`;
+        else daysBadge=`<span class="days-badge upcoming">${days}d away</span>`;
+      }
+      const evEndDate=e.event_end_date?parseLocalDate(e.event_end_date):evDate;
+      const isPast=evDate&&evEndDate<today;
+      const isPassed=e.stage==='passed';
+      const payClass=e.stage==='payment_full'||e.stage==='completed'?'pay-full':e.stage==='partial_paid'?'pay-partial':e.stage==='deposit_paid'?'pay-deposit':e.stage==='stamp_ordered'?'pay-partial':'pay-none';
+      return divider+`<div class="event-card market-${e.market||''} ${payClass}${urg?' urgent':''}${isPast?' past-event':''}${isPassed?' passed-event':''}${isDnbItem?' dnb-event':''}" onclick="openEdit('${e.id}')">
+        <div class="event-card-top">
+          <div>
+            <div class="event-name">${esc(e.name||'Unnamed')}</div>
+            <div class="event-venue">${esc(e.venue||'')}${e.contact?' · '+esc(e.contact):''}</div>
+          </div>
+          <div class="event-date-block">
+            <div class="event-date">${evDate?evDate.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})+(e.event_end_date&&e.event_end_date!==e.event_date?' – '+parseLocalDate(e.event_end_date).toLocaleDateString('en-US',{month:'short',day:'numeric'}):''):'No date'}</div>
+            ${daysBadge}
+          </div>
+        </div>
+        <div class="event-meta">
+          ${marketBadge(e.market)}${e.venue_type?`<span class="badge" style="background:#f0f9ff;color:#075985;border:1px solid #bae6fd">${esc(e.venue_type)}</span>`:''}
+          ${stageBadge(e.stage)}${stampBadge(e,urg)}${logoBadge(e)}${coiBadge(e)}${debriefBadge(e)}${sourceBadge(e)}
+          ${e.coconuts?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🥥 ${e.coconuts} · 📦 ${(parseInt(e.coconuts)/9).toFixed(1)}box</span>`:''}
+          ${e.delivery_date?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🚚 ${parseLocalDate(e.delivery_date).toLocaleDateString('en-US',{month:'short',day:'numeric'})}${e.delivery_time?' '+e.delivery_time:''}</span>`:''}
+        </div>
+        ${(function(){
+          if(!tot)return'';
+          const pct=Math.min(100,Math.round((dep+bal)/tot*100));
+          const barColor=pct>=100?'#4ade80':pct>0?'#fbbf24':'#e5e7eb';
+          return '<div style="height:3px;background:#f0ede8;border-radius:2px;margin-bottom:6px;overflow:hidden">'
+            +'<div style="height:100%;width:'+pct+'%;background:'+barColor+';border-radius:2px;transition:width 0.3s"></div>'
+            +'</div>';
+        })()}
+        <div class="event-pay">
+          <span class="${dep>0?'chk':'xm'}">${dep>0?'✓':'○'}</span> <strong>$${dep.toLocaleString()}</strong> deposit
+          <span style="margin:0 4px">·</span>
+          <span class="${bal>0?'chk':'xm'}">${bal>0?'✓':'○'}</span> <strong>$${bal.toLocaleString()}</strong> balance
+          ${(function(){
+            if(!tot)return'';
+            var pre=parseFloat(e.pre_tax_amount)||0;
+            var tax=parseFloat(e.tax_amount)||0;
+            var s='<span style="margin-left:auto">';
+            if(tax>0)s+='Pre-tax: <strong>$'+pre.toLocaleString()+'</strong> &middot; Tax: <strong>$'+tax.toLocaleString()+'</strong> &middot; ';
+            s+='Total: <strong>$'+parseFloat(tot).toLocaleString()+'</strong></span>';
+            return s;
+          })()}
+          ${(e.delivery_date||e.event_date)?`<button type="button" onclick="event.stopPropagation();addToCalendarById('${e.id}')" style="margin-left:8px;display:inline-flex;align-items:center;gap:3px;background:var(--green-pale);color:var(--green);border:1px solid var(--green-mid2);border-radius:5px;padding:2px 8px;font-size:10px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap">📅 Add to Calendar</button>`:''}
+          <a href="${buildWhatsAppLink(e)}" target="_blank" onclick="event.stopPropagation()" style="display:inline-flex;align-items:center;gap:3px;background:#dcfce7;color:#15803d;border:1px solid #86efac;border-radius:5px;padding:2px 8px;font-size:10px;font-weight:600;text-decoration:none;white-space:nowrap">📱 Send Brief</a>
+        </div>
+        ${(function(){
+          if(!(e.cost_per_box||e.cost_labor||e.cost_other))return'';
+          if(!document.body.classList.contains('owner-unlocked'))return'';
+          const p=calcProfit(e);
+          const otherStr=p.other?' · Other $'+Math.round(p.other).toLocaleString():'';
+          return '<div class="profit-card">'
+            +'<div style="display:flex;justify-content:space-between;align-items:flex-start">'
+            +'<div><div class="p-label">Est. Profit</div>'
+            +'<div class="p-val '+(p.profit<0?'loss':'')+'">'+(p.profit<0?'-':'')+'$'+Math.abs(Math.round(p.profit)).toLocaleString()+'</div>'
+            +'<div class="p-margin">'+p.margin+'% margin &middot; $'+Math.round(p.revenue).toLocaleString()+' revenue</div></div>'
+            +'<div style="text-align:right"><div class="p-label">Cost breakdown</div>'
+            +'<div style="font-size:11px;color:#9fc9b0;margin-top:2px">COGS $'+Math.round(p.cogs).toLocaleString()+' &middot; Labor $'+Math.round(p.labor).toLocaleString()+otherStr+'</div>'
+            +'<div style="font-size:11px;color:#9fc9b0;margin-top:1px">Total cost: $'+Math.round(p.totalCost).toLocaleString()+'</div>'
+            +'</div></div></div>';
+        })()}
+      </div>`;
+    }).join('');
+  }
+}
+
+function addToCalendarById(id){
+  var e=events.find(function(x){return x.id===id;});
+  if(!e){alert('Event not found.');return;}
+  addToCalendar(e);
+}
+function addToCalendar(e){
+  var d=e.delivery_date||e.event_date||'';
+  var dEnd=e.event_end_date||e.delivery_date||e.event_date||d;
+  if(!d){alert('No event date or delivery date set for this event.');return;}
+  // Build details string
+  var nuts=parseInt(e.coconuts)||0;
+  var boxes=nuts?'('+( nuts/9).toFixed(1)+' boxes)':'';
+  var cracking=[];
+  if(e.crack_straw)cracking.push(e.crack_straw+' straw hole');
+  if(e.crack_circle)cracking.push(e.crack_circle+' circle');
+  if(e.crack_whole)cracking.push(e.crack_whole+' whole/uncracked');
+  var title=encodeURIComponent((e.delivery_date?'HC Delivery':'HC Event')+' - '+(e.name||'Event'));
+  var location=encodeURIComponent(e.delivery_notes||e.venue||'');
+  var desc='Hamptons Coconuts Delivery%0A';
+  desc+='Client: '+encodeURIComponent(e.name||'')+'%0A';
+  desc+='Venue: '+encodeURIComponent(e.venue||'')+'%0A';
+  if(e.delivery_notes)desc+='Address: '+encodeURIComponent(e.delivery_notes)+'%0A';
+  if(e.delivery_time)desc+='Window: '+encodeURIComponent(e.delivery_time)+'%0A';
+  desc+='Order: '+nuts+' coconuts '+boxes+'%0A';
+  if(cracking.length)desc+='Cracking: '+encodeURIComponent(cracking.join(', '))+'%0A';
+  desc+='Stamp: '+encodeURIComponent(e.stamp_status||'Not ordered');
+  // All-day event: dates as YYYYMMDD/YYYYMMDD
+  var dt=d.replace(/-/g,'');
+  var dtEnd=dEnd.replace(/-/g,'');
+  var url='https://calendar.google.com/calendar/render?action=TEMPLATE'
+    +'&text='+title
+    +'&dates='+dt+'/'+dtEnd
+    +'&details='+desc
+    +'&location='+location;
+  // Open in new tab/window — on iPhone with GCal app installed this opens the app
+  window.open(url,'_blank');
+}
+function buildWhatsAppLink(e){
+  var evDate=e.event_date?parseLocalDate(e.event_date).toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'}):'TBD';
+  var delivDate=e.delivery_date?parseLocalDate(e.delivery_date).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'}):'';
+  var nuts=parseInt(e.coconuts)||0;
+  var boxes=nuts?'('+( nuts/9).toFixed(1)+' boxes)':'';
+  var cracking=[];
+  if(e.crack_straw)cracking.push(e.crack_straw+' straw hole');
+  if(e.crack_circle)cracking.push(e.crack_circle+' circle');
+  if(e.crack_whole)cracking.push(e.crack_whole+' whole/uncracked');
+  var NL='\n';
+  var msg='HC HAMPTONS COCONUTS - DAY-OF BRIEF'+NL;
+  msg+='====================================='+NL+NL;
+  msg+='CLIENT: '+(e.name||'')+NL;
+  msg+='VENUE: '+(e.venue||'')+NL;
+  if(e.delivery_notes)msg+='ADDRESS: '+e.delivery_notes+NL;
+  msg+='EVENT DATE: '+evDate+NL;
+  if(delivDate&&e.delivery_time)msg+='DELIVERY: '+delivDate+' - '+e.delivery_time+NL;
+  else if(delivDate)msg+='DELIVERY DATE: '+delivDate+NL;
+  else if(e.delivery_time)msg+='DELIVERY WINDOW: '+e.delivery_time+NL;
+  msg+=NL+'ORDER'+NL;
+  msg+='- '+nuts+' coconuts '+boxes+NL;
+  if(cracking.length)msg+='- Cracking: '+cracking.join(', ')+NL;
+  msg+=NL+'STAMP: '+(e.stamp_status||'Not ordered')+NL;
+  if(e.stamp_design)msg+='Design: '+e.stamp_design+NL;
+  if(e.notes)msg+=NL+'NOTES: '+e.notes+NL;
+  msg+=NL+'=====================================';
+  return 'https://wa.me/?text='+encodeURIComponent(msg);
+}
+
+
+// ── CALENDAR
+function renderCal(){
+  const wrap=document.getElementById('cal-wrap');
+  const today=new Date();
+  const startDow=new Date(calYear,calMonth,1).getDay();
+  const daysInMonth=new Date(calYear,calMonth+1,0).getDate();
+  const totalCells=Math.ceil((startDow+daysInMonth)/7)*7;
+  const evByDate={};
+  events.forEach(e=>{
+    const dateKey=e.type==='recurring'?e.next_order_date:e.event_date;
+    if(!dateKey)return;
+    if(!evByDate[dateKey])evByDate[dateKey]=[];
+    evByDate[dateKey].push(e);
+  });
+  let cells='';
+  for(let i=0;i<totalCells;i++){
+    const d=new Date(calYear,calMonth,1+(i-startDow));
+    const isThisMonth=d.getMonth()===calMonth;
+    const isToday=d.toDateString()===today.toDateString();
+    const dateStr=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    const dayEvs=evByDate[dateStr]||[];
+    const shown=dayEvs.slice(0,3);const extra=dayEvs.length-3;
+    const evHtml=shown.map(e=>{
+      const urg=isStampUrgent(e);
+      const typeClass=e.type==='recurring'?'type-recurring':'type-event market-'+(e.market||'');
+      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}" onclick="event.stopPropagation();openEdit('${e.id}')" title="${esc(e.name)}">${e.type==='recurring'?'🔄 ':''}${esc(e.name)}</div>`;
+    }).join('');
+    cells+=`<div class="cal-cell${!isThisMonth?' other-month':''}${isToday?' today':''}">
+      <div class="cal-date">${d.getDate()}</div>${evHtml}${extra>0?`<div class="cal-more">+${extra}</div>`:''}
+    </div>`;
+  }
+  wrap.innerHTML=`
+    <div class="cal-header">
+      <div class="cal-title">${MONTHS[calMonth]} ${calYear}</div>
+      <div class="cal-nav">
+        <button onclick="calPrev()">← Prev</button>
+        <button class="today-btn" onclick="calToday()">Today</button>
+        <button onclick="calNext()">Next →</button>
+      </div>
+    </div>
+    <div class="cal-grid-header">${DAYS.map(d=>`<div class="cal-day-name">${d}</div>`).join('')}</div>
+    <div class="cal-grid">${cells}</div>
+    <div class="cal-legend">
+      <span style="font-weight:600">Legend:</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:#e0e7ff;border-left:2px solid #6366f1;margin-right:4px"></span>Recurring</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:#eff6ff;border-left:2px solid #3b82f6;margin-right:4px"></span>Event (NY)</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:#ecfdf5;border-left:2px solid #10b981;margin-right:4px"></span>Event (Miami)</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:#fff1ee;border-left:2px solid var(--fire);margin-right:4px"></span>🚨 Urgent</span>
+    </div>`;
+}
+function calPrev(){calMonth--;if(calMonth<0){calMonth=11;calYear--;}renderCal();}
+function calNext(){calMonth++;if(calMonth>11){calMonth=0;calYear++;}renderCal();}
+function calToday(){calYear=new Date().getFullYear();calMonth=new Date().getMonth();renderCal();}
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function openNew(type){editingId=null;buildModal({type:type||'event'});}
+function openEdit(id){editingId=id;buildModal(events.find(x=>x.id===id)||{});}
+
+// ── MODAL
+function buildModal(e){
+  const old=document.getElementById('modal-overlay');if(old)old.remove();
+  const isEdit=!!editingId;
+  const isRecurring=e.type==='recurring';
+  const div=document.createElement('div');
+  div.id='modal-overlay';div.className='overlay';
+  div.innerHTML=`<div class="modal">
+    <button class="modal-close" onclick="closeModal()">×</button>
+    <div class="modal-title">${isEdit?'Edit':'New'}</div>
+    <div class="modal-type-toggle">
+      <button class="mtt-btn${!isRecurring?' active':''}" id="tt-event" onclick="switchType('event')">🎉 One-time event</button>
+      <button class="mtt-btn${isRecurring?' active':''}" id="tt-recurring" onclick="switchType('recurring')">🔄 Recurring account</button>
+    </div>
+    <div class="form-grid" id="form-body">
+      ${formBody(e)}
+    </div>
+    <div class="modal-footer">
+      ${isEdit?`<button class="btn btn-danger" onclick="delEvent('${editingId}')">Delete</button>`:''}
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEvent()">Save</button>
+    </div>
+  </div>`;
+  document.body.appendChild(div);
+  div.addEventListener('click',ev=>{if(ev.target===div)closeModal();});
+  wirePickers();
+}
+
+function switchType(t){
+  document.getElementById('tt-event').className='mtt-btn'+(t==='event'?' active':'');
+  document.getElementById('tt-recurring').className='mtt-btn'+(t==='recurring'?' active':'');
+  const cur=getCurrentFormData();cur.type=t;
+  document.getElementById('form-body').innerHTML=formBody(cur);
+  wirePickers();
+}
+
+function formBody(e){
+  const isRecurring=e.type==='recurring';
+  return`
+    ${!editingId?`<div class="inv-section full">
+      <button class="pick-btn" id="inv-pick-btn" type="button">📄 Choose invoice</button>
+      <div class="inv-hint">Upload PDF or image — Claude autofills the form</div>
+    </div>
+    <div id="pstatus" class="full"></div>`:''}
+    <div class="sec-hdr">Details</div>
+    <div class="field full"><label class="flbl">Name / client</label><input type="text" id="f-name" value="${esc(e.name||'')}" placeholder="${isRecurring?'e.g. Surf Lodge':'e.g. Goldman Summer Party'}"></div>
+    <div class="field"><label class="flbl">Venue</label><input type="text" id="f-venue" value="${esc(e.venue||'')}" placeholder="Venue name"></div>
+    <div class="field"><label class="flbl">Contact</label><input type="text" id="f-contact" value="${esc(e.contact||'')}" placeholder="Contact person"></div>
+    <div class="field"><label class="flbl">Email</label><input type="email" id="f-email" value="${esc(e.email||'')}" placeholder="email@co.com"></div>
+    <div class="field"><label class="flbl">Phone</label><input type="tel" id="f-phone" value="${esc(e.phone||'')}" placeholder="+1 (631)..."></div>
+    <div class="field"><label class="flbl">Market</label><select id="f-market">
+      <option value="">— Select —</option>
+      <option value="ny"${e.market==='ny'?' selected':''}>🗽 Greater NY</option>
+      <option value="miami"${e.market==='miami'?' selected':''}>🌴 Miami</option>
+      <option value="other"${e.market==='other'?' selected':''}>📍 Other</option>
+    </select></div>
+    <div class="field"><label class="flbl">How did they find us?</label><select id="f-source">
+      <option value="">— Select source —</option>
+      ${SOURCE_OPTIONS.map(s=>`<option value="${s}"${e.source===s?' selected':''}>${s}</option>`).join('')}
+    </select></div>
+    <div class="field" style="grid-column:1/-1;display:flex;align-items:center;gap:10px;background:#f8faff;border:1px solid #dbeafe;border-radius:var(--radius);padding:10px 14px">
+      <input type="checkbox" id="f-coi-requested" ${e.coi_requested?'checked':''} style="width:16px;height:16px;accent-color:var(--green);flex-shrink:0;cursor:pointer">
+      <label for="f-coi-requested" style="font-size:13px;font-weight:500;cursor:pointer;margin:0">Customer requested a copy of our <strong>COI</strong> (Certificate of Insurance)</label>
+    </div>
+    ${isRecurring?`<div class="field"><label class="flbl">Venue type</label><select id="f-venue-type">
+      <option value="">— Select —</option>
+      ${VENUE_TYPES.map(t=>`<option value="${t}"${e.venue_type===t?' selected':''}>${t}</option>`).join('')}
+    </select></div>`:''}
+    ${!isRecurring?`<div class="field"><label class="flbl">Event type</label><select id="f-event-type">
+      <option value="">— Select —</option>
+      ${EVENT_TYPES.map(t=>`<option value="${t}"${e.event_type===t?' selected':''}>${t}</option>`).join('')}
+    </select></div>`:''}
+    ${isRecurring?`
+    <div class="sec-hdr">Schedule</div>
+    <div class="field"><label class="flbl">Frequency</label><select id="f-frequency">
+      ${FREQ_OPTIONS.map(f=>`<option value="${f}"${e.frequency===f?' selected':''}>${f}</option>`).join('')}
+    </select></div>
+    <div class="field"><label class="flbl">Next order date</label><input type="date" id="f-next-order-date" value="${e.next_order_date||''}"></div>
+    <div class="field"><label class="flbl">Typical order time</label><input type="text" id="f-order-time" value="${esc(e.order_time||'')}" placeholder="e.g. Mondays 10am"></div>
+    `:`
+    <div class="field"><label class="flbl">Event start date</label><input type="date" id="f-event-date" value="${e.event_date||''}"></div>
+    <div class="field" style="display:flex;align-items:center;gap:8px;padding-top:18px">
+      <input type="checkbox" id="f-multi-day" ${e.event_end_date?'checked':''} onchange="toggleMultiDay(this.checked)" style="width:15px;height:15px;accent-color:var(--green);cursor:pointer">
+      <label for="f-multi-day" style="font-size:13px;font-weight:500;cursor:pointer;margin:0">Multi-day event</label>
+    </div>
+    <div class="field" id="end-date-wrap" style="display:${e.event_end_date?'flex':'none'};flex-direction:column;gap:4px">
+      <label class="flbl">Event end date</label>
+      <input type="date" id="f-event-end-date" value="${e.event_end_date||''}">
+    </div>
+    `}
+    <div class="sec-hdr">Order</div>
+    <div class="field"><label class="flbl">Coconuts</label><input type="number" id="f-coconuts" value="${e.coconuts||''}" min="1" placeholder="e.g. 100" oninput="updateBoxCount(this.value)"></div>
+    <div class="field"><label class="flbl">Boxes <span style="font-weight:400;font-size:10px">(auto · 9/box)</span></label><input type="text" id="f-boxes" value="${e.coconuts?((parseInt(e.coconuts)/9).toFixed(1)+' boxes'):'—'}" readonly style="background:#f5f3ee;color:var(--text-muted);cursor:default"></div>
+    <div class="sec-hdr">Cracking breakdown</div>
+    <div class="field"><label class="flbl">Straw hole</label><input type="number" id="f-crack-straw" value="${e.crack_straw||''}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
+    <div class="field"><label class="flbl">Circle cracked</label><input type="number" id="f-crack-circle" value="${e.crack_circle||''}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
+    <div class="field"><label class="flbl">Whole</label><input type="number" id="f-crack-whole" value="${e.crack_whole||''}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
+    <div class="field"><label class="flbl">Total <span style="font-weight:400;font-size:10px">(vs coconuts)</span></label><input type="text" id="f-crack-total" value="${(function(){const s=parseInt(e.crack_straw||0),c=parseInt(e.crack_circle||0),w=parseInt(e.crack_whole||0),t=parseInt(e.coconuts||0);const sum=s+c+w;if(!sum&&!t)return'—';return sum+(t?' / '+t:'');})()}" readonly style="background:#f5f3ee;color:var(--text-muted);cursor:default"></div>
+    <div class="sec-hdr">Brass stamp</div>
+    <div class="field"><label class="flbl">Design / notes</label><textarea id="f-stamp-design">${esc(e.stamp_design||'')}</textarea></div>
+    <div class="field"><label class="flbl">Stamp status</label><select id="f-stamp-status">${STAMP_STATUSES.map(s=>`<option value="${s}"${e.stamp_status===s?' selected':''}>${s}</option>`).join('')}</select></div>
+    <div class="field"><label class="flbl">Logo PNG received?</label><select id="f-logo-received">
+      <option value=""${!e.logo_received?' selected':''}>— Not set —</option>
+      <option value="Yes"${e.logo_received==='Yes'?' selected':''}>✓ Yes — PNG received</option>
+      <option value="No"${e.logo_received==='No'?' selected':''}>✗ No — PNG not received</option>
+      <option value="unbranded"${e.logo_received==='unbranded'?' selected':''}>Unbranded Requested</option>
+    </select></div>
+    <div class="full">
+      <label class="flbl" style="display:block;margin-bottom:5px">Logo image <span style="font-weight:400;font-size:10px;text-transform:none">(upload PNG/JPG for day-of brief reference)</span></label>
+      ${e.logo_data_url
+        ? `<div style="position:relative;display:inline-block;width:100%">
+            <img src="${e.logo_data_url}" class="logo-preview" id="logo-preview-img" onclick="viewLogoFullscreen('${e.logo_data_url}')" title="Click to view full size">
+            <button type="button" onclick="clearLogo()" style="position:absolute;top:4px;right:4px;background:rgba(0,0,0,0.5);color:#fff;border:none;border-radius:50%;width:22px;height:22px;cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center">×</button>
+           </div>`
+        : `<div class="logo-upload-area" id="logo-upload-area" onclick="document.getElementById('logo-file-input').click()">
+            <div style="font-size:22px;margin-bottom:6px">🖼</div>
+            <div style="font-size:13px;font-weight:500;color:var(--text-muted)">Upload logo image</div>
+            <div style="font-size:11px;color:var(--text-hint);margin-top:2px">PNG, JPG — shown in event for day-of reference</div>
+           </div>`
+      }
+      <input type="hidden" id="f-logo-data-url" value="">
+    </div>
+    <div class="sec-hdr">Pipeline</div>
+    <div class="field"><label class="flbl">Stage</label><select id="f-stage" onchange="onStageChange(this.value)">${STAGES.map(s=>`<option value="${s.id}"${e.stage===s.id?' selected':''}>${s.label}</option>`).join('')}</select></div>
+    <div class="sec-hdr">Payment</div>
+    <div class="field"><label class="flbl">Pre-tax total ($) <span style="font-weight:400;font-size:9px;color:var(--text-hint)">used for profit calc</span></label><input type="number" id="f-pretax" value="${e.pre_tax_amount||''}" placeholder="0.00" oninput="autoCalcTax()"></div>
+    <div class="field"><label class="flbl">Tax ($)</label><input type="number" id="f-tax" value="${e.tax_amount||''}" placeholder="0.00" oninput="autoCalcTax()"></div>
+    <div class="field"><label class="flbl">Total incl. tax ($)</label><input type="number" id="f-total" value="${e.total_amount||''}" placeholder="0.00" style="background:#f5f3ee;color:var(--text-muted)" readonly></div>
+    <div class="field"><label class="flbl">Deposit received ($)</label><input type="number" id="f-deposit" value="${e.deposit_amount||''}" placeholder="0.00"></div>
+    <div class="field"><label class="flbl">Balance received ($)</label><input type="number" id="f-balance" value="${e.balance_amount||''}" placeholder="0.00"></div>
+    <div class="field"><label class="flbl">Payment notes</label><input type="text" id="f-pay-notes" value="${esc(e.pay_notes||'')}" placeholder="Venmo, check #1024"></div>
+    ${!isRecurring?`
+    <div class="sec-hdr">Delivery</div>
+    <div class="field"><label class="flbl">Delivery date</label><input type="date" id="f-delivery-date" value="${e.delivery_date||''}"></div>
+    <div class="field"><label class="flbl">Time window</label><input type="text" id="f-delivery-time" value="${esc(e.delivery_time||'')}" placeholder="e.g. 10am – 2pm"></div>
+    <div class="field full"><label class="flbl">Delivery address / notes</label><input type="text" id="f-delivery-notes" value="${esc(e.delivery_notes||'')}" placeholder="Address, loading dock, call on arrival..."></div>
+    `:''}
+    <div class="sec-hdr">Invoice</div>
+    <div class="field"><label class="flbl">Invoice filename</label><input type="text" id="f-inv" value="${esc(e.invoice_name||'')}" placeholder="e.g. Invoice_2026.pdf"></div>
+    <div class="field"><label class="flbl">Google Drive link</label><input type="text" id="f-inv-url" value="${esc(e.invoice_url||'')}" placeholder="https://drive.google.com/file/d/..."></div>
+
+    <div class="sec-hdr owner-lock" style="color:#4ade80;border-bottom-color:#1a3a2a;background:#0d2418;margin-left:-26px;margin-right:-26px;padding-left:26px;padding-right:26px">💰 Costs & Profit <span style="font-size:9px;font-weight:400;color:#7bbf9a">(owner only)</span></div>
+    <div class="owner-lock cost-row full">
+      <div class="field"><label class="flbl" style="color:#7bbf9a">Cost per box ($)</label><input type="number" id="f-cost-per-box" value="${e.cost_per_box||''}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
+      <div class="field"><label class="flbl" style="color:#7bbf9a">Labor cost ($)</label><input type="number" id="f-cost-labor" value="${e.cost_labor||''}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
+      <div class="field"><label class="flbl" style="color:#7bbf9a">Other costs ($)</label><input type="number" id="f-cost-other" value="${e.cost_other||''}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
+    </div>
+    <div class="sec-hdr">Notes</div>
+    <div class="field full"><textarea id="f-notes" placeholder="Any other notes...">${esc(e.notes||'')}</textarea></div>
+    <div class="sec-hdr" style="color:#b45309;border-bottom-color:#fde68a">📋 Post-Event Debrief</div>
+    <div class="field full">
+      <label class="flbl" style="display:block;margin-bottom:8px">Issues encountered <span style="font-weight:400;text-transform:none;font-size:10px">(check all that apply)</span></label>
+      <div id="debrief-checkboxes" style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+        ${[
+          'Stamp size incorrect',
+          'Stamp arrived late',
+          'Logo PNG not received in time',
+          'No customer phone number',
+          'No walk-in cooler at venue',
+          'Delivery window miscommunication',
+          'Wrong coconut quantity',
+          'Cracking breakdown error',
+          'Late delivery',
+          'Venue access issues',
+          'Payment collected late',
+          'Customer hard to reach',
+          'Coconuts not fresh enough',
+          'Packaging issue',
+        ].map(issue => {
+          const checked=(e.debrief_issues||'').split('|').map(s=>s.trim()).includes(issue);
+          return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:${checked?'var(--green-pale)':'#fff'};color:${checked?'var(--green)':'var(--text)'}">
+            <input type="checkbox" name="debrief-issue" value="${issue}" ${checked?'checked':''} onchange="updateDebriefStyle(this)" style="accent-color:var(--green)">
+            ${issue}
+          </label>`;
+        }).join('')}
+      </div>
+      <div style="margin-top:8px">
+        <input type="text" id="f-debrief-other" value="${esc((e.debrief_issues||'').split('|').find(s=>!['Stamp size incorrect','Stamp arrived late','Logo PNG not received in time','No customer phone number','No walk-in cooler at venue','Delivery window miscommunication','Wrong coconut quantity','Cracking breakdown error','Late delivery','Venue access issues','Payment collected late','Customer hard to reach','Coconuts not fresh enough','Packaging issue'].includes(s.trim()))?.trim()||'')}" placeholder="Other issue (type here)...">
+      </div>
+    </div>
+    <div class="field full"><label class="flbl">Remember for next time</label><textarea id="f-debrief-next" placeholder="Key takeaways and action items for future events...">${esc(e.debrief_next||'')}</textarea></div>
+    <div class="field"><label class="flbl">Overall rating</label><select id="f-debrief-rating">
+      <option value="">— Rate this event —</option>
+      <option value="5"${e.debrief_rating==='5'?' selected':''}>⭐⭐⭐⭐⭐ Flawless</option>
+      <option value="4"${e.debrief_rating==='4'?' selected':''}>⭐⭐⭐⭐ Good, minor issues</option>
+      <option value="3"${e.debrief_rating==='3'?' selected':''}>⭐⭐⭐ OK, notable issues</option>
+      <option value="2"${e.debrief_rating==='2'?' selected':''}>⭐⭐ Rough, needs work</option>
+      <option value="1"${e.debrief_rating==='1'?' selected':''}>⭐ Major problems</option>
+    </select></div>`;
+}
+
+function wirePickers(){
+  const pb=document.getElementById('inv-pick-btn');
+  if(pb)pb.addEventListener('click',()=>{const i=document.createElement('input');i.type='file';i.accept='.pdf,image/*';i.style.display='none';document.body.appendChild(i);i.addEventListener('change',function(){if(this.files&&this.files[0])onInvoiceFile(this.files[0]);document.body.removeChild(i);});i.click();});
+  // Logo file input
+  const logoInp=document.getElementById('logo-file-input');
+  if(!logoInp){
+    const li=document.createElement('input');
+    li.type='file';li.accept='image/*';li.id='logo-file-input';li.style.display='none';
+    document.body.appendChild(li);
+    li.addEventListener('change',function(){
+      if(!this.files||!this.files[0])return;
+      const reader=new FileReader();
+      reader.onload=function(ev){
+        const dataUrl=ev.target.result;
+        document.getElementById('f-logo-data-url').value=dataUrl;
+        // Replace upload area with preview
+        const area=document.getElementById('logo-upload-area');
+        if(area){
+          window._currentLogoUrl=dataUrl;
+          area.outerHTML='<div style="position:relative;display:inline-block;width:100%"><img id="logo-preview-img" class="logo-preview" title="Click to view full size"><button type="button" onclick="clearLogo()" style="position:absolute;top:4px;right:4px;background:rgba(0,0,0,0.5);color:#fff;border:none;border-radius:50%;width:22px;height:22px;cursor:pointer;font-size:13px;line-height:1">×</button></div>';
+          const pImg=document.getElementById('logo-preview-img');
+          if(pImg){pImg.src=dataUrl;pImg.onclick=function(){viewLogoFullscreen(window._currentLogoUrl);};}
+        }
+      };
+      reader.readAsDataURL(this.files[0]);
+    });
+  }
+  // Pre-populate hidden field if editing event with existing logo
+  const fld=document.getElementById('f-logo-data-url');
+  if(fld&&editingId){
+    const ev=events.find(x=>x.id===editingId);
+    if(ev&&ev.logo_data_url)fld.value=ev.logo_data_url;
+  }
+}
+function clearLogo(){
+  const fld=document.getElementById('f-logo-data-url');
+  if(fld)fld.value='';
+  const preview=document.getElementById('logo-preview-img');
+  if(preview&&preview.parentNode){
+    preview.parentNode.outerHTML=`<div class="logo-upload-area" id="logo-upload-area" onclick="document.getElementById('logo-file-input').click()">
+      <div style="font-size:22px;margin-bottom:6px">🖼</div>
+      <div style="font-size:13px;font-weight:500;color:var(--text-muted)">Upload logo image</div>
+      <div style="font-size:11px;color:var(--text-hint);margin-top:2px">PNG, JPG — shown in event for day-of reference</div>
+    </div>`;
+  }
+}
+function viewLogoFullscreen(url){
+  const m=document.createElement('div');
+  m.className='logo-modal';
+  m.onclick=()=>m.remove();
+  m.innerHTML=`<img src="${url}" alt="Logo">`;
+  document.body.appendChild(m);
+}
+
+function getCurrentFormData(){
+  const isRec=document.getElementById('tt-recurring')?.classList.contains('active');
+  return{
+    type:isRec?'recurring':'event',
+    name:document.getElementById('f-name')?.value||'',
+    venue:document.getElementById('f-venue')?.value||'',
+    contact:document.getElementById('f-contact')?.value||'',
+    email:document.getElementById('f-email')?.value||'',
+    phone:document.getElementById('f-phone')?.value||'',
+    market:document.getElementById('f-market')?.value||'',
+    coi_requested:document.getElementById('f-coi-requested')?.checked||false,
+    source:document.getElementById('f-source')?.value||'',
+    venue_type:document.getElementById('f-venue-type')?.value||'',
+    event_type:document.getElementById('f-event-type')?.value||'',
+    event_date:document.getElementById('f-event-date')?.value||'',
+    event_end_date:document.getElementById('f-event-end-date')?.value||'',
+    next_order_date:document.getElementById('f-next-order-date')?.value||'',
+    frequency:document.getElementById('f-frequency')?.value||'',
+    order_time:document.getElementById('f-order-time')?.value||'',
+    coconuts:document.getElementById('f-coconuts')?.value||'',
+    crack_straw:document.getElementById('f-crack-straw')?.value||'',
+    crack_circle:document.getElementById('f-crack-circle')?.value||'',
+    crack_whole:document.getElementById('f-crack-whole')?.value||'',
+    stamp_design:document.getElementById('f-stamp-design')?.value||'',
+    stamp_status:document.getElementById('f-stamp-status')?.value||'',
+    logo_received:document.getElementById('f-logo-received')?.value||'',
+    stage:document.getElementById('f-stage')?.value||'lead',
+    pre_tax_amount:document.getElementById('f-pretax')?.value||'',
+    tax_amount:document.getElementById('f-tax')?.value||'',
+    total_amount:document.getElementById('f-total')?.value||'',
+    deposit_amount:document.getElementById('f-deposit')?.value||'',
+    balance_amount:document.getElementById('f-balance')?.value||'',
+    pay_notes:document.getElementById('f-pay-notes')?.value||'',
+    delivery_date:document.getElementById('f-delivery-date')?.value||'',
+    delivery_time:document.getElementById('f-delivery-time')?.value||'',
+    delivery_notes:document.getElementById('f-delivery-notes')?.value||'',
+    logo_data_url:document.getElementById('f-logo-data-url')?.value||'',
+    invoice_name:document.getElementById('f-inv')?.value||'',
+    invoice_url:document.getElementById('f-inv-url')?.value||'',
+    cost_per_box:document.getElementById('f-cost-per-box')?.value||'',
+    cost_labor:document.getElementById('f-cost-labor')?.value||'',
+    cost_other:document.getElementById('f-cost-other')?.value||'',
+    notes:document.getElementById('f-notes')?.value||'',
+    debrief_issues:(function(){
+      const boxes=Array.from(document.querySelectorAll('input[name="debrief-issue"]:checked')).map(cb=>cb.value);
+      const other=(document.getElementById('f-debrief-other')?.value||'').trim();
+      if(other)boxes.push(other);
+      return boxes.join(' | ');
+    })(),
+    debrief_next:document.getElementById('f-debrief-next')?.value||'',
+    debrief_rating:document.getElementById('f-debrief-rating')?.value||'',
+  };
+}
+
+function toggleMultiDay(checked){
+  const wrap=document.getElementById('end-date-wrap');
+  if(!wrap)return;
+  wrap.style.display=checked?'flex':'none';
+  if(!checked){
+    const el=document.getElementById('f-event-end-date');
+    if(el)el.value='';
+  } else {
+    // Default end date to start date if empty
+    const start=document.getElementById('f-event-date')?.value;
+    const end=document.getElementById('f-event-end-date');
+    if(end&&!end.value&&start)end.value=start;
+  }
+}
+function autoCalcTax(){
+  const pre=parseFloat(document.getElementById('f-pretax')?.value)||0;
+  const tax=parseFloat(document.getElementById('f-tax')?.value)||0;
+  const totalEl=document.getElementById('f-total');
+  if(totalEl)totalEl.value=(pre+tax>0?(pre+tax).toFixed(2):'');
+}
+function onStageChange(val){
+  if(val!=='payment_full')return;
+  const total=parseFloat(document.getElementById('f-total')?.value)||0;
+  const deposit=parseFloat(document.getElementById('f-deposit')?.value)||0;
+  if(total<=0)return;
+  const bal=Math.max(0,total-deposit);
+  const balEl=document.getElementById('f-balance');
+  if(balEl&&(!balEl.value||parseFloat(balEl.value)===0)){
+    balEl.value=bal.toFixed(2);
+    balEl.style.borderColor='var(--green)';
+    balEl.style.background='#f0faf5';
+    setTimeout(()=>{balEl.style.borderColor='';balEl.style.background='';},2000);
+  }
+}
+function updateDebriefStyle(cb){
+  const lbl=cb.closest('label');
+  if(!lbl)return;
+  if(cb.checked){lbl.style.background='var(--green-pale)';lbl.style.color='var(--green)';}
+  else{lbl.style.background='#fff';lbl.style.color='var(--text)';}
+}
+function updateBoxCount(val){
+  const el=document.getElementById('f-boxes');if(!el)return;
+  const n=parseInt(val);
+  el.value=n>0?((n/9).toFixed(1)+' boxes'):'—';
+  updateCrackTotal();
+}
+function updateCrackTotal(){
+  const s=parseInt(document.getElementById('f-crack-straw')?.value)||0;
+  const c=parseInt(document.getElementById('f-crack-circle')?.value)||0;
+  const w=parseInt(document.getElementById('f-crack-whole')?.value)||0;
+  const t=parseInt(document.getElementById('f-coconuts')?.value)||0;
+  const el=document.getElementById('f-crack-total');
+  if(el)el.value=(s+c+w)+(t?' / '+t:'');
+}
+
+function closeModal(){const o=document.getElementById('modal-overlay');if(o)o.remove();if(currentView==='cal')renderCal();}
+
+function saveEvent(){
+  const d=getCurrentFormData();
+  const name=d.name.trim();
+  if(!name){alert('Please enter a name.');return;}
+  const isRecurring=d.type==='recurring';
+  const ev={
+    id:editingId||('ev_'+Date.now()),
+    ...d,
+    name,
+    followup_added:d.stage==='lead'?(editingId?(events.find(x=>x.id===editingId)?.followup_added||new Date().toISOString().slice(0,10)):new Date().toISOString().slice(0,10)):'',
+  };
+  if(editingId){const i=events.findIndex(x=>x.id===editingId);if(i>=0)events[i]=ev;else events.push(ev);}
+  else events.push(ev);
+  saveEvents();closeModal();render();
+}
+
+function delEvent(id){
+  if(!confirm('Delete this entry?'))return;
+  events=events.filter(e=>e.id!==id);
+  saveEvents();closeModal();render();
+}
+
+// ── INVOICE PARSE
+async function onInvoiceFile(file){
+  const apiKey=getKey();
+  if(!apiKey){alert('Add your Anthropic API key in the yellow bar first.');return;}
+  const inv=document.getElementById('f-inv');if(inv)inv.value=file.name;
+  const ps=document.getElementById('pstatus');if(!ps)return;
+  ps.innerHTML=`<div class="parsing-bar"><div class="spinner"></div><span>Reading invoice with Claude...</span></div>`;
+  try{
+    const b64=await toB64(file);
+    const isImg=file.type.startsWith('image/');
+    const mt=isImg?file.type:'application/pdf';
+    const cb=isImg?{type:'image',source:{type:'base64',media_type:mt,data:b64}}:{type:'document',source:{type:'base64',media_type:'application/pdf',data:b64}};
+    const resp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:1000,system:`You are an invoice parser for Hamptons Coconuts. Return ONLY valid JSON, no markdown, no backticks: {"name":"client or event name","venue":"venue","contact":"contact person","email":"email","phone":"phone","event_date":"YYYY-MM-DD or empty","coconuts":"integer string or empty","total_amount":"number string no $ sign","deposit_amount":"deposit as number string","balance_amount":"balance as number string","stamp_design":"branding notes","delivery_notes":"delivery address or location","notes":"other info"}`,messages:[{role:'user',content:[cb,{type:'text',text:'Extract invoice details. JSON only.'}]}]})});
+    const raw=await resp.text();
+    if(!resp.ok){let m=`HTTP ${resp.status}`;try{const j=JSON.parse(raw);m=j.error?.message||m;}catch(x){}throw new Error(m);}
+    const data=JSON.parse(raw);
+    const txt=data.content?.find(c=>c.type==='text')?.text||'{}';
+    const parsed=JSON.parse(txt.replace(/```json|```/g,'').trim());
+    const map={name:'f-name',venue:'f-venue',contact:'f-contact',email:'f-email',phone:'f-phone',event_date:'f-event-date',coconuts:'f-coconuts',total_amount:'f-total',deposit_amount:'f-deposit',balance_amount:'f-balance',stamp_design:'f-stamp-design',delivery_notes:'f-delivery-notes',notes:'f-notes'};
+    let filled=0;
+    Object.entries(map).forEach(([k,id])=>{const el=document.getElementById(id);if(el&&parsed[k]&&String(parsed[k]).trim()){el.value=parsed[k];el.classList.add('autofilled');filled++;}});
+    if(parsed.coconuts)updateBoxCount(parsed.coconuts);
+    ps.innerHTML=`<div class="ok-banner">✓ Autofilled ${filled} fields from invoice</div>`;
+  }catch(err){ps.innerHTML=`<div class="err-banner"><div>Could not read invoice — check API key</div><div class="err-detail">${esc(String(err.message))}</div></div>`;}
+}
+function toB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=()=>rej(new Error('Read failed'));r.readAsDataURL(file);});}
+
+
+function renderReports(){
+  const wrap=document.getElementById('report-wrap');
+  const now=new Date();
+  const thisYear=now.getFullYear();
+  const thisMonth=now.getMonth();
+
+  function countBy(arr,key){
+    const out={};
+    arr.forEach(e=>{const v=e[key]||'(not set)';out[v]=(out[v]||0)+1;});
+    return Object.entries(out).sort((a,b)=>b[1]-a[1]);
+  }
+  function sumBy(arr,key,valKey){
+    const out={};
+    arr.forEach(e=>{const v=e[key]||'(not set)';out[v]=(out[v]||0)+(parseFloat(e[valKey])||0);});
+    return Object.entries(out).sort((a,b)=>b[1]-a[1]);
+  }
+  function bar(count,max,color){
+    const pct=max>0?Math.round((count/max)*100):0;
+    return `<div style="flex:1;background:#f0ede8;border-radius:4px;height:8px;overflow:hidden"><div style="width:${pct}%;height:100%;background:${color};border-radius:4px;transition:width 0.3s"></div></div>`;
+  }
+  function table(title,data,color,valueLabel){
+    if(!data.length)return`<div style="color:var(--text-muted);font-size:13px;padding:12px 0">No data yet</div>`;
+    const max=data[0][1];
+    return`<div style="margin-bottom:20px">
+      <div style="font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:10px">${title}</div>
+      ${data.map(([k,v])=>`<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <div style="min-width:140px;font-size:13px;font-weight:500;color:var(--text)">${esc(k)}</div>
+        ${bar(v,max,color)}
+        <div style="min-width:40px;text-align:right;font-size:13px;font-weight:600;color:${color}">${valueLabel==='$'?'$'+Math.round(v).toLocaleString():v}</div>
+      </div>`).join('')}
+    </div>`;
+  }
+
+  const allEvents=events.filter(e=>e.type!=='recurring');
+  const passed=events.filter(e=>e.stage==='passed');
+  const recurring=events.filter(e=>e.type==='recurring'&&e.stage!=='passed');
+  const nyEvents=events.filter(e=>e.market==='ny');
+  const miamiEvents=events.filter(e=>e.market==='miami');
+  const totalRev=events.reduce((s,e)=>s+(parseFloat(e.total_amount)||0),0);
+  const collected=events.reduce((s,e)=>s+(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0),0);
+  const totalNuts=events.reduce((s,e)=>s+(parseInt(e.coconuts)||0),0);
+
+  // By month (events with dates)
+  const byMonth={};
+  events.forEach(e=>{
+    const d=e.event_date||e.next_order_date;if(!d)return;
+    const dt=parseLocalDate(d);
+    const key=dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0');
+    if(!byMonth[key])byMonth[key]={count:0,revenue:0};
+    byMonth[key].count++;
+    byMonth[key].revenue+=(parseFloat(e.total_amount)||0);
+  });
+  const monthData=Object.entries(byMonth).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);
+
+  wrap.innerHTML=`
+    <div style="padding-top:20px">
+      <div style="font-family:'DM Serif Display',serif;font-size:24px;color:var(--green);margin-bottom:4px">Reports & Analytics</div>
+      <div style="font-size:13px;color:var(--text-muted);margin-bottom:24px">${events.length} total entries · $${Math.round(totalRev).toLocaleString()} total contract value · ${totalNuts.toLocaleString()} coconuts</div>
+
+      <!-- SUMMARY ROW -->
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:28px">
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px;text-align:center">
+          <div style="font-size:28px;font-weight:600;color:var(--green)">${allEvents.length}</div>
+          <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-top:2px">One-time events</div>
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px;text-align:center">
+          <div style="font-size:28px;font-weight:600;color:#2563eb">${recurring.length}</div>
+          <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-top:2px">Recurring accounts</div>
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px;text-align:center">
+          <div style="font-size:28px;font-weight:600;color:#d97706">${nyEvents.length}</div>
+          <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-top:2px">🗽 Greater NY</div>
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px;text-align:center">
+          <div style="font-size:28px;font-weight:600;color:#e11d48">${miamiEvents.length}</div>
+          <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-top:2px">🌴 Miami</div>
+        </div>
+      </div>
+
+      <!-- MONTH BARS -->
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:20px;margin-bottom:20px">
+        <div style="font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:14px">Events by month</div>
+        ${monthData.length?`<div style="display:flex;align-items:flex-end;gap:6px;height:80px">
+          ${monthData.map(([m,d])=>{
+            const maxCount=Math.max(...monthData.map(x=>x[1].count));
+            const pct=maxCount>0?Math.round((d.count/maxCount)*100):0;
+            const label=m.slice(5)+'/'+m.slice(2,4);
+            return`<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px">
+              <div style="font-size:10px;font-weight:600;color:var(--green)">${d.count||''}</div>
+              <div style="width:100%;background:#f0ede8;border-radius:3px 3px 0 0;height:${Math.max(pct*0.6,4)}px;background:var(--green);opacity:${0.4+pct*0.006}"></div>
+              <div style="font-size:9px;color:var(--text-muted)">${label}</div>
+            </div>`;
+          }).join('')}
+        </div>`:'<div style="color:var(--text-muted);font-size:13px">No dated events yet</div>'}
+      </div>
+
+      <!-- BREAKDOWN GRID -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:20px">
+          ${table('Event type (one-time)',countBy(allEvents,'event_type'),'#7c3aed','count')}
+          ${table('Event type — revenue',sumBy(allEvents,'event_type','total_amount'),'#7c3aed','$')}
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:20px">
+          ${table('Venue type (all)',countBy(events,'venue_type'),'#0369a1','count')}
+          ${table('Venue type — coconuts',sumBy(events,'venue_type','coconuts'),'#0369a1','count')}
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:20px">
+          ${table('Market breakdown',countBy(events,'market'),'#059669','count')}
+          ${table('Market — revenue',sumBy(events,'market','total_amount'),'#059669','$')}
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:20px">
+          ${table('Pipeline stage',countBy(events,'stage'),'#d97706','count')}
+          ${table('Recurring frequency',countBy(recurring,'frequency'),'#d97706','count')}
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:20px;grid-column:1/-1">
+          ${table('How they found us — count',countBy(events,'source'),'#0891b2','count')}
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:20px;grid-column:1/-1">
+          <div style="font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:14px">Post-event debrief — issue frequency</div>
+          ${(function(){
+            const debriefed=events.filter(e=>e.debrief_issues);
+            if(!debriefed.length)return'<div style="color:var(--text-muted);font-size:13px">No debriefs logged yet — fill in debrief after each event</div>';
+            // Count issue frequency
+            const issueCounts={};
+            debriefed.forEach(e=>{
+              (e.debrief_issues||'').split('|').map(s=>s.trim()).filter(Boolean).forEach(issue=>{
+                issueCounts[issue]=(issueCounts[issue]||0)+1;
+              });
+            });
+            const sorted=Object.entries(issueCounts).sort((a,b)=>b[1]-a[1]);
+            const maxCount=sorted[0]?.[1]||1;
+            const bars=sorted.map(([issue,count])=>`<div style="display:flex;align-items:center;gap:10px;margin-bottom:7px">
+              <div style="min-width:160px;font-size:12px;color:var(--text)">${esc(issue)}</div>
+              <div style="flex:1;background:#f0ede8;border-radius:3px;height:7px;overflow:hidden"><div style="width:${Math.round(count/maxCount*100)}%;height:100%;background:#dc2626;border-radius:3px"></div></div>
+              <div style="min-width:20px;text-align:right;font-size:12px;font-weight:600;color:#dc2626">${count}</div>
+            </div>`).join('');
+            const notes=debriefed.filter(e=>e.debrief_next).map(e=>`<div style="margin-top:6px;padding:8px 12px;background:#f0faf5;border-radius:6px;border-left:3px solid var(--green)">
+              <div style="font-size:11px;font-weight:600;color:var(--green-mid)">${esc(e.name)}</div>
+              <div style="font-size:12px;color:var(--text);margin-top:2px">✓ ${esc(e.debrief_next)}</div>
+            </div>`).join('');
+            return bars+(notes?`<div style="margin-top:14px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:6px">Learnings logged</div>${notes}`:'');
+          })()}
+        </div>
+        </div>
+        </div>
+      </div>
+
+      <div class="owner-lock" style="background:#0d2418;border:1px solid #1a3a2a;border-radius:var(--radius-lg);padding:20px;margin-bottom:20px">
+        <div style="font-size:12px;font-weight:700;color:#7bbf9a;text-transform:uppercase;letter-spacing:0.6px;margin-bottom:14px">💰 Profit Summary (Owner Only)</div>
+        ${(function(){
+          const costed=events.filter(e=>e.cost_per_box||e.cost_labor||e.cost_other);
+          if(!costed.length)return'<div style="color:#4a7c5f;font-size:13px">No cost data entered yet — add costs to events to see profit</div>';
+          const totals=costed.reduce((acc,e)=>{const p=calcProfit(e);acc.revenue+=p.revenue;acc.cost+=p.totalCost;acc.profit+=p.profit;return acc;},{revenue:0,cost:0,profit:0});
+          const avgMargin=totals.revenue>0?Math.round((totals.profit/totals.revenue)*100):0;
+          return `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px">
+            <div style="text-align:center"><div style="font-size:24px;font-weight:700;color:#4ade80">$${Math.round(totals.profit).toLocaleString()}</div><div style="font-size:10px;color:#7bbf9a;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px">Total profit</div></div>
+            <div style="text-align:center"><div style="font-size:24px;font-weight:700;color:#fff">$${Math.round(totals.revenue).toLocaleString()}</div><div style="font-size:10px;color:#7bbf9a;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px">Total revenue</div></div>
+            <div style="text-align:center"><div style="font-size:24px;font-weight:700;color:#fbbf24">${avgMargin}%</div><div style="font-size:10px;color:#7bbf9a;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px">Avg margin</div></div>
+          </div>
+          <div style="font-size:11px;color:#4a7c5f">${costed.length} of ${events.length} events have cost data · $${Math.round(totals.cost).toLocaleString()} total costs</div>`;
+        })()}
+      </div>
+      <div style="margin-top:20px;padding:14px 18px;background:#f0faf5;border:1px solid var(--green-mid2);border-radius:var(--radius-lg);font-size:12px;color:var(--green-mid)">
+        💡 Reports update live as you add events. All charts reflect your current data.
+      </div>
+    </div>`;
+}
+
+
+// ── OWNER PIN
+const OWNER_PIN='1234'; // Change this to your own PIN
+function checkOwnerPin(){
+  const pin=document.getElementById('owner-pin-input').value;
+  if(pin===OWNER_PIN){
+    document.body.classList.add('owner-unlocked');
+    document.getElementById('owner-status').innerHTML='<span class="owner-badge">✓ OWNER VIEW</span>';
+    document.getElementById('owner-pin-input').value='';
+    localStorage.setItem('hc_owner_session','1');
+    render();
+  } else {
+    document.getElementById('owner-status').textContent='Wrong PIN';
+    setTimeout(()=>document.getElementById('owner-status').textContent='Locked — profit data hidden',2000);
+  }
+}
+function initOwner(){
+  if(localStorage.getItem('hc_owner_session')==='1'){
+    document.body.classList.add('owner-unlocked');
+    document.getElementById('owner-status').innerHTML='<span class="owner-badge">✓ OWNER VIEW</span>';
+  }
+}
+function lockOwner(){
+  document.body.classList.remove('owner-unlocked');
+  localStorage.removeItem('hc_owner_session');
+  document.getElementById('owner-status').textContent='Locked — profit data hidden';
+  render();
+}
+
+// ── PROFIT CALC
+function calcProfit(e){
+  const revenue=parseFloat(e.pre_tax_amount)||parseFloat(e.total_amount)||0;
+  const costPerBox=parseFloat(e.cost_per_box)||0;
+  const labor=parseFloat(e.cost_labor)||0;
+  const other=parseFloat(e.cost_other)||0;
+  const nuts=parseInt(e.coconuts)||0;
+  const boxes=nuts>0?Math.ceil(nuts/9):0;
+  const cogs=costPerBox*boxes;
+  const totalCost=cogs+labor+other;
+  const profit=revenue-totalCost;
+  const margin=revenue>0?Math.round((profit/revenue)*100):0;
+  return{revenue,cogs,labor,other,totalCost,profit,margin,boxes};
+}
+function hasProfit(e){return !!(e.cost_per_box||e.cost_labor||e.cost_other);}
+
+initKeyUI();initOwner();loadEvents();render();
+
+// ══════════════════════════════════════════════
+// ☁️  JSONBIN.IO CLOUD SYNC
+// ══════════════════════════════════════════════
+const JB_MASTER_KEY='$2a$10$u.rxXODnJDj/K3vQ33MIG.e8MJDtjUkLLFaYkcfOVF5KdiOqXLDoS';
+let jbMasterKey=JB_MASTER_KEY;
+let jbBinId=localStorage.getItem('hc_jb_bin')||'';
+let jbSyncing=false;
+
+// Auto-connect on load
+(function(){
+  localStorage.setItem('hc_jb_key',JB_MASTER_KEY);
+  // Hide the key input bar entirely since key is built-in
+  const bar=document.getElementById('sync-bar');
+  if(bar){
+    const inp=document.getElementById('jb-key-input');
+    const connectBtn=bar.querySelector('button[onclick="jbConnect()"]');
+    if(inp)inp.style.display='none';
+    if(connectBtn)connectBtn.style.display='none';
+  }
+  if(jbBinId){
+    // Already have a bin — show connected UI and pull latest
+    updateJbUI(true);
+    jbPull();
+  } else {
+    // First time on this device — create the bin
+    setSyncStatus('<span class="sync-spinner"></span> Setting up cloud sync...','');
+    jbConnect();
+  }
+})();
+
+function setSyncStatus(msg,type){
+  const el=document.getElementById('sync-status');
+  if(!el)return;
+  el.innerHTML=msg;
+  el.className='sync-status'+(type==='ok'?' sync-ok':type==='err'?' sync-err':'');
+}
+
+function updateJbUI(connected){
+  const syncNowBtn=document.getElementById('sync-now-btn');
+  const syncPullBtn=document.getElementById('sync-pull-btn');
+  if(connected){
+    if(syncNowBtn)syncNowBtn.style.display='inline-block';
+    if(syncPullBtn)syncPullBtn.style.display='inline-block';
+    setSyncStatus('✓ Cloud sync active — auto-saves on every change','ok');
+  } else {
+    if(syncNowBtn)syncNowBtn.style.display='none';
+    if(syncPullBtn)syncPullBtn.style.display='none';
+    setSyncStatus('Not connected','');
+  }
+}
+
+async function jbConnect(){
+  const key=jbMasterKey||JB_MASTER_KEY;
+  if(!key){alert('No API key found.');return;}
+  jbMasterKey=key;
+  localStorage.setItem('hc_jb_key',key);
+  setSyncStatus('<span class="sync-spinner"></span> Connecting...','');
+  // Try to find existing bin named 'hc_events'
+  try{
+    const listResp=await fetch('https://api.jsonbin.io/v3/b?collectionId=&limit=20',{
+      headers:{'X-Master-Key':jbMasterKey,'X-Bin-Name':'hc_events'}
+    });
+    // Just try to create/use a bin
+    if(!jbBinId){
+      // Create a new bin
+      const createResp=await fetch('https://api.jsonbin.io/v3/b',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-Master-Key':jbMasterKey,'X-Bin-Name':'hc_events','X-Bin-Private':'true'},
+        body:JSON.stringify({events:events})
+      });
+      if(!createResp.ok){
+        const err=await createResp.json();
+        throw new Error(err.message||'Could not create bin ('+createResp.status+')');
+      }
+      const createData=await createResp.json();
+      jbBinId=createData.metadata.id;
+      localStorage.setItem('hc_jb_bin',jbBinId);
+      updateJbUI(true);
+      setSyncStatus('✓ Connected! New cloud storage created. Auto-syncing...','ok');
+    } else {
+      // Pull existing data
+      await jbPull();
+      updateJbUI(true);
+    }
+  }catch(err){
+    setSyncStatus('Connection failed: '+err.message,'err');
+    console.error(err);
+  }
+}
+
+async function jbPush(silent=false){
+  if(!jbMasterKey||!jbBinId)return;
+  if(jbSyncing)return;
+  jbSyncing=true;
+  try{
+    const resp=await fetch('https://api.jsonbin.io/v3/b/'+jbBinId,{
+      method:'PUT',
+      headers:{'Content-Type':'application/json','X-Master-Key':jbMasterKey},
+      body:JSON.stringify({events:events})
+    });
+    if(!resp.ok)throw new Error('Push failed ('+resp.status+')');
+    if(!silent){
+      const now=new Date();
+      setSyncStatus('✓ Saved to cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
+    }
+  }catch(err){
+    if(!silent)setSyncStatus('Sync failed: '+err.message,'err');
+    console.error('jbPush error:',err);
+  }finally{
+    jbSyncing=false;
+  }
+}
+
+async function jbPull(){
+  if(!jbMasterKey||!jbBinId){alert('Not connected. Enter your key and click Connect first.');return;}
+  setSyncStatus('<span class="sync-spinner"></span> Loading from cloud...','');
+  try{
+    const resp=await fetch('https://api.jsonbin.io/v3/b/'+jbBinId+'/latest',{
+      headers:{'X-Master-Key':jbMasterKey}
+    });
+    if(!resp.ok)throw new Error('Pull failed ('+resp.status+')');
+    const data=await resp.json();
+    if(data.record&&Array.isArray(data.record.events)){
+      events=data.record.events;
+      localStorage.setItem('hc_events',JSON.stringify(events));
+      render();
+      const now=new Date();
+      setSyncStatus('✓ Loaded '+events.length+' events from cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
+    } else {
+      setSyncStatus('Cloud data looks empty — nothing to load','');
+    }
+  }catch(err){
+    setSyncStatus('Pull failed: '+err.message,'err');
+    console.error('jbPull error:',err);
+  }
+}
+
+function jbDisconnect(){
+  jbMasterKey='';
+  jbBinId='';
+  localStorage.removeItem('hc_jb_key');
+  localStorage.removeItem('hc_jb_bin');
+  const inp=document.getElementById('jb-key-input');
+  if(inp)inp.value='';
+  updateJbUI(false);
+}
+</script>
+</body>
+</html>
