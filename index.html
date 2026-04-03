@@ -410,8 +410,7 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
   <span style="font-size:13px">☁️</span>
   <span id="sync-status" class="sync-status">Connecting...</span>
   <span style="flex:1"></span>
-  <button id="sync-now-btn" onclick="jbPush()" style="display:none;background:none;border:1px solid rgba(0,122,255,0.3);border-radius:7px;padding:4px 11px;font-size:11px;cursor:pointer;color:var(--blue);font-weight:600;transition:all 0.15s">↑ Push</button>
-  <button id="sync-pull-btn" onclick="jbPull()" style="display:none;background:none;border:1px solid rgba(0,122,255,0.3);border-radius:7px;padding:4px 11px;font-size:11px;cursor:pointer;color:var(--blue);font-weight:600;transition:all 0.15s">↓ Pull</button>
+
 </div>
 
 <div class="urgent-banner" id="urgent-banner">
@@ -1782,15 +1781,9 @@ function setSyncStatus(msg,type){
 }
 
 function updateJbUI(connected){
-  const syncNowBtn=document.getElementById('sync-now-btn');
-  const syncPullBtn=document.getElementById('sync-pull-btn');
   if(connected){
-    if(syncNowBtn)syncNowBtn.style.display='inline-block';
-    if(syncPullBtn)syncPullBtn.style.display='inline-block';
-    setSyncStatus('✓ Cloud sync active — auto-saves on every change','ok');
+    setSyncStatus('✓ Cloud sync active','ok');
   } else {
-    if(syncNowBtn)syncNowBtn.style.display='none';
-    if(syncPullBtn)syncPullBtn.style.display='none';
     setSyncStatus('Not connected','');
   }
 }
