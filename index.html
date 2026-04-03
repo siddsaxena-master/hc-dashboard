@@ -268,6 +268,31 @@ input.autofilled{border-color:var(--green)!important;background:#f0faf5!importan
 .sheet-link:hover{text-decoration:underline}
 
 .logo-preview{width:100%;max-height:120px;object-fit:contain;border-radius:8px;border:1px solid var(--border);background:#fafafa;padding:8px;cursor:pointer}
+
+/* PIN LOCK SCREEN */
+#pin-overlay{position:fixed;inset:0;background:var(--green);z-index:9999;display:flex;align-items:center;justify-content:center;flex-direction:column;padding:20px}
+#pin-overlay.hidden{display:none}
+.pin-box{background:#fff;border-radius:20px;padding:36px 32px;width:100%;max-width:360px;text-align:center;box-shadow:0 24px 64px rgba(0,0,0,0.3)}
+.pin-logo{font-size:40px;margin-bottom:8px}
+.pin-brand{font-family:'DM Serif Display',serif;font-size:22px;color:var(--green);margin-bottom:4px}
+.pin-sub{font-size:12px;color:var(--text-muted);margin-bottom:24px;letter-spacing:0.5px;text-transform:uppercase}
+.pin-dots{display:flex;justify-content:center;gap:10px;margin-bottom:20px}
+.pin-dot{width:14px;height:14px;border-radius:50%;border:2px solid var(--border);background:transparent;transition:all 0.15s}
+.pin-dot.filled{background:var(--green);border-color:var(--green)}
+.pin-keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+.pin-key{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:14px;font-size:20px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;transition:all 0.1s;color:var(--text)}
+.pin-key:hover{background:var(--green-pale);border-color:var(--green)}
+.pin-key:active{transform:scale(0.95)}
+.pin-key.del{font-size:16px;color:var(--text-muted)}
+.pin-error{color:var(--red);font-size:12px;font-weight:600;min-height:18px;margin-top:4px}
+.pin-role-badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;margin-bottom:16px}
+.pin-role-badge.owner{background:#dcfce7;color:#166534}
+.pin-role-badge.ny{background:#dbeafe;color:#1e40af}
+.pin-role-badge.miami{background:#ffe4e6;color:#9f1239}
+/* Team role restrictions */
+.market-ny-only .add-btn,.market-miami-only .add-btn{display:none}
+.market-ny-only .owner-hide,.market-miami-only .owner-hide{display:none}
+.market-ny-only .topbar-actions .icon-btn,.market-miami-only .topbar-actions .icon-btn{display:none}
 .logo-upload-area{grid-column:1/-1;border:1.5px dashed var(--border-mid);border-radius:var(--radius-lg);padding:16px;text-align:center;cursor:pointer;transition:all 0.2s;background:#fafafa;position:relative}
 .logo-upload-area:hover{border-color:var(--green);background:var(--green-wash)}
 .logo-modal{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;cursor:pointer}
@@ -354,6 +379,38 @@ input.autofilled{border-color:var(--green)!important;background:#f0faf5!importan
 </style>
 </head>
 <body>
+<!-- PIN LOCK OVERLAY -->
+<div id="pin-overlay">
+  <div class="pin-box">
+    <div class="pin-logo">🥥</div>
+    <div class="pin-brand">Hamptons Coconuts</div>
+    <div class="pin-sub">Ops Dashboard</div>
+    <div id="pin-role-display"></div>
+    <div class="pin-dots" id="pin-dots">
+      <div class="pin-dot" id="pd0"></div>
+      <div class="pin-dot" id="pd1"></div>
+      <div class="pin-dot" id="pd2"></div>
+      <div class="pin-dot" id="pd3"></div>
+      <div class="pin-dot" id="pd4"></div>
+      <div class="pin-dot" id="pd5"></div>
+    </div>
+    <div class="pin-keypad">
+      <button class="pin-key" onclick="pinKey('1')">1</button>
+      <button class="pin-key" onclick="pinKey('2')">2</button>
+      <button class="pin-key" onclick="pinKey('3')">3</button>
+      <button class="pin-key" onclick="pinKey('4')">4</button>
+      <button class="pin-key" onclick="pinKey('5')">5</button>
+      <button class="pin-key" onclick="pinKey('6')">6</button>
+      <button class="pin-key" onclick="pinKey('7')">7</button>
+      <button class="pin-key" onclick="pinKey('8')">8</button>
+      <button class="pin-key" onclick="pinKey('9')">9</button>
+      <button class="pin-key" onclick="pinKey('0')" style="grid-column:2">0</button>
+      <button class="pin-key del" onclick="pinDel()">⌫</button>
+    </div>
+    <div class="pin-error" id="pin-error"></div>
+  </div>
+</div>
+
 <div class="topbar">
   <div class="brand">
     <div class="brand-icon">🥥</div>
@@ -366,7 +423,7 @@ input.autofilled{border-color:var(--green)!important;background:#f0faf5!importan
       <button class="vt-btn" id="vt-report" onclick="setView('report')">📊 Reports</button>
     </div>
     <div class="topbar-actions">
-      <button class="icon-btn owner-lock" onclick="lockOwner()" title="Lock owner view" style="color:#4ade80">🔒 Lock</button>
+      <button class="icon-btn" onclick="lockOwner()" title="Lock &amp; switch role" style="color:#4ade80">🔒 Lock</button>
       <button class="icon-btn" onclick="exportData()" title="Backup data">↓ Backup</button>
       <button class="icon-btn" onclick="importData()" title="Restore data">↑ Restore</button>
     </div>
@@ -654,12 +711,14 @@ function renderUrgent(){
 }
 
 function renderStats(){
-  const recurring=events.filter(e=>e.type==='recurring'&&e.stage!=='passed');
-  const oneTime=events.filter(e=>e.type!=='recurring'&&e.stage!=='passed'&&e.stage!=='passed');
-  const nuts=events.reduce((s,e)=>s+(parseInt(e.coconuts)||0),0);
-  const coll=events.reduce((s,e)=>s+(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0),0);
-  const pend=events.filter(e=>e.stage!=='completed').reduce((s,e)=>s+Math.max(0,(parseFloat(e.total_amount)||0)-(parseFloat(e.deposit_amount)||0)-(parseFloat(e.balance_amount)||0)),0);
-  const costedEvents=events.filter(hasProfit);
+  const mf=e=>!currentMarket||!e.market||e.market===currentMarket||e.market==='';
+  const filteredEvents=events.filter(mf);
+  const recurring=filteredEvents.filter(e=>e.type==='recurring'&&e.stage!=='passed');
+  const oneTime=filteredEvents.filter(e=>e.type!=='recurring'&&e.stage!=='passed');
+  const nuts=filteredEvents.reduce((s,e)=>s+(parseInt(e.coconuts)||0),0);
+  const coll=filteredEvents.reduce((s,e)=>s+(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0),0);
+  const pend=filteredEvents.filter(e=>e.stage!=='completed').reduce((s,e)=>s+Math.max(0,(parseFloat(e.total_amount)||0)-(parseFloat(e.deposit_amount)||0)-(parseFloat(e.balance_amount)||0)),0);
+  const costedEvents=filteredEvents.filter(hasProfit);
   const totalProfit=costedEvents.reduce((s,e)=>{const p=calcProfit(e);return s+p.profit;},0);
   const ownerUnlocked=document.body.classList.contains('owner-unlocked');
   document.getElementById('stats-grid').innerHTML=`
@@ -712,9 +771,11 @@ function logoBadge(e){
 }
 
 function renderLists(){
-  const recurring=events.filter(e=>e.type==='recurring').sort((a,b)=>a.name.localeCompare(b.name));
+  // Filter by market role
+  const mf=e=>!currentMarket||!e.market||e.market===currentMarket||e.market==='';
+  const recurring=events.filter(e=>e.type==='recurring'&&mf(e)).sort((a,b)=>a.name.localeCompare(b.name));
   const today=new Date();today.setHours(0,0,0,0);
-  const oneTime=events.filter(e=>e.type!=='recurring').sort((a,b)=>{
+  const oneTime=events.filter(e=>e.type!=='recurring'&&mf(e)).sort((a,b)=>{
     const da=parseLocalDate(a.event_date)||new Date('9999-01-01');
     const db=parseLocalDate(b.event_date)||new Date('9999-01-01');
     const daEnd=a.event_end_date?parseLocalDate(a.event_end_date):da;
@@ -1587,33 +1648,106 @@ function renderReports(){
 }
 
 
-// ── OWNER PIN
-const OWNER_PIN='1234'; // Change this to your own PIN
-function checkOwnerPin(){
-  const pin=document.getElementById('owner-pin-input').value;
-  if(pin===OWNER_PIN){
-    document.body.classList.add('owner-unlocked');
-    document.getElementById('owner-status').innerHTML='<span class="owner-badge">✓ OWNER VIEW</span>';
-    document.getElementById('owner-pin-input').value='';
-    localStorage.setItem('hc_owner_session','1');
-    render();
-  } else {
-    document.getElementById('owner-status').textContent='Wrong PIN';
-    setTimeout(()=>document.getElementById('owner-status').textContent='Locked — profit data hidden',2000);
+// ══════════════════════════════════════════════
+// 🔐  ROLE-BASED PIN ACCESS CONTROL
+// ══════════════════════════════════════════════
+const PINS={
+  '071515':{role:'owner',label:'Owner',market:null},
+  '2026':{role:'ny',label:'NY Team',market:'ny'},
+  '1991':{role:'miami',label:'Miami Team',market:'miami'}
+};
+let currentRole=null; // 'owner','ny','miami'
+let currentMarket=null; // null=all, 'ny', 'miami'
+let pinBuffer='';
+
+function pinKey(d){
+  if(pinBuffer.length>=6)return;
+  pinBuffer+=d;
+  updatePinDots();
+  if(pinBuffer.length>=4){
+    // Check after a short delay to show last dot
+    setTimeout(checkPin,120);
   }
 }
-function initOwner(){
-  if(localStorage.getItem('hc_owner_session')==='1'){
+function pinDel(){
+  pinBuffer=pinBuffer.slice(0,-1);
+  updatePinDots();
+  document.getElementById('pin-error').textContent='';
+}
+function updatePinDots(){
+  for(let i=0;i<6;i++){
+    const dot=document.getElementById('pd'+i);
+    if(dot)dot.classList.toggle('filled',i<pinBuffer.length);
+  }
+}
+function checkPin(){
+  const match=PINS[pinBuffer];
+  if(match){
+    currentRole=match.role;
+    currentMarket=match.market;
+    localStorage.setItem('hc_role',currentRole);
+    localStorage.setItem('hc_market',currentMarket||'');
+    applyRole();
+    document.getElementById('pin-overlay').classList.add('hidden');
+    pinBuffer='';
+    updatePinDots();
+    render();
+    // Show role badge in topbar
+    const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
+    document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
+  } else if(pinBuffer.length>=6){
+    document.getElementById('pin-error').textContent='Incorrect PIN — try again';
+    pinBuffer='';
+    updatePinDots();
+    setTimeout(()=>document.getElementById('pin-error').textContent='',2000);
+  }
+}
+function applyRole(){
+  // Owner-unlocked class controls financial visibility
+  if(currentRole==='owner'){
     document.body.classList.add('owner-unlocked');
-    document.getElementById('owner-status').innerHTML='<span class="owner-badge">✓ OWNER VIEW</span>';
+  } else {
+    document.body.classList.remove('owner-unlocked');
+  }
+  // Market filter class
+  document.body.classList.remove('market-ny-only','market-miami-only');
+  if(currentMarket==='ny')document.body.classList.add('market-ny-only');
+  if(currentMarket==='miami')document.body.classList.add('market-miami-only');
+  // Hide/show owner-only controls
+  document.querySelectorAll('.owner-lock,.icon-btn[onclick*="exportData"],[onclick*="importData"]').forEach(el=>{
+    el.style.display=currentRole==='owner'?'':'none';
+  });
+  // Hide owner banner (replaced by PIN system)
+  const ob=document.getElementById('owner-banner');
+  if(ob)ob.style.display='none';
+}
+function initOwner(){
+  const savedRole=localStorage.getItem('hc_role');
+  const savedMarket=localStorage.getItem('hc_market');
+  if(savedRole&&PINS[savedRole]||Object.values(PINS).find(p=>p.role===savedRole)){
+    currentRole=savedRole;
+    currentMarket=savedMarket||null;
+    applyRole();
+    document.getElementById('pin-overlay').classList.add('hidden');
+    const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
+    document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
   }
 }
 function lockOwner(){
-  document.body.classList.remove('owner-unlocked');
+  currentRole=null;
+  currentMarket=null;
+  localStorage.removeItem('hc_role');
+  localStorage.removeItem('hc_market');
   localStorage.removeItem('hc_owner_session');
-  document.getElementById('owner-status').textContent='Locked — profit data hidden';
-  render();
+  document.body.classList.remove('owner-unlocked','market-ny-only','market-miami-only');
+  document.getElementById('pin-overlay').classList.remove('hidden');
+  document.getElementById('owner-status').textContent='';
+  pinBuffer='';
+  updatePinDots();
+  document.getElementById('pin-error').textContent='';
 }
+// Legacy stub
+function checkOwnerPin(){}
 
 // ── PROFIT CALC
 function calcProfit(e){
