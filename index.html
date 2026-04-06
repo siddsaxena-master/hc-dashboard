@@ -2008,7 +2008,7 @@ function gmailConnect(){
       setGmailStatus('Checking inbox...','');
       gmailCheckInbox();
       if(gmailPollTimer)clearInterval(gmailPollTimer);
-      gmailPollTimer=setInterval(gmailCheckInbox,60000);
+      gmailPollTimer=setInterval(gmailCheckInbox,300000); // every 5 min
     }
   });
   tokenClient.requestAccessToken();
@@ -2031,11 +2031,16 @@ function setGmailStatus(msg,type){
   el.style.color=type==='err'?'var(--fire)':type==='ok'?'var(--green)':'var(--text-hint)';
 }
 
+// Skip words — emails with ONLY these in subject are not events
+const GMAIL_SKIP_WORDS=/^(re:|fw:|fwd:)?\s*(welcome|unsubscribe|verify|confirm your email|password reset|security alert|newsletter|promotional|sale|discount|receipt for your payment|your statement|account update|shipping notification|delivery confirmed|tracking number)/i;
+// Must-parse words — if subject has these, always send to Claude
+const GMAIL_MUST_PARSE=/invoice|coconut|event|booking|order|quote|proposal|wedding|party|catering|venue|deposit|payment request|hampton/i;
+
 async function gmailCheckInbox(){
   if(!gmailToken)return;
   try{
     setGmailStatus('Checking inbox...','');
-    const listResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?q=is:unread&maxResults=10',{
+    const listResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?q=is:unread+newer_than:7d&maxResults=10',{
       headers:{'Authorization':'Bearer '+gmailToken}
     });
     if(listResp.status===401){gmailDisconnect();setGmailStatus('Session expired — reconnect','err');return;}
@@ -2049,23 +2054,63 @@ async function gmailCheckInbox(){
     if(!newMsgs.length){setGmailStatus('Inbox synced','ok');return;}
 
     if(!getKey()){setGmailStatus('Found '+newMsgs.length+' emails — API key missing','err');return;}
-    setGmailStatus(`Parsing ${newMsgs.length} email${newMsgs.length>1?'s':''}...`,'');
-    let parsed=0;
+
+    // Phase 1: Fetch headers only (cheap — no API tokens used)
+    setGmailStatus(`Screening ${newMsgs.length} email${newMsgs.length>1?'s':''}...`,'');
+    const candidates=[];
     for(const msg of newMsgs){
       try{
-        const detail=await gmailGetMessage(msg.id);
-        if(!detail)continue;
-        const eventData=await gmailParseEmail(detail);
-        if(eventData){
-          pendingImports.push({...eventData,_gmailId:msg.id,_subject:detail.subject});
-          parsed++;
-        }
-        processed.push(msg.id);
-      }catch(err){
-        console.error('Error processing message '+msg.id+':',err);
-        processed.push(msg.id);
-      }
+        const hResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+msg.id+'?format=metadata&metadataHeaders=Subject&metadataHeaders=From',{
+          headers:{'Authorization':'Bearer '+gmailToken}
+        });
+        if(!hResp.ok){processed.push(msg.id);continue;}
+        const hData=await hResp.json();
+        const hdrs=hData.payload?.headers||[];
+        const subj=(hdrs.find(h=>h.name==='Subject')||{}).value||'';
+        const from=(hdrs.find(h=>h.name==='From')||{}).value||'';
+        // Pre-filter: skip obvious non-event emails
+        if(GMAIL_SKIP_WORDS.test(subj)){processed.push(msg.id);continue;}
+        // If subject looks relevant OR is ambiguous, keep as candidate
+        candidates.push({id:msg.id,subject:subj,from:from});
+      }catch(e){processed.push(msg.id);}
     }
+
+    if(!candidates.length){
+      saveProcessedIds(processed.slice(-500));
+      setGmailStatus('Inbox synced — no event emails found','ok');
+      return;
+    }
+
+    // Phase 2: Fetch full content only for candidates and batch-parse
+    setGmailStatus(`Parsing ${candidates.length} email${candidates.length>1?'s':''}...`,'');
+    const emailTexts=[];
+    const candidateMap=[];
+    for(const c of candidates){
+      try{
+        const detail=await gmailGetMessage(c.id);
+        if(!detail){processed.push(c.id);continue;}
+        emailTexts.push(`--- EMAIL ${emailTexts.length+1} ---\nSubject: ${detail.subject}\nFrom: ${detail.from}\nDate: ${detail.date}\n\n${detail.body}`);
+        candidateMap.push({id:c.id,subject:detail.subject,attachment:detail.attachment});
+      }catch(e){processed.push(c.id);}
+    }
+
+    if(!emailTexts.length){
+      saveProcessedIds(processed.slice(-500));
+      setGmailStatus('Inbox synced','ok');
+      return;
+    }
+
+    // Phase 3: Single batched API call for all text-only emails
+    const batchResult=await gmailBatchParse(emailTexts,candidateMap);
+    let parsed=0;
+    batchResult.forEach((eventData,i)=>{
+      const c=candidateMap[i];
+      if(eventData){
+        pendingImports.push({...eventData,_gmailId:c.id,_subject:c.subject});
+        parsed++;
+      }
+      processed.push(c.id);
+    });
     saveProcessedIds(processed.slice(-500));
 
     if(parsed>0){
@@ -2107,93 +2152,104 @@ async function gmailGetMessage(id){
   }
   extractText(data.payload);
 
-  let attachments=[];
-  function findAttachments(part){
-    if(part.filename&&part.body?.attachmentId){
-      const mime=part.mimeType||'';
-      if(mime.startsWith('image/')||mime==='application/pdf'){
-        attachments.push({filename:part.filename,mimeType:mime,attachmentId:part.body.attachmentId,size:part.body.size||0});
-      }
-    }
-    if(part.parts)part.parts.forEach(findAttachments);
-  }
-  findAttachments(data.payload);
-
+  // Only fetch attachments for invoices (expensive in tokens) — skip for regular emails
   let attachmentData=null;
-  if(attachments.length>0){
-    const att=attachments[0];
-    try{
-      const attResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+id+'/attachments/'+att.attachmentId,{
-        headers:{'Authorization':'Bearer '+gmailToken}
-      });
-      if(attResp.ok){
-        const attJson=await attResp.json();
-        attachmentData={data:attJson.data.replace(/-/g,'+').replace(/_/g,'/'),mimeType:att.mimeType,filename:att.filename};
+  const isInvoice=GMAIL_MUST_PARSE.test(subject)&&/invoice|payment request|quote/i.test(subject);
+  if(isInvoice){
+    let attachments=[];
+    function findAttachments(part){
+      if(part.filename&&part.body?.attachmentId){
+        const mime=part.mimeType||'';
+        if((mime.startsWith('image/')||mime==='application/pdf')&&(part.body.size||0)<2000000){
+          attachments.push({filename:part.filename,mimeType:mime,attachmentId:part.body.attachmentId});
+        }
       }
-    }catch(e){console.error('Attachment fetch failed:',e);}
-  }
-
-  return {subject,from,date,body:body.slice(0,8000),attachment:attachmentData,messageId:id};
-}
-
-async function gmailParseEmail(email){
-  const apiKey=getKey();
-  if(!apiKey)return null;
-
-  const contentBlocks=[];
-  if(email.attachment){
-    const isImg=email.attachment.mimeType.startsWith('image/');
-    if(isImg){
-      contentBlocks.push({type:'image',source:{type:'base64',media_type:email.attachment.mimeType,data:email.attachment.data}});
-    } else {
-      contentBlocks.push({type:'document',source:{type:'base64',media_type:'application/pdf',data:email.attachment.data}});
+      if(part.parts)part.parts.forEach(findAttachments);
+    }
+    findAttachments(data.payload);
+    if(attachments.length>0){
+      const att=attachments[0];
+      try{
+        const attResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+id+'/attachments/'+att.attachmentId,{
+          headers:{'Authorization':'Bearer '+gmailToken}
+        });
+        if(attResp.ok){
+          const attJson=await attResp.json();
+          attachmentData={data:attJson.data.replace(/-/g,'+').replace(/_/g,'/'),mimeType:att.mimeType,filename:att.filename};
+        }
+      }catch(e){}
     }
   }
-  contentBlocks.push({type:'text',text:`Email Subject: ${email.subject}\nFrom: ${email.from}\nDate: ${email.date}\n\nBody:\n${email.body}`});
 
-  const systemPrompt=`You are an email parser for Hamptons Coconuts, a coconut catering company. Parse this email/invoice and extract event details. This could be a QuickBooks invoice, a venue inquiry, a booking confirmation, or a general event email.
-
-Return ONLY valid JSON (no markdown, no backticks):
-{
-  "name": "client or event name",
-  "venue": "venue name or empty",
-  "contact": "contact person name or empty",
-  "email": "email address or empty",
-  "phone": "phone number or empty",
-  "event_date": "YYYY-MM-DD or empty",
-  "event_end_date": "YYYY-MM-DD or empty (only if multi-day)",
-  "delivery_date": "YYYY-MM-DD or empty",
-  "delivery_time": "time string or empty",
-  "coconuts": "integer string or empty",
-  "total_amount": "number string no $ sign or empty",
-  "deposit_amount": "deposit number string or empty",
-  "balance_amount": "balance number string or empty",
-  "stamp_design": "branding notes or empty",
-  "delivery_notes": "delivery address or empty",
-  "market": "ny or miami or other (infer from address/venue)",
-  "event_type": "Wedding, Corporate Event, Birthday Party, Holiday Party, or empty",
-  "notes": "other relevant info, include invoice number if present",
-  "is_event": true or false (false if this email is not related to an event/order — e.g. spam, newsletter, unrelated)
+  return {subject,from,date,body:body.slice(0,3000),attachment:attachmentData,messageId:id};
 }
 
-If you can't determine a field, leave it as an empty string. Infer market from location clues (Hamptons/Long Island/NYC = ny, Miami/Florida = miami). Be smart about extracting from QuickBooks invoice formats.`;
+// Batch parse: one API call for all emails (huge token savings)
+async function gmailBatchParse(emailTexts,candidateMap){
+  const apiKey=getKey();
+  if(!apiKey)return emailTexts.map(()=>null);
 
-  try{
-    const resp=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-      body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:1200,system:systemPrompt,messages:[{role:'user',content:contentBlocks}]})
-    });
-    if(!resp.ok){console.error('Claude API error:',resp.status);return null;}
-    const data=await resp.json();
-    const txt=data.content?.find(c=>c.type==='text')?.text||'{}';
-    const parsed=JSON.parse(txt.replace(/```json|```/g,'').trim());
-    if(parsed.is_event===false)return null;
-    return parsed;
-  }catch(err){
-    console.error('Email parse error:',err);
-    return null;
+  // If any email has an attachment, send it separately (can't batch images)
+  const withAttachment=candidateMap.findIndex(c=>c.attachment);
+  const results=new Array(emailTexts.length).fill(null);
+
+  // Handle attachment email separately if exists
+  if(withAttachment>=0){
+    const c=candidateMap[withAttachment];
+    const att=c.attachment;
+    const contentBlocks=[];
+    const isImg=att.mimeType.startsWith('image/');
+    contentBlocks.push(isImg?{type:'image',source:{type:'base64',media_type:att.mimeType,data:att.data}}:{type:'document',source:{type:'base64',media_type:'application/pdf',data:att.data}});
+    contentBlocks.push({type:'text',text:emailTexts[withAttachment]+'\n\nExtract event/invoice details as JSON.'});
+    try{
+      const resp=await fetch('https://api.anthropic.com/v1/messages',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+        body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:500,system:GMAIL_PARSE_PROMPT_SINGLE,messages:[{role:'user',content:contentBlocks}]})
+      });
+      if(resp.ok){
+        const d=await resp.json();
+        const t=d.content?.find(x=>x.type==='text')?.text||'{}';
+        const p=JSON.parse(t.replace(/```json|```/g,'').trim());
+        if(p.is_event!==false)results[withAttachment]=p;
+      }
+    }catch(e){console.error('Attachment parse error:',e);}
   }
+
+  // Batch the rest in a single call
+  const batchIdxs=emailTexts.map((_,i)=>i).filter(i=>i!==withAttachment);
+  if(batchIdxs.length>0){
+    const batchText=batchIdxs.map((idx,n)=>emailTexts[idx]).join('\n\n');
+    try{
+      const resp=await fetch('https://api.anthropic.com/v1/messages',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+        body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:batchIdxs.length*400,system:GMAIL_PARSE_PROMPT_BATCH(batchIdxs.length),messages:[{role:'user',content:[{type:'text',text:batchText}]}]})
+      });
+      if(resp.ok){
+        const d=await resp.json();
+        const t=d.content?.find(x=>x.type==='text')?.text||'[]';
+        const arr=JSON.parse(t.replace(/```json|```/g,'').trim());
+        const parsed=Array.isArray(arr)?arr:[arr];
+        parsed.forEach((p,n)=>{
+          if(n<batchIdxs.length&&p&&p.is_event!==false){
+            results[batchIdxs[n]]=p;
+          }
+        });
+      }
+    }catch(e){console.error('Batch parse error:',e);}
+  }
+  return results;
+}
+
+const GMAIL_PARSE_PROMPT_SINGLE=`Parse this email/invoice for Hamptons Coconuts (coconut catering). Return ONLY JSON:
+{"name":"","venue":"","contact":"","email":"","phone":"","event_date":"YYYY-MM-DD","event_end_date":"","delivery_date":"","delivery_time":"","coconuts":"int","total_amount":"num","deposit_amount":"","balance_amount":"","stamp_design":"","delivery_notes":"address","market":"ny|miami|other","event_type":"Wedding|Corporate Event|Birthday Party|Holiday Party","notes":"","is_event":true/false}
+Leave unknown fields empty. is_event=false for spam/newsletters/unrelated.`;
+
+function GMAIL_PARSE_PROMPT_BATCH(n){
+  return `Parse ${n} emails for Hamptons Coconuts (coconut catering). Return ONLY a JSON array of ${n} objects, one per email in order:
+[{"name":"","venue":"","contact":"","email":"","phone":"","event_date":"YYYY-MM-DD","event_end_date":"","delivery_date":"","delivery_time":"","coconuts":"int","total_amount":"num","deposit_amount":"","balance_amount":"","stamp_design":"","delivery_notes":"address","market":"ny|miami|other","event_type":"Wedding|Corporate Event|Birthday Party|Holiday Party","notes":"","is_event":true/false},...]
+Leave unknown fields empty. is_event=false for spam/newsletters/unrelated. Market: Hamptons/NYC/LI=ny, Miami/FL=miami.`;
 }
 
 function renderImportPanel(){
