@@ -210,6 +210,33 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-
 .cal-more{font-size:9px;color:var(--text-hint);padding:1px 3px;font-weight:500}
 .cal-legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px;font-size:11px;color:var(--text-muted);align-items:center}
 
+/* GMAIL IMPORT */
+.gmail-btn{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:4px 12px;font-size:11px;font-weight:600;cursor:pointer;color:var(--text-muted);transition:all 0.15s;white-space:nowrap}
+.gmail-btn:hover{background:var(--bg);border-color:var(--border-mid)}
+.gmail-btn.connected{background:#ecfdf5;color:#059669;border-color:#a7f3d0}
+.gmail-status{font-size:11px;color:var(--text-hint)}
+.gmail-badge{background:#ef4444;color:#fff;font-size:9px;font-weight:700;border-radius:10px;padding:1px 5px;margin-left:4px;vertical-align:top}
+.import-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);margin:0 20px 16px;padding:16px 20px;box-shadow:var(--shadow)}
+.import-panel-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.import-panel-title{font-size:14px;font-weight:700;color:var(--text)}
+.import-panel-actions{display:flex;gap:6px}
+.import-panel-actions button{padding:5px 12px;border-radius:8px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:var(--surface2);color:var(--text-muted);transition:all 0.15s}
+.import-panel-actions .import-confirm{background:var(--green);color:#fff;border-color:var(--green)}
+.import-panel-actions .import-confirm:hover{opacity:0.9}
+.import-item{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:8px;position:relative}
+.import-item:last-child{margin-bottom:0}
+.import-item-name{font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px}
+.import-item-details{font-size:11px;color:var(--text-muted);display:flex;gap:8px;flex-wrap:wrap}
+.import-item-remove{position:absolute;top:10px;right:10px;background:none;border:none;cursor:pointer;color:var(--text-hint);font-size:14px}
+.import-item-remove:hover{color:var(--fire)}
+.import-item .badge{font-size:10px}
+.import-spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--border);border-top-color:var(--green);border-radius:50%;animation:spin 0.6s linear infinite;margin-right:6px;vertical-align:middle}
+.import-toast{position:fixed;bottom:24px;right:24px;background:#065f46;color:#ecfdf5;padding:12px 20px;border-radius:12px;font-size:13px;font-weight:600;z-index:200;box-shadow:0 4px 20px rgba(0,0,0,0.2);animation:toastIn 0.3s ease-out}
+@keyframes toastIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.gmail-setup-bar{background:#fffbeb;border:1px solid #fde68a;border-radius:10px;margin:0 20px 12px;padding:10px 16px;font-size:12px;color:#92400e;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.gmail-setup-bar input{flex:1;min-width:200px;padding:6px 10px;border:1px solid #fde68a;border-radius:6px;font-size:12px;background:#fff;color:#92400e}
+.gmail-setup-bar button{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid #f59e0b;background:#f59e0b;color:#fff}
+
 /* MODAL */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:100;display:flex;align-items:flex-start;justify-content:center;padding:32px 16px;overflow-y:auto;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
 .modal{background:var(--surface);border-radius:var(--radius-2xl);width:100%;max-width:580px;padding:28px;position:relative;margin-bottom:40px;box-shadow:var(--shadow-lg)}
@@ -418,7 +445,24 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
   <span style="font-size:13px">☁️</span>
   <span id="sync-status" class="sync-status">Connecting...</span>
   <span style="flex:1"></span>
-
+  <span id="gmail-status" class="gmail-status"></span>
+  <button class="gmail-btn" id="gmail-btn" onclick="gmailConnect()">📧 Connect Gmail</button>
+</div>
+<div id="gmail-setup" class="gmail-setup-bar" style="display:none">
+  <span>📧 Gmail Client ID:</span>
+  <input type="text" id="gmail-client-id" placeholder="Paste your Google OAuth Client ID here">
+  <button onclick="saveGmailClientId()">Save</button>
+  <span style="font-size:10px;color:#b45309">Need one? <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color:#b45309;text-decoration:underline">Google Cloud Console</a></span>
+</div>
+<div id="import-panel" class="import-panel" style="display:none">
+  <div class="import-panel-header">
+    <div class="import-panel-title">📧 Email Import Preview</div>
+    <div class="import-panel-actions">
+      <button onclick="dismissAllImports()">Dismiss All</button>
+      <button class="import-confirm" onclick="confirmAllImports()">Import All</button>
+    </div>
+  </div>
+  <div id="import-items"></div>
 </div>
 
 <div class="urgent-banner" id="urgent-banner">
@@ -1920,6 +1964,355 @@ function jbDisconnect(){
   if(inp)inp.value='';
   updateJbUI(false);
 }
+
+// ══════════════════════════════════════════════
+// 📧  GMAIL IMPORT
+// ══════════════════════════════════════════════
+let gmailToken=null;
+let gmailPollTimer=null;
+let pendingImports=[];
+const GMAIL_SCOPES='https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify';
+
+function getGmailClientId(){return localStorage.getItem('hc_gmail_client_id')||'';}
+function getProcessedIds(){try{return JSON.parse(localStorage.getItem('hc_gmail_processed')||'[]');}catch(e){return[];}}
+function saveProcessedIds(ids){localStorage.setItem('hc_gmail_processed',JSON.stringify(ids));}
+
+function saveGmailClientId(){
+  const v=document.getElementById('gmail-client-id').value.trim();
+  if(!v){alert('Please paste your Google OAuth Client ID');return;}
+  localStorage.setItem('hc_gmail_client_id',v);
+  document.getElementById('gmail-setup').style.display='none';
+  gmailConnect();
+}
+
+function initGmailUI(){
+  const cid=getGmailClientId();
+  if(cid){
+    document.getElementById('gmail-setup').style.display='none';
+  }
+}
+initGmailUI();
+
+function gmailConnect(){
+  const clientId=getGmailClientId();
+  if(!clientId){
+    document.getElementById('gmail-setup').style.display='flex';
+    return;
+  }
+  if(!getKey()){alert('Add your Anthropic API key first (needed for AI parsing).');return;}
+  const tokenClient=google.accounts.oauth2.initTokenClient({
+    client_id:clientId,
+    scope:GMAIL_SCOPES,
+    callback:(resp)=>{
+      if(resp.error){
+        console.error('Gmail auth error:',resp);
+        setGmailStatus('Auth failed','err');
+        return;
+      }
+      gmailToken=resp.access_token;
+      const btn=document.getElementById('gmail-btn');
+      btn.textContent='📧 Connected';
+      btn.classList.add('connected');
+      btn.onclick=gmailDisconnect;
+      setGmailStatus('Checking inbox...','');
+      gmailCheckInbox();
+      if(gmailPollTimer)clearInterval(gmailPollTimer);
+      gmailPollTimer=setInterval(gmailCheckInbox,60000);
+    }
+  });
+  tokenClient.requestAccessToken();
+}
+
+function gmailDisconnect(){
+  gmailToken=null;
+  if(gmailPollTimer){clearInterval(gmailPollTimer);gmailPollTimer=null;}
+  const btn=document.getElementById('gmail-btn');
+  btn.textContent='📧 Connect Gmail';
+  btn.classList.remove('connected');
+  btn.onclick=gmailConnect;
+  setGmailStatus('','');
+}
+
+function setGmailStatus(msg,type){
+  const el=document.getElementById('gmail-status');
+  if(!el)return;
+  el.textContent=msg;
+  el.style.color=type==='err'?'var(--fire)':type==='ok'?'var(--green)':'var(--text-hint)';
+}
+
+async function gmailCheckInbox(){
+  if(!gmailToken)return;
+  try{
+    setGmailStatus('Checking inbox...','');
+    const listResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?q=is:unread&maxResults=10',{
+      headers:{'Authorization':'Bearer '+gmailToken}
+    });
+    if(listResp.status===401){gmailDisconnect();setGmailStatus('Session expired — reconnect','err');return;}
+    if(!listResp.ok)throw new Error('List failed ('+listResp.status+')');
+    const listData=await listResp.json();
+    const messages=listData.messages||[];
+    if(!messages.length){setGmailStatus('Inbox synced — no new emails','ok');return;}
+
+    const processed=getProcessedIds();
+    const newMsgs=messages.filter(m=>!processed.includes(m.id));
+    if(!newMsgs.length){setGmailStatus('Inbox synced','ok');return;}
+
+    setGmailStatus(`Parsing ${newMsgs.length} email${newMsgs.length>1?'s':''}...`,'');
+    let parsed=0;
+    for(const msg of newMsgs){
+      try{
+        const detail=await gmailGetMessage(msg.id);
+        if(!detail)continue;
+        const eventData=await gmailParseEmail(detail);
+        if(eventData){
+          pendingImports.push({...eventData,_gmailId:msg.id,_subject:detail.subject});
+          parsed++;
+        }
+        processed.push(msg.id);
+      }catch(err){
+        console.error('Error processing message '+msg.id+':',err);
+        processed.push(msg.id);
+      }
+    }
+    saveProcessedIds(processed.slice(-500));
+
+    if(parsed>0){
+      renderImportPanel();
+      setGmailStatus(parsed+' new email'+(parsed>1?'s':'')+' ready to import','ok');
+      const btn=document.getElementById('gmail-btn');
+      btn.innerHTML='📧 Connected<span class="gmail-badge">'+parsed+'</span>';
+    } else {
+      setGmailStatus('Inbox synced — no event emails found','ok');
+    }
+  }catch(err){
+    console.error('Gmail check error:',err);
+    setGmailStatus('Check failed: '+err.message,'err');
+  }
+}
+
+async function gmailGetMessage(id){
+  const resp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+id+'?format=full',{
+    headers:{'Authorization':'Bearer '+gmailToken}
+  });
+  if(!resp.ok)return null;
+  const data=await resp.json();
+  const headers=data.payload?.headers||[];
+  const getH=(n)=>(headers.find(h=>h.name.toLowerCase()===n.toLowerCase())||{}).value||'';
+  const subject=getH('Subject');
+  const from=getH('From');
+  const date=getH('Date');
+
+  let body='';
+  function extractText(part){
+    if(part.mimeType==='text/plain'&&part.body?.data){
+      body+=atob(part.body.data.replace(/-/g,'+').replace(/_/g,'/'));
+    }
+    if(part.mimeType==='text/html'&&!body&&part.body?.data){
+      const html=atob(part.body.data.replace(/-/g,'+').replace(/_/g,'/'));
+      body+=html.replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim();
+    }
+    if(part.parts)part.parts.forEach(extractText);
+  }
+  extractText(data.payload);
+
+  let attachments=[];
+  function findAttachments(part){
+    if(part.filename&&part.body?.attachmentId){
+      const mime=part.mimeType||'';
+      if(mime.startsWith('image/')||mime==='application/pdf'){
+        attachments.push({filename:part.filename,mimeType:mime,attachmentId:part.body.attachmentId,size:part.body.size||0});
+      }
+    }
+    if(part.parts)part.parts.forEach(findAttachments);
+  }
+  findAttachments(data.payload);
+
+  let attachmentData=null;
+  if(attachments.length>0){
+    const att=attachments[0];
+    try{
+      const attResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+id+'/attachments/'+att.attachmentId,{
+        headers:{'Authorization':'Bearer '+gmailToken}
+      });
+      if(attResp.ok){
+        const attJson=await attResp.json();
+        attachmentData={data:attJson.data.replace(/-/g,'+').replace(/_/g,'/'),mimeType:att.mimeType,filename:att.filename};
+      }
+    }catch(e){console.error('Attachment fetch failed:',e);}
+  }
+
+  return {subject,from,date,body:body.slice(0,8000),attachment:attachmentData,messageId:id};
+}
+
+async function gmailParseEmail(email){
+  const apiKey=getKey();
+  if(!apiKey)return null;
+
+  const contentBlocks=[];
+  if(email.attachment){
+    const isImg=email.attachment.mimeType.startsWith('image/');
+    if(isImg){
+      contentBlocks.push({type:'image',source:{type:'base64',media_type:email.attachment.mimeType,data:email.attachment.data}});
+    } else {
+      contentBlocks.push({type:'document',source:{type:'base64',media_type:'application/pdf',data:email.attachment.data}});
+    }
+  }
+  contentBlocks.push({type:'text',text:`Email Subject: ${email.subject}\nFrom: ${email.from}\nDate: ${email.date}\n\nBody:\n${email.body}`});
+
+  const systemPrompt=`You are an email parser for Hamptons Coconuts, a coconut catering company. Parse this email/invoice and extract event details. This could be a QuickBooks invoice, a venue inquiry, a booking confirmation, or a general event email.
+
+Return ONLY valid JSON (no markdown, no backticks):
+{
+  "name": "client or event name",
+  "venue": "venue name or empty",
+  "contact": "contact person name or empty",
+  "email": "email address or empty",
+  "phone": "phone number or empty",
+  "event_date": "YYYY-MM-DD or empty",
+  "event_end_date": "YYYY-MM-DD or empty (only if multi-day)",
+  "delivery_date": "YYYY-MM-DD or empty",
+  "delivery_time": "time string or empty",
+  "coconuts": "integer string or empty",
+  "total_amount": "number string no $ sign or empty",
+  "deposit_amount": "deposit number string or empty",
+  "balance_amount": "balance number string or empty",
+  "stamp_design": "branding notes or empty",
+  "delivery_notes": "delivery address or empty",
+  "market": "ny or miami or other (infer from address/venue)",
+  "event_type": "Wedding, Corporate Event, Birthday Party, Holiday Party, or empty",
+  "notes": "other relevant info, include invoice number if present",
+  "is_event": true or false (false if this email is not related to an event/order — e.g. spam, newsletter, unrelated)
+}
+
+If you can't determine a field, leave it as an empty string. Infer market from location clues (Hamptons/Long Island/NYC = ny, Miami/Florida = miami). Be smart about extracting from QuickBooks invoice formats.`;
+
+  try{
+    const resp=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+      body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:1200,system:systemPrompt,messages:[{role:'user',content:contentBlocks}]})
+    });
+    if(!resp.ok){console.error('Claude API error:',resp.status);return null;}
+    const data=await resp.json();
+    const txt=data.content?.find(c=>c.type==='text')?.text||'{}';
+    const parsed=JSON.parse(txt.replace(/```json|```/g,'').trim());
+    if(parsed.is_event===false)return null;
+    return parsed;
+  }catch(err){
+    console.error('Email parse error:',err);
+    return null;
+  }
+}
+
+function renderImportPanel(){
+  const panel=document.getElementById('import-panel');
+  const items=document.getElementById('import-items');
+  if(!pendingImports.length){panel.style.display='none';return;}
+  panel.style.display='block';
+  items.innerHTML=pendingImports.map((e,i)=>{
+    const dateStr=e.event_date?new Date(e.event_date+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'No date';
+    const market=e.market==='ny'?'🗽 NY':e.market==='miami'?'🌴 Miami':'📍 Other';
+    return `<div class="import-item">
+      <button class="import-item-remove" onclick="dismissImport(${i})" title="Dismiss">✕</button>
+      <div class="import-item-name">${esc(e.name||e._subject||'Unknown')}</div>
+      <div class="import-item-details">
+        <span>${dateStr}</span>
+        ${e.venue?'<span>📍 '+esc(e.venue)+'</span>':''}
+        ${e.coconuts?'<span>🥥 '+e.coconuts+'</span>':''}
+        ${e.total_amount?'<span>💰 $'+parseFloat(e.total_amount).toLocaleString()+'</span>':''}
+        <span>${market}</span>
+        ${e.event_type?'<span>'+esc(e.event_type)+'</span>':''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function dismissImport(idx){
+  pendingImports.splice(idx,1);
+  renderImportPanel();
+  updateGmailBadge();
+}
+
+function dismissAllImports(){
+  pendingImports=[];
+  renderImportPanel();
+  updateGmailBadge();
+}
+
+function confirmAllImports(){
+  let count=0;
+  pendingImports.forEach(p=>{
+    const ev={
+      id:'ev_'+Date.now()+'_'+Math.random().toString(36).slice(2,6),
+      type:'event',
+      name:p.name||p._subject||'Imported event',
+      stage:'lead',
+      venue:p.venue||'',
+      contact:p.contact||'',
+      email:p.email||'',
+      phone:p.phone||'',
+      event_date:p.event_date||'',
+      event_end_date:p.event_end_date||'',
+      delivery_date:p.delivery_date||'',
+      delivery_time:p.delivery_time||'',
+      coconuts:p.coconuts||'',
+      total_amount:p.total_amount||'',
+      deposit_amount:p.deposit_amount||'',
+      balance_amount:p.balance_amount||'',
+      stamp_design:p.stamp_design||'',
+      stamp_status:'Not ordered',
+      delivery_notes:p.delivery_notes||'',
+      market:p.market||'',
+      event_type:p.event_type||'',
+      source:'Email import',
+      notes:p.notes||'',
+      logo_received:'',
+      logo_data_url:'',
+      coi_requested:false,
+      crack_straw:'',crack_circle:'',crack_whole:'',
+      pre_tax_amount:'',tax_amount:'',
+      pay_notes:'',
+      invoice_name:'',invoice_url:'',
+      debrief_issues:'',debrief_next:'',debrief_rating:'',
+      cost_per_box:'',cost_labor:'',cost_other:'',
+      followup_added:new Date().toISOString().split('T')[0],
+      frequency:'',next_order_date:'',order_time:'',venue_type:''
+    };
+    events.push(ev);
+    count++;
+    // Mark email as read
+    if(p._gmailId&&gmailToken){
+      fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+p._gmailId+'/modify',{
+        method:'POST',
+        headers:{'Authorization':'Bearer '+gmailToken,'Content-Type':'application/json'},
+        body:JSON.stringify({removeLabelIds:['UNREAD']})
+      }).catch(()=>{});
+    }
+  });
+  pendingImports=[];
+  saveEvents();render();renderImportPanel();
+  updateGmailBadge();
+  showImportToast(count+' event'+(count>1?'s':'')+' imported from email');
+}
+
+function updateGmailBadge(){
+  const btn=document.getElementById('gmail-btn');
+  if(!gmailToken)return;
+  if(pendingImports.length>0){
+    btn.innerHTML='📧 Connected<span class="gmail-badge">'+pendingImports.length+'</span>';
+  } else {
+    btn.textContent='📧 Connected';
+  }
+}
+
+function showImportToast(msg){
+  const t=document.createElement('div');
+  t.className='import-toast';
+  t.textContent='✓ '+msg;
+  document.body.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity 0.3s';setTimeout(()=>t.remove(),300);},3500);
+}
+
 </script>
 </body>
 </html>
