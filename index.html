@@ -551,7 +551,20 @@ const SEED=[
 ];
 
 function loadEvents(){
-  try{const r=localStorage.getItem('hc_events');if(r){events=JSON.parse(r);return;}}catch(e){}
+  try{
+    const r=localStorage.getItem('hc_events');
+    if(r){
+      const parsed=JSON.parse(r);
+      if(Array.isArray(parsed)){
+        // Sanitize: ensure every event has an id and type, strip non-string fields that should be strings
+        events=parsed.filter(e=>e&&typeof e==='object'&&e.id).map(e=>{
+          if(!e.type)e.type='event';
+          return e;
+        });
+        return;
+      }
+    }
+  }catch(e){console.error('loadEvents error:',e);}
   events=SEED;saveEvents();
 }
 function saveEvents(){
@@ -1935,23 +1948,32 @@ async function jbPull(){
   if(!jbMasterKey||!jbBinId){return;} // silently skip if not connected
   setSyncStatus('<span class="sync-spinner"></span> Loading from cloud...','');
   try{
+    const controller=new AbortController();
+    const timeout=setTimeout(()=>controller.abort(),15000);
     const resp=await fetch('https://api.jsonbin.io/v3/b/'+jbBinId+'/latest',{
-      headers:{'X-Master-Key':jbMasterKey}
+      headers:{'X-Master-Key':jbMasterKey},
+      signal:controller.signal
     });
+    clearTimeout(timeout);
     if(!resp.ok)throw new Error('Pull failed ('+resp.status+')');
     const data=await resp.json();
     if(data.record&&Array.isArray(data.record.events)){
-      events=data.record.events;
+      // Sanitize pulled data
+      events=data.record.events.filter(e=>e&&typeof e==='object'&&e.id);
       localStorage.setItem('hc_events',JSON.stringify(events));
       render();
       const now=new Date();
       setSyncStatus('✓ Loaded '+events.length+' events from cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
     } else {
-      setSyncStatus('Cloud data looks empty — nothing to load','');
+      setSyncStatus('Cloud data looks empty — using local data','');
+      render();
     }
   }catch(err){
-    setSyncStatus('Pull failed: '+err.message,'err');
+    const msg=err.name==='AbortError'?'Cloud sync timed out — using local data':('Pull failed: '+err.message);
+    setSyncStatus(msg,'err');
     console.error('jbPull error:',err);
+    // Still render from local data so dashboard isn't blank
+    render();
   }
 }
 
@@ -2241,59 +2263,68 @@ function dismissAllImports(){
 }
 
 function confirmAllImports(){
-  let count=0;
-  pendingImports.forEach(p=>{
-    const ev={
-      id:'ev_'+Date.now()+'_'+Math.random().toString(36).slice(2,6),
-      type:'event',
-      name:p.name||p._subject||'Imported event',
-      stage:'lead',
-      venue:p.venue||'',
-      contact:p.contact||'',
-      email:p.email||'',
-      phone:p.phone||'',
-      event_date:p.event_date||'',
-      event_end_date:p.event_end_date||'',
-      delivery_date:p.delivery_date||'',
-      delivery_time:p.delivery_time||'',
-      coconuts:p.coconuts||'',
-      total_amount:p.total_amount||'',
-      deposit_amount:p.deposit_amount||'',
-      balance_amount:p.balance_amount||'',
-      stamp_design:p.stamp_design||'',
-      stamp_status:'Not ordered',
-      delivery_notes:p.delivery_notes||'',
-      market:p.market||'',
-      event_type:p.event_type||'',
-      source:'Email import',
-      notes:p.notes||'',
-      logo_received:'',
-      logo_data_url:'',
-      coi_requested:false,
-      crack_straw:'',crack_circle:'',crack_whole:'',
-      pre_tax_amount:'',tax_amount:'',
-      pay_notes:'',
-      invoice_name:'',invoice_url:'',
-      debrief_issues:'',debrief_next:'',debrief_rating:'',
-      cost_per_box:'',cost_labor:'',cost_other:'',
-      followup_added:new Date().toISOString().split('T')[0],
-      frequency:'',next_order_date:'',order_time:'',venue_type:''
-    };
-    events.push(ev);
-    count++;
-    // Mark email as read
-    if(p._gmailId&&gmailToken){
-      fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+p._gmailId+'/modify',{
-        method:'POST',
-        headers:{'Authorization':'Bearer '+gmailToken,'Content-Type':'application/json'},
-        body:JSON.stringify({removeLabelIds:['UNREAD']})
-      }).catch(()=>{});
-    }
-  });
-  pendingImports=[];
-  saveEvents();render();renderImportPanel();
-  updateGmailBadge();
-  showImportToast(count+' event'+(count>1?'s':'')+' imported from email');
+  try{
+    let count=0;
+    const gmailIds=[];
+    pendingImports.forEach((p,idx)=>{
+      const ev={
+        id:'ev_'+Date.now()+'_'+idx+'_'+Math.random().toString(36).slice(2,6),
+        type:'event',
+        name:String(p.name||p._subject||'Imported event').slice(0,200),
+        stage:'lead',
+        venue:String(p.venue||''),
+        contact:String(p.contact||''),
+        email:String(p.email||''),
+        phone:String(p.phone||''),
+        event_date:String(p.event_date||''),
+        event_end_date:String(p.event_end_date||''),
+        delivery_date:String(p.delivery_date||''),
+        delivery_time:String(p.delivery_time||''),
+        coconuts:String(p.coconuts||''),
+        total_amount:String(p.total_amount||''),
+        deposit_amount:String(p.deposit_amount||''),
+        balance_amount:String(p.balance_amount||''),
+        stamp_design:String(p.stamp_design||''),
+        stamp_status:'Not ordered',
+        delivery_notes:String(p.delivery_notes||''),
+        market:String(p.market||''),
+        event_type:String(p.event_type||''),
+        source:'Email import',
+        notes:String(p.notes||''),
+        logo_received:'',
+        logo_data_url:'',
+        coi_requested:false,
+        crack_straw:'',crack_circle:'',crack_whole:'',
+        pre_tax_amount:'',tax_amount:'',
+        pay_notes:'',
+        invoice_name:'',invoice_url:'',
+        debrief_issues:'',debrief_next:'',debrief_rating:'',
+        cost_per_box:'',cost_labor:'',cost_other:'',
+        followup_added:new Date().toISOString().split('T')[0],
+        frequency:'',next_order_date:'',order_time:'',venue_type:''
+      };
+      events.push(ev);
+      count++;
+      if(p._gmailId)gmailIds.push(p._gmailId);
+    });
+    pendingImports=[];
+    saveEvents();render();renderImportPanel();
+    updateGmailBadge();
+    showImportToast(count+' event'+(count>1?'s':'')+' imported from email');
+    // Mark emails as read in background (non-blocking)
+    gmailIds.forEach(gid=>{
+      if(gmailToken){
+        fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+gid+'/modify',{
+          method:'POST',
+          headers:{'Authorization':'Bearer '+gmailToken,'Content-Type':'application/json'},
+          body:JSON.stringify({removeLabelIds:['UNREAD']})
+        }).catch(()=>{});
+      }
+    });
+  }catch(err){
+    console.error('Import error:',err);
+    alert('Import failed: '+err.message+'. Your existing data is safe.');
+  }
 }
 
 function updateGmailBadge(){
