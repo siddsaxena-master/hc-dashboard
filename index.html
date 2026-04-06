@@ -986,8 +986,19 @@ function renderCal(){
   events.forEach(e=>{
     const dateKey=e.type==='recurring'?e.next_order_date:e.event_date;
     if(!dateKey)return;
-    if(!evByDate[dateKey])evByDate[dateKey]=[];
-    evByDate[dateKey].push(e);
+    if(e.type!=='recurring'&&e.event_end_date&&e.event_end_date!==e.event_date){
+      const start=parseLocalDate(e.event_date);
+      const end=parseLocalDate(e.event_end_date);
+      for(let d=new Date(start);d<=end;d.setDate(d.getDate()+1)){
+        const k=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        if(!evByDate[k])evByDate[k]=[];
+        const pos=d.toDateString()===start.toDateString()?'start':d.toDateString()===end.toDateString()?'end':'mid';
+        evByDate[k].push({...e,_multiPos:pos});
+      }
+    } else {
+      if(!evByDate[dateKey])evByDate[dateKey]=[];
+      evByDate[dateKey].push(e);
+    }
   });
   let cells='';
   for(let i=0;i<totalCells;i++){
@@ -1000,7 +1011,12 @@ function renderCal(){
     const evHtml=shown.map(e=>{
       const urg=isStampUrgent(e);
       const typeClass=e.type==='recurring'?'type-recurring':'type-event market-'+(e.market||'');
-      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}" onclick="event.stopPropagation();openEdit('${e.id}')" title="${esc(e.name)}">${e.type==='recurring'?'🔄 ':''}${esc(e.name)}</div>`;
+      let multiStyle='';
+      if(e._multiPos==='start'){multiStyle='border-radius:3px 0 0 3px;margin-right:-2px;';}
+      else if(e._multiPos==='mid'){multiStyle='border-radius:0;margin-left:-2px;margin-right:-2px;border-left:none;opacity:0.85;';}
+      else if(e._multiPos==='end'){multiStyle='border-radius:0 3px 3px 0;margin-left:-2px;border-left:none;opacity:0.85;';}
+      const label=e._multiPos==='mid'?'···':e._multiPos==='end'?'▶ '+esc(e.name):(e.type==='recurring'?'🔄 ':'')+esc(e.name);
+      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}" style="${multiStyle}" onclick="event.stopPropagation();openEdit('${e.id}')" title="${esc(e.name)}">${label}</div>`;
     }).join('');
     cells+=`<div class="cal-cell${!isThisMonth?' other-month':''}${isToday?' today':''}">
       <div class="cal-date">${d.getDate()}</div>${evHtml}${extra>0?`<div class="cal-more">+${extra}</div>`:''}
