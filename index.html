@@ -449,12 +449,6 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
   <span id="gmail-status" class="gmail-status"></span>
   <button class="gmail-btn" id="gmail-btn" onclick="gmailConnect()">📧 Connect Gmail</button>
 </div>
-<div id="gmail-setup" class="gmail-setup-bar" style="display:none">
-  <span>📧 Gmail Client ID:</span>
-  <input type="text" id="gmail-client-id" placeholder="Paste your Google OAuth Client ID here">
-  <button onclick="saveGmailClientId()">Save</button>
-  <span style="font-size:10px;color:#b45309">Need one? <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color:#b45309;text-decoration:underline">Google Cloud Console</a></span>
-</div>
 <div id="import-panel" class="import-panel" style="display:none">
   <div class="import-panel-header">
     <div class="import-panel-title">📧 Email Import Preview</div>
@@ -531,19 +525,9 @@ let events=[], currentView='list', editingId=null;
 let calYear=new Date().getFullYear(), calMonth=new Date().getMonth();
 
 // ── API KEY
-function getKey(){return localStorage.getItem('hc_apikey')||'';}
-function saveKey(){
-  const k=document.getElementById('apikey-input').value.trim();
-  if(!k.startsWith('sk-')){alert('Should start with sk-ant-');return;}
-  localStorage.setItem('hc_apikey',k);
-  document.getElementById('key-status').textContent='✓ Key saved';
-  document.getElementById('key-status').className='key-ok';
-  document.getElementById('apikey-input').value='sk-ant-••••••••••••';
-}
-function initKeyUI(){
-  const k=getKey();
-  if(k){document.getElementById('apikey-input').value='sk-ant-••••••••••••';document.getElementById('key-status').textContent='✓ Key saved';document.getElementById('key-status').className='key-ok';}
-}
+const HC_API_KEY='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';
+function getKey(){return HC_API_KEY;}
+function initKeyUI(){}
 
 // ── STORAGE
 const SEED=[
@@ -1786,6 +1770,8 @@ function checkPin(){
         }
       },30000);
     }
+    // Auto-connect Gmail after PIN unlock
+    setTimeout(()=>{if(!gmailToken&&typeof google!=='undefined')gmailConnect();},1500);
     // Show role badge in topbar
     const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
     document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
@@ -1834,6 +1820,8 @@ function initOwner(){
         }
       },30000);
     }
+    // Auto-connect Gmail on session restore
+    setTimeout(()=>{if(!gmailToken&&typeof google!=='undefined')gmailConnect();},1500);
   }
 }
 function lockOwner(){
@@ -1994,37 +1982,17 @@ function jbDisconnect(){
 let gmailToken=null;
 let gmailPollTimer=null;
 let pendingImports=[];
+const GMAIL_CLIENT_ID='75524305294-64rd8ooijhd2kkfao2bnqss8egvk1cb4.apps.googleusercontent.com';
 const GMAIL_SCOPES='https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify';
 
-function getGmailClientId(){return localStorage.getItem('hc_gmail_client_id')||'';}
+function getGmailClientId(){return GMAIL_CLIENT_ID;}
 function getProcessedIds(){try{return JSON.parse(localStorage.getItem('hc_gmail_processed')||'[]');}catch(e){return[];}}
 function saveProcessedIds(ids){localStorage.setItem('hc_gmail_processed',JSON.stringify(ids));}
 
-function saveGmailClientId(){
-  const v=document.getElementById('gmail-client-id').value.trim();
-  if(!v){alert('Please paste your Google OAuth Client ID');return;}
-  localStorage.setItem('hc_gmail_client_id',v);
-  document.getElementById('gmail-setup').style.display='none';
-  gmailConnect();
-}
-
-function initGmailUI(){
-  const cid=getGmailClientId();
-  if(cid){
-    document.getElementById('gmail-setup').style.display='none';
-  }
-}
-initGmailUI();
-
 function gmailConnect(){
-  const clientId=getGmailClientId();
-  if(!clientId){
-    document.getElementById('gmail-setup').style.display='flex';
-    return;
-  }
   // API key checked later during parsing, not at connect time
   const tokenClient=google.accounts.oauth2.initTokenClient({
-    client_id:clientId,
+    client_id:GMAIL_CLIENT_ID,
     scope:GMAIL_SCOPES,
     callback:(resp)=>{
       if(resp.error){
@@ -2080,7 +2048,7 @@ async function gmailCheckInbox(){
     const newMsgs=messages.filter(m=>!processed.includes(m.id));
     if(!newMsgs.length){setGmailStatus('Inbox synced','ok');return;}
 
-    if(!getKey()){setGmailStatus('Found '+newMsgs.length+' emails — add API key to parse','err');showApiKeyPrompt();return;}
+    if(!getKey()){setGmailStatus('Found '+newMsgs.length+' emails — API key missing','err');return;}
     setGmailStatus(`Parsing ${newMsgs.length} email${newMsgs.length>1?'s':''}...`,'');
     let parsed=0;
     for(const msg of newMsgs){
