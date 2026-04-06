@@ -203,6 +203,9 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-
 .cal-ev.multi-mid{border-radius:0;margin-left:-8px;margin-right:-8px;border-left:none;opacity:0.85}
 .cal-ev.multi-end{border-radius:0 5px 5px 0;margin-left:-8px;border-left:none;opacity:0.85}
 .cal-ev.multi-slot-placeholder{visibility:hidden;height:16px}
+.cal-ev.cal-lead{border:1.5px dashed currentColor;background:transparent!important;opacity:0.7}
+.cal-ev.cal-confirmed{box-shadow:0 1px 2px rgba(0,0,0,0.1)}
+.cal-ev.cal-passed{opacity:0.35;text-decoration:line-through}
 .cal-ev.type-recurring{background:#ede9fe;color:#5b21b6}
 .cal-ev.type-event.market-ny{background:#e8f2ff;color:#0055cc}
 .cal-ev.type-event.market-miami{background:#fff0f3;color:#c0003c}
@@ -1086,12 +1089,16 @@ function renderCal(){
       if(e._placeholder)return`<div class="cal-ev multi-slot-placeholder">&nbsp;</div>`;
       const urg=isStampUrgent(e);
       const typeClass=e.type==='recurring'?'type-recurring':'type-event market-'+(e.market||'');
+      const isLead=e.stage==='lead'||!e.stage;
+      const isPassed=e.stage==='passed';
+      const stageClass=isPassed?' cal-passed':isLead?' cal-lead':' cal-confirmed';
       let multiClass='';
       if(e._multiPos==='start')multiClass=' multi-start';
       else if(e._multiPos==='mid')multiClass=' multi-mid';
       else if(e._multiPos==='end')multiClass=' multi-end';
-      const label=e._multiPos==='mid'?'&nbsp;':e._multiPos==='end'?esc(e.name):(e.type==='recurring'?'🔄 ':'')+esc(e.name);
-      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}${multiClass}" onclick="event.stopPropagation();openEdit('${e.id}')" title="${esc(e.name)}">${label}</div>`;
+      const prefix=e.type==='recurring'?'🔄 ':isLead?'○ ':'● ';
+      const label=e._multiPos==='mid'?'&nbsp;':e._multiPos==='end'?esc(e.name):prefix+esc(e.name);
+      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}${stageClass}${multiClass}" onclick="event.stopPropagation();openEdit('${e.id}')" title="${esc(e.name)}${isLead?' (Lead)':isPassed?' (Passed)':' (Confirmed)'}">${label}</div>`;
     }).join('');
     cells+=`<div class="cal-cell${!isThisMonth?' other-month':''}${isToday?' today':''}">
       <div class="cal-date">${d.getDate()}</div>${evHtml}${extra>0?`<div class="cal-more">+${extra}</div>`:''}
@@ -1114,6 +1121,8 @@ function renderCal(){
       <span><span style="display:inline-block;width:8px;height:8px;background:#eff6ff;border-left:2px solid #3b82f6;margin-right:4px"></span>Event (NY)</span>
       <span><span style="display:inline-block;width:8px;height:8px;background:#ecfdf5;border-left:2px solid #10b981;margin-right:4px"></span>Event (Miami)</span>
       <span><span style="display:inline-block;width:8px;height:8px;background:#fff1ee;border-left:2px solid var(--fire);margin-right:4px"></span>🚨 Urgent</span>
+      <span style="margin-left:8px;border-left:1px solid var(--border);padding-left:10px">○ <span style="border:1.5px dashed #999;border-radius:3px;padding:0 4px;font-size:9px;opacity:0.7">Lead</span></span>
+      <span>● <span style="background:var(--green-pale);border-radius:3px;padding:0 4px;font-size:9px;box-shadow:0 1px 2px rgba(0,0,0,0.1)">Confirmed</span></span>
     </div>`;
 }
 function calPrev(){calMonth--;if(calMonth<0){calMonth=11;calYear--;}renderCal();}
