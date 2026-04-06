@@ -198,6 +198,10 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-
 .cal-cell.today .cal-date{background:var(--green);color:#fff;border-radius:50%}
 .cal-date{font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:3px;width:22px;height:22px;display:flex;align-items:center;justify-content:center}
 .cal-ev{border-radius:5px;padding:2px 6px;font-size:10px;margin-bottom:2px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.cal-ev.multi-start{border-radius:5px 0 0 5px;margin-right:-8px}
+.cal-ev.multi-mid{border-radius:0;margin-left:-8px;margin-right:-8px;border-left:none;opacity:0.85}
+.cal-ev.multi-end{border-radius:0 5px 5px 0;margin-left:-8px;border-left:none;opacity:0.85}
+.cal-ev.multi-slot-placeholder{visibility:hidden;height:16px}
 .cal-ev.type-recurring{background:#ede9fe;color:#5b21b6}
 .cal-ev.type-event.market-ny{background:#e8f2ff;color:#0055cc}
 .cal-ev.type-event.market-miami{background:#fff0f3;color:#c0003c}
@@ -325,6 +329,10 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
   .cal-title{font-size:17px}
   .cal-cell{min-height:58px;padding:4px;border-radius:7px}
   .cal-ev{font-size:9px;padding:1px 4px}
+  .cal-ev.multi-start{margin-right:-5px}
+  .cal-ev.multi-mid{margin-left:-5px;margin-right:-5px}
+  .cal-ev.multi-end{margin-left:-5px}
+  .cal-ev.multi-slot-placeholder{height:14px}
   .cal-day-name{font-size:9px;padding:5px 0}
   .cal-legend{gap:8px;font-size:10px;margin-top:10px}
   #report-wrap{padding:0 14px 24px}
@@ -983,22 +991,51 @@ function renderCal(){
   const daysInMonth=new Date(calYear,calMonth+1,0).getDate();
   const totalCells=Math.ceil((startDow+daysInMonth)/7)*7;
   const evByDate={};
+  // Collect multi-day events and assign consistent slot indices
+  const multiDayEvents=[];
   events.forEach(e=>{
     const dateKey=e.type==='recurring'?e.next_order_date:e.event_date;
     if(!dateKey)return;
     if(e.type!=='recurring'&&e.event_end_date&&e.event_end_date!==e.event_date){
-      const start=parseLocalDate(e.event_date);
-      const end=parseLocalDate(e.event_end_date);
+      multiDayEvents.push(e);
+    }
+  });
+  // Sort multi-day events by start date so slot assignment is deterministic
+  multiDayEvents.sort((a,b)=>(a.event_date||'').localeCompare(b.event_date||''));
+  // Assign a global slot index for each multi-day event per date
+  const multiSlots={}; // dateKey -> {eventId: slotIndex}
+  multiDayEvents.forEach(e=>{
+    const start=parseLocalDate(e.event_date);
+    const end=parseLocalDate(e.event_end_date);
+    // Find the lowest slot that's free across all days of this event
+    let slot=0;
+    for(;;slot++){
+      let free=true;
       for(let d=new Date(start);d<=end;d.setDate(d.getDate()+1)){
         const k=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-        if(!evByDate[k])evByDate[k]=[];
-        const pos=d.toDateString()===start.toDateString()?'start':d.toDateString()===end.toDateString()?'end':'mid';
-        evByDate[k].push({...e,_multiPos:pos});
+        if(multiSlots[k]){
+          const taken=Object.values(multiSlots[k]);
+          if(taken.includes(slot)){free=false;break;}
+        }
       }
-    } else {
-      if(!evByDate[dateKey])evByDate[dateKey]=[];
-      evByDate[dateKey].push(e);
+      if(free)break;
     }
+    for(let d=new Date(start);d<=end;d.setDate(d.getDate()+1)){
+      const k=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      if(!multiSlots[k])multiSlots[k]={};
+      multiSlots[k][e.id]=slot;
+      if(!evByDate[k])evByDate[k]=[];
+      const pos=d.toDateString()===start.toDateString()?'start':d.toDateString()===end.toDateString()?'end':'mid';
+      evByDate[k].push({...e,_multiPos:pos,_slot:slot});
+    }
+  });
+  // Add single-day and recurring events
+  events.forEach(e=>{
+    const dateKey=e.type==='recurring'?e.next_order_date:e.event_date;
+    if(!dateKey)return;
+    if(e.type!=='recurring'&&e.event_end_date&&e.event_end_date!==e.event_date)return; // already added
+    if(!evByDate[dateKey])evByDate[dateKey]=[];
+    evByDate[dateKey].push(e);
   });
   let cells='';
   for(let i=0;i<totalCells;i++){
@@ -1007,16 +1044,29 @@ function renderCal(){
     const isToday=d.toDateString()===today.toDateString();
     const dateStr=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
     const dayEvs=evByDate[dateStr]||[];
-    const shown=dayEvs.slice(0,3);const extra=dayEvs.length-3;
+    // Separate multi-day (slotted) from single-day events
+    const multiDay=dayEvs.filter(e=>e._multiPos);
+    const singleDay=dayEvs.filter(e=>!e._multiPos);
+    // Build ordered list: multi-day events in slot order (with placeholders for gaps), then single-day
+    const maxSlot=multiDay.length?Math.max(...multiDay.map(e=>e._slot)):- 1;
+    const ordered=[];
+    for(let s=0;s<=maxSlot;s++){
+      const ev=multiDay.find(e=>e._slot===s);
+      if(ev)ordered.push(ev);
+      else ordered.push({_placeholder:true,_slot:s});
+    }
+    singleDay.forEach(e=>ordered.push(e));
+    const shown=ordered.slice(0,4);const extra=ordered.length-4;
     const evHtml=shown.map(e=>{
+      if(e._placeholder)return`<div class="cal-ev multi-slot-placeholder">&nbsp;</div>`;
       const urg=isStampUrgent(e);
       const typeClass=e.type==='recurring'?'type-recurring':'type-event market-'+(e.market||'');
-      let multiStyle='';
-      if(e._multiPos==='start'){multiStyle='border-radius:3px 0 0 3px;margin-right:-2px;';}
-      else if(e._multiPos==='mid'){multiStyle='border-radius:0;margin-left:-2px;margin-right:-2px;border-left:none;opacity:0.85;';}
-      else if(e._multiPos==='end'){multiStyle='border-radius:0 3px 3px 0;margin-left:-2px;border-left:none;opacity:0.85;';}
-      const label=e._multiPos==='mid'?'···':e._multiPos==='end'?'▶ '+esc(e.name):(e.type==='recurring'?'🔄 ':'')+esc(e.name);
-      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}" style="${multiStyle}" onclick="event.stopPropagation();openEdit('${e.id}')" title="${esc(e.name)}">${label}</div>`;
+      let multiClass='';
+      if(e._multiPos==='start')multiClass=' multi-start';
+      else if(e._multiPos==='mid')multiClass=' multi-mid';
+      else if(e._multiPos==='end')multiClass=' multi-end';
+      const label=e._multiPos==='mid'?'&nbsp;':e._multiPos==='end'?esc(e.name):(e.type==='recurring'?'🔄 ':'')+esc(e.name);
+      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}${multiClass}" onclick="event.stopPropagation();openEdit('${e.id}')" title="${esc(e.name)}">${label}</div>`;
     }).join('');
     cells+=`<div class="cal-cell${!isThisMonth?' other-month':''}${isToday?' today':''}">
       <div class="cal-date">${d.getDate()}</div>${evHtml}${extra>0?`<div class="cal-more">+${extra}</div>`:''}
