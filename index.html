@@ -2057,7 +2057,7 @@ async function gmailCheckInbox(){
     const newMsgs=messages.filter(m=>!processed.includes(m.id));
     if(!newMsgs.length){setGmailStatus('Inbox synced','ok');return;}
 
-    if(!getKey()){setGmailStatus('Found '+newMsgs.length+' emails — add Anthropic API key to parse','err');return;}
+    if(!getKey()){setGmailStatus('Found '+newMsgs.length+' emails — add API key to parse','err');showApiKeyPrompt();return;}
     setGmailStatus(`Parsing ${newMsgs.length} email${newMsgs.length>1?'s':''}...`,'');
     let parsed=0;
     for(const msg of newMsgs){
@@ -2304,6 +2304,30 @@ function updateGmailBadge(){
   } else {
     btn.textContent='📧 Connected';
   }
+}
+
+function showApiKeyPrompt(){
+  const existing=document.getElementById('api-key-prompt');
+  if(existing)return;
+  const div=document.createElement('div');
+  div.id='api-key-prompt';
+  div.className='gmail-setup-bar';
+  div.innerHTML=`<span>🔑 Anthropic API Key needed to parse emails:</span>
+    <input type="text" id="api-key-inline" placeholder="sk-ant-api03-..." style="flex:1;min-width:200px">
+    <button onclick="saveApiKeyInline()">Save & Parse</button>
+    <span style="font-size:10px;color:#b45309"><a href="https://console.anthropic.com/settings/keys" target="_blank" style="color:#b45309;text-decoration:underline">Get a key</a></span>`;
+  const panel=document.getElementById('import-panel');
+  panel.parentNode.insertBefore(div,panel);
+}
+
+function saveApiKeyInline(){
+  const k=document.getElementById('api-key-inline').value.trim();
+  if(!k.startsWith('sk-')){alert('Key should start with sk-');return;}
+  localStorage.setItem('hc_apikey',k);
+  const prompt=document.getElementById('api-key-prompt');
+  if(prompt)prompt.remove();
+  setGmailStatus('Key saved — checking inbox...','ok');
+  gmailCheckInbox();
 }
 
 function showImportToast(msg){
