@@ -299,31 +299,31 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
 
 .logo-preview{width:100%;max-height:120px;object-fit:contain;border-radius:8px;border:1px solid var(--border);background:#fafafa;padding:8px;cursor:pointer}
 
-/* PIN LOCK SCREEN — Apple-style */
+/* AUTH SCREEN */
 #pin-overlay{position:fixed;inset:0;background:linear-gradient(160deg,#0d2418 0%,#1c4532 60%,#276749 100%);z-index:9999;display:flex;align-items:center;justify-content:center;flex-direction:column;padding:20px}
 #pin-overlay.hidden{display:none}
 .pin-box{background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-radius:24px;padding:36px 32px;width:100%;max-width:340px;text-align:center;box-shadow:0 32px 80px rgba(0,0,0,0.35)}
 .pin-logo{font-size:44px;margin-bottom:10px;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.1))}
 .pin-brand{font-size:20px;font-weight:700;color:var(--text);margin-bottom:2px;letter-spacing:-0.4px}
 .pin-sub{font-size:11px;color:var(--text-hint);margin-bottom:28px;letter-spacing:0.8px;text-transform:uppercase;font-weight:500}
-.pin-dots{display:flex;justify-content:center;gap:12px;margin-bottom:24px}
-.pin-dot{width:13px;height:13px;border-radius:50%;border:1.5px solid var(--border-mid);background:transparent;transition:all 0.2s cubic-bezier(0.34,1.56,0.64,1)}
-.pin-dot.filled{background:var(--green);border-color:var(--green);transform:scale(1.1)}
-.pin-keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
-.pin-key{background:var(--bg);border:1px solid var(--border);border-radius:14px;padding:15px;font-size:22px;font-weight:400;cursor:pointer;transition:all 0.12s;color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,0.06)}
-.pin-key:hover{background:#e9e9ef;box-shadow:0 2px 6px rgba(0,0,0,0.1)}
-.pin-key:active{transform:scale(0.93);background:#d8d8df}
-.pin-key.del{font-size:18px;color:var(--text-muted)}
-.pin-error{color:var(--red);font-size:12px;font-weight:600;min-height:18px;margin-top:4px;animation:shake 0.3s ease}
-@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
-.pin-role-badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:0.3px;text-transform:uppercase;margin-bottom:16px}
-.pin-role-badge.owner{background:#dcfce7;color:#166534}
-.pin-role-badge.ny{background:#e8f2ff;color:#0055cc}
-.pin-role-badge.miami{background:#fff0f3;color:#c0003c}
+.google-signin-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:12px 20px;border-radius:12px;border:1px solid var(--border);background:#fff;font-size:14px;font-weight:600;color:#3c4043;cursor:pointer;transition:all 0.15s;box-shadow:0 1px 3px rgba(0,0,0,0.08);font-family:'Inter',-apple-system,sans-serif;margin-bottom:12px}
+.google-signin-btn:hover{background:#f8f9fa;box-shadow:0 2px 8px rgba(0,0,0,0.12)}
+.google-signin-btn:active{transform:scale(0.98)}
+.pin-error{color:var(--red);font-size:12px;font-weight:600;min-height:18px;margin-top:4px}
+.auth-role-badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:0.3px;text-transform:uppercase;margin-bottom:16px}
+.auth-role-badge.owner{background:#dcfce7;color:#166534}
+.auth-role-badge.ny{background:#e8f2ff;color:#0055cc}
+.auth-role-badge.miami{background:#fff0f3;color:#c0003c}
 /* Team role restrictions */
 .market-ny-only .add-btn,.market-miami-only .add-btn{display:none}
 .market-ny-only .owner-hide,.market-miami-only .owner-hide{display:none}
 .market-ny-only .topbar-actions .icon-btn,.market-miami-only .topbar-actions .icon-btn{display:none}
+/* View-only mode for team members */
+.team-view-only .add-btn{display:none}
+.team-view-only .section-add{display:none}
+.team-view-only .card-edit-btn{display:none}
+.team-view-only .modal .save-btn{display:none}
+.team-view-only .modal .del-btn{display:none}
 .logo-upload-area{grid-column:1/-1;border:1.5px dashed var(--border-mid);border-radius:var(--radius-lg);padding:16px;text-align:center;cursor:pointer;transition:all 0.2s;background:#fafafa;position:relative}
 .logo-upload-area:hover{border-color:var(--green);background:var(--green-wash)}
 .logo-modal{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;cursor:pointer}
@@ -389,34 +389,17 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
 </style>
 </head>
 <body>
-<!-- PIN LOCK OVERLAY -->
+<!-- AUTH OVERLAY -->
 <div id="pin-overlay">
   <div class="pin-box">
     <div class="pin-logo">🥥</div>
     <div class="pin-brand">Hamptons Coconuts</div>
     <div class="pin-sub">Ops Dashboard</div>
     <div id="pin-role-display"></div>
-    <div class="pin-dots" id="pin-dots">
-      <div class="pin-dot" id="pd0"></div>
-      <div class="pin-dot" id="pd1"></div>
-      <div class="pin-dot" id="pd2"></div>
-      <div class="pin-dot" id="pd3"></div>
-      <div class="pin-dot" id="pd4"></div>
-      <div class="pin-dot" id="pd5"></div>
-    </div>
-    <div class="pin-keypad">
-      <button class="pin-key" onclick="pinKey('1')">1</button>
-      <button class="pin-key" onclick="pinKey('2')">2</button>
-      <button class="pin-key" onclick="pinKey('3')">3</button>
-      <button class="pin-key" onclick="pinKey('4')">4</button>
-      <button class="pin-key" onclick="pinKey('5')">5</button>
-      <button class="pin-key" onclick="pinKey('6')">6</button>
-      <button class="pin-key" onclick="pinKey('7')">7</button>
-      <button class="pin-key" onclick="pinKey('8')">8</button>
-      <button class="pin-key" onclick="pinKey('9')">9</button>
-      <button class="pin-key" onclick="pinKey('0')" style="grid-column:2">0</button>
-      <button class="pin-key del" onclick="pinDel()">⌫</button>
-    </div>
+    <button class="google-signin-btn" id="google-signin-btn" onclick="googleSignIn()">
+      <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+      Sign in with Google
+    </button>
     <div class="pin-error" id="pin-error"></div>
   </div>
 </div>
@@ -433,7 +416,7 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
       <button class="vt-btn" id="vt-report" onclick="setView('report')">📊 Reports</button>
     </div>
     <div class="topbar-actions">
-      <button class="icon-btn" onclick="lockOwner()" title="Lock &amp; switch role" style="color:#4ade80">🔒 Lock</button>
+      <button class="icon-btn" onclick="lockOwner()" title="Sign out" style="color:#4ade80">🔓 Sign Out</button>
       <button class="icon-btn" onclick="exportData()" title="Backup data">↓ Backup</button>
       <button class="icon-btn" onclick="importData()" title="Restore data">↑ Restore</button>
     </div>
@@ -1719,126 +1702,153 @@ function renderReports(){
 // ══════════════════════════════════════════════
 // 🔐  ROLE-BASED PIN ACCESS CONTROL
 // ══════════════════════════════════════════════
-const PINS={
-  '071515':{role:'owner',label:'Owner',market:null},
-  '2026':{role:'ny',label:'NY Team',market:'ny'},
-  '1991':{role:'miami',label:'Miami Team',market:'miami'}
+// ── AUTH: Google OAuth + Email Whitelist
+const AUTH_USERS={
+  'siddsaxena@gmail.com':{role:'owner',label:'Owner',market:null},
+  // Add team members here:
+  // 'nyperson@gmail.com':{role:'ny',label:'NY Team',market:'ny'},
+  // 'miamiperson@gmail.com':{role:'miami',label:'Miami Team',market:'miami'},
 };
 let currentRole=null; // 'owner','ny','miami'
 let currentMarket=null; // null=all, 'ny', 'miami'
-let pinBuffer='';
+let currentUserEmail=null;
 
-function pinKey(d){
-  if(pinBuffer.length>=6)return;
-  pinBuffer+=d;
-  updatePinDots();
-  if(pinBuffer.length>=4){
-    // Check after a short delay to show last dot
-    setTimeout(checkPin,120);
-  }
-}
-function pinDel(){
-  pinBuffer=pinBuffer.slice(0,-1);
-  updatePinDots();
-  document.getElementById('pin-error').textContent='';
-}
-function updatePinDots(){
-  for(let i=0;i<6;i++){
-    const dot=document.getElementById('pd'+i);
-    if(dot)dot.classList.toggle('filled',i<pinBuffer.length);
-  }
-}
-function checkPin(){
-  const match=PINS[pinBuffer];
-  if(match){
-    currentRole=match.role;
-    currentMarket=match.market;
-    localStorage.setItem('hc_role',currentRole);
-    localStorage.setItem('hc_market',currentMarket||'');
-    applyRole();
-    document.getElementById('pin-overlay').classList.add('hidden');
-    pinBuffer='';
-    updatePinDots();
-    render();
-    // Auto-pull latest cloud data after PIN unlock
-    jbPull();
-    // Start periodic background sync every 30 seconds
-    if(!window._jbSyncInterval){
-      window._jbSyncInterval=setInterval(()=>{
-        if(currentRole&&jbBinId&&jbMasterKey&&!jbSyncing){
-          jbPull();
+function googleSignIn(){
+  const btn=document.getElementById('google-signin-btn');
+  btn.textContent='Signing in...';
+  btn.disabled=true;
+  const client=google.accounts.oauth2.initTokenClient({
+    client_id:GMAIL_CLIENT_ID,
+    scope:'email profile '+GMAIL_SCOPES,
+    callback:async(resp)=>{
+      if(resp.error){
+        btn.innerHTML='<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Sign in with Google';
+        btn.disabled=false;
+        document.getElementById('pin-error').textContent='Sign-in cancelled';
+        setTimeout(()=>document.getElementById('pin-error').textContent='',3000);
+        return;
+      }
+      // Got token — now get user's email
+      gmailToken=resp.access_token;
+      try{
+        const infoResp=await fetch('https://www.googleapis.com/oauth2/v2/userinfo',{
+          headers:{'Authorization':'Bearer '+resp.access_token}
+        });
+        const info=await infoResp.json();
+        const email=(info.email||'').toLowerCase();
+        const authEntry=AUTH_USERS[email];
+        if(!authEntry){
+          document.getElementById('pin-error').textContent='Access denied — '+email+' is not authorized';
+          btn.innerHTML='<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Sign in with Google';
+          btn.disabled=false;
+          gmailToken=null;
+          return;
         }
-      },30000);
+        // Authorized — activate session
+        currentUserEmail=email;
+        currentRole=authEntry.role;
+        currentMarket=authEntry.market;
+        localStorage.setItem('hc_auth_email',email);
+        localStorage.setItem('hc_role',currentRole);
+        localStorage.setItem('hc_market',currentMarket||'');
+        activateSession();
+      }catch(e){
+        console.error('Auth error:',e);
+        btn.innerHTML='<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Sign in with Google';
+        btn.disabled=false;
+        document.getElementById('pin-error').textContent='Sign-in failed — try again';
+      }
     }
-    // Auto-connect Gmail after PIN unlock
-    setTimeout(()=>{if(!gmailToken&&typeof google!=='undefined')gmailConnect();},1500);
-    // Show role badge in topbar
-    const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
-    document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
-  } else if(pinBuffer.length>=6){
-    document.getElementById('pin-error').textContent='Incorrect PIN — try again';
-    pinBuffer='';
-    updatePinDots();
-    setTimeout(()=>document.getElementById('pin-error').textContent='',2000);
-  }
+  });
+  client.requestAccessToken();
 }
+
+function activateSession(){
+  applyRole();
+  document.getElementById('pin-overlay').classList.add('hidden');
+  render();
+  jbPull();
+  // Background sync
+  if(!window._jbSyncInterval){
+    window._jbSyncInterval=setInterval(()=>{
+      if(currentRole&&jbBinId&&jbMasterKey&&!jbSyncing)jbPull();
+    },30000);
+  }
+  // Gmail is already connected from the sign-in token
+  if(gmailToken){
+    const btn=document.getElementById('gmail-btn');
+    btn.textContent='📧 Connected';
+    btn.classList.add('connected');
+    btn.onclick=gmailDisconnect;
+    gmailCheckInbox();
+    if(gmailPollTimer)clearInterval(gmailPollTimer);
+    gmailPollTimer=setInterval(gmailCheckInbox,300000);
+  }
+  // Role badge
+  const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
+  document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
+}
+
 function applyRole(){
-  // Owner-unlocked class controls financial visibility
   if(currentRole==='owner'){
     document.body.classList.add('owner-unlocked');
   } else {
     document.body.classList.remove('owner-unlocked');
   }
-  // Market filter class
-  document.body.classList.remove('market-ny-only','market-miami-only');
+  document.body.classList.remove('market-ny-only','market-miami-only','team-view-only');
   if(currentMarket==='ny')document.body.classList.add('market-ny-only');
   if(currentMarket==='miami')document.body.classList.add('market-miami-only');
-  // Hide/show owner-only controls
+  // Team members are view-only
+  if(currentRole&&currentRole!=='owner')document.body.classList.add('team-view-only');
   document.querySelectorAll('.owner-lock,.icon-btn[onclick*="exportData"],[onclick*="importData"]').forEach(el=>{
     el.style.display=currentRole==='owner'?'':'none';
   });
-  // Hide owner banner (replaced by PIN system)
   const ob=document.getElementById('owner-banner');
   if(ob)ob.style.display='none';
 }
+
 function initOwner(){
+  const savedEmail=localStorage.getItem('hc_auth_email');
   const savedRole=localStorage.getItem('hc_role');
   const savedMarket=localStorage.getItem('hc_market');
-  if(savedRole&&PINS[savedRole]||Object.values(PINS).find(p=>p.role===savedRole)){
-    currentRole=savedRole;
-    currentMarket=savedMarket||null;
+  if(savedEmail&&AUTH_USERS[savedEmail]){
+    const authEntry=AUTH_USERS[savedEmail];
+    currentUserEmail=savedEmail;
+    currentRole=authEntry.role;
+    currentMarket=authEntry.market;
     applyRole();
     document.getElementById('pin-overlay').classList.add('hidden');
     const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
     document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
-    // Auto-pull on session restore + start background sync
     jbPull();
     if(!window._jbSyncInterval){
       window._jbSyncInterval=setInterval(()=>{
-        if(currentRole&&jbBinId&&jbMasterKey&&!jbSyncing){
-          jbPull();
-        }
+        if(currentRole&&jbBinId&&jbMasterKey&&!jbSyncing)jbPull();
       },30000);
     }
     // Auto-connect Gmail on session restore
     setTimeout(()=>{if(!gmailToken&&typeof google!=='undefined')gmailConnect();},1500);
   }
 }
+
 function lockOwner(){
   currentRole=null;
   currentMarket=null;
+  currentUserEmail=null;
+  gmailToken=null;
+  if(gmailPollTimer){clearInterval(gmailPollTimer);gmailPollTimer=null;}
+  localStorage.removeItem('hc_auth_email');
   localStorage.removeItem('hc_role');
   localStorage.removeItem('hc_market');
-  localStorage.removeItem('hc_owner_session');
-  document.body.classList.remove('owner-unlocked','market-ny-only','market-miami-only');
+  document.body.classList.remove('owner-unlocked','market-ny-only','market-miami-only','team-view-only');
   document.getElementById('pin-overlay').classList.remove('hidden');
   document.getElementById('owner-status').textContent='';
-  pinBuffer='';
-  updatePinDots();
   document.getElementById('pin-error').textContent='';
+  const gBtn=document.getElementById('gmail-btn');
+  gBtn.textContent='📧 Connect Gmail';
+  gBtn.classList.remove('connected');
+  gBtn.onclick=gmailConnect;
 }
-// Legacy stub
-function checkOwnerPin(){}
 
 // ── PROFIT CALC
 function calcProfit(e){
