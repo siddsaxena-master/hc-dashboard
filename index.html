@@ -1999,7 +1999,7 @@ function gmailConnect(){
     document.getElementById('gmail-setup').style.display='flex';
     return;
   }
-  if(!getKey()){alert('Add your Anthropic API key first (needed for AI parsing).');return;}
+  // API key checked later during parsing, not at connect time
   const tokenClient=google.accounts.oauth2.initTokenClient({
     client_id:clientId,
     scope:GMAIL_SCOPES,
@@ -2057,6 +2057,7 @@ async function gmailCheckInbox(){
     const newMsgs=messages.filter(m=>!processed.includes(m.id));
     if(!newMsgs.length){setGmailStatus('Inbox synced','ok');return;}
 
+    if(!getKey()){setGmailStatus('Found '+newMsgs.length+' emails — add Anthropic API key to parse','err');return;}
     setGmailStatus(`Parsing ${newMsgs.length} email${newMsgs.length>1?'s':''}...`,'');
     let parsed=0;
     for(const msg of newMsgs){
