@@ -435,6 +435,7 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
   <span style="flex:1"></span>
   <span id="gmail-status" class="gmail-status"></span>
   <button class="gmail-btn" id="gmail-btn" onclick="gmailConnect()">📧 Connect Gmail</button>
+  <button class="gmail-btn" id="tg-btn" onclick="document.getElementById('tg-setup').style.display=document.getElementById('tg-setup').style.display==='none'?'flex':'none'" title="Telegram stamp alerts">📲</button>
 </div>
 <div id="import-panel" class="import-panel" style="display:none">
   <div class="import-panel-header">
@@ -445,6 +446,14 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
     </div>
   </div>
   <div id="import-items"></div>
+</div>
+
+<div id="tg-setup" class="gmail-setup-bar" style="display:none">
+  <span>📲 Telegram Bot:</span>
+  <input type="text" id="tg-bot-token" placeholder="Bot token from @BotFather" style="flex:1;min-width:180px">
+  <input type="text" id="tg-chat-id" placeholder="Your chat ID" style="flex:0.5;min-width:100px">
+  <button onclick="saveTgConfig()">Connect</button>
+  <button onclick="document.getElementById('tg-setup').style.display='none'" style="background:transparent;border-color:var(--border);color:var(--text-muted)">Later</button>
 </div>
 
 <div class="urgent-banner" id="urgent-banner">
@@ -1502,8 +1511,16 @@ function saveEvent(){
     name,
     followup_added:d.stage==='lead'?(editingId?(events.find(x=>x.id===editingId)?.followup_added||new Date().toISOString().slice(0,10)):new Date().toISOString().slice(0,10)):'',
   };
-  if(editingId){const i=events.findIndex(x=>x.id===editingId);if(i>=0)events[i]=ev;else events.push(ev);}
-  else events.push(ev);
+  if(editingId){
+    const i=events.findIndex(x=>x.id===editingId);
+    const oldStage=i>=0?events[i].stage:'';
+    if(i>=0)events[i]=ev;else events.push(ev);
+    // Trigger telegram if stage just changed to confirmed and stamp not ordered
+    const confirmedStages=['deposit_paid','in_kind','stamp_ordered','payment_full'];
+    if(confirmedStages.includes(ev.stage)&&oldStage!==ev.stage&&ev.stamp_status==='Not ordered'){
+      sendTelegramStampAlert(ev,0);
+    }
+  } else events.push(ev);
   saveEvents();closeModal();render();
 }
 
@@ -2075,11 +2092,10 @@ async function gmailCheckInbox(){
     const newMsgs=messages.filter(m=>!processed.includes(m.id));
     if(!newMsgs.length){setGmailStatus('Inbox synced','ok');return;}
 
-    if(!getKey()){setGmailStatus('Found '+newMsgs.length+' emails — API key missing','err');return;}
-
-    // Phase 1: Fetch headers only (cheap — no API tokens used)
+    // Phase 0: Fetch headers and detect QB payments (zero AI tokens)
     setGmailStatus(`Screening ${newMsgs.length} email${newMsgs.length>1?'s':''}...`,'');
     const candidates=[];
+    let paymentUpdates=0;
     for(const msg of newMsgs){
       try{
         const hResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+msg.id+'?format=metadata&metadataHeaders=Subject&metadataHeaders=From',{
@@ -2090,18 +2106,43 @@ async function gmailCheckInbox(){
         const hdrs=hData.payload?.headers||[];
         const subj=(hdrs.find(h=>h.name==='Subject')||{}).value||'';
         const from=(hdrs.find(h=>h.name==='From')||{}).value||'';
+
+        // QB Payment detection — no AI needed!
+        if(isQBPaymentEmail(subj,from)){
+          const detail=await gmailGetMessage(msg.id);
+          if(detail){
+            const payInfo=extractPaymentInfo(detail.subject,detail.body);
+            if(payInfo){
+              const matched=matchEventForPayment(payInfo);
+              if(matched){
+                applyPaymentUpdate(matched,payInfo);
+                paymentUpdates++;
+              }
+            }
+          }
+          processed.push(msg.id);
+          continue;
+        }
+
         // Pre-filter: skip obvious non-event emails
         if(GMAIL_SKIP_WORDS.test(subj)){processed.push(msg.id);continue;}
-        // If subject looks relevant OR is ambiguous, keep as candidate
         candidates.push({id:msg.id,subject:subj,from:from});
       }catch(e){processed.push(msg.id);}
     }
 
+    if(paymentUpdates>0){
+      saveEvents();render();
+      showImportToast(paymentUpdates+' payment'+(paymentUpdates>1?'s':'')+' auto-synced from QuickBooks');
+    }
+
     if(!candidates.length){
       saveProcessedIds(processed.slice(-500));
-      setGmailStatus('Inbox synced — no event emails found','ok');
+      const msg=paymentUpdates>0?paymentUpdates+' payment'+(paymentUpdates>1?'s':'')+' synced':'Inbox synced — no new emails';
+      setGmailStatus(msg,'ok');
       return;
     }
+
+    if(!getKey()){setGmailStatus('Found '+candidates.length+' emails — API key missing for parsing','err');saveProcessedIds(processed.slice(-500));return;}
 
     // Phase 2: Fetch full content only for candidates and batch-parse
     setGmailStatus(`Parsing ${candidates.length} email${candidates.length>1?'s':''}...`,'');
@@ -2137,7 +2178,8 @@ async function gmailCheckInbox(){
 
     if(parsed>0){
       renderImportPanel();
-      setGmailStatus(parsed+' new email'+(parsed>1?'s':'')+' ready to import','ok');
+      const extraMsg=paymentUpdates>0?' + '+paymentUpdates+' payment'+(paymentUpdates>1?'s':'')+' synced':'';
+      setGmailStatus(parsed+' new email'+(parsed>1?'s':'')+' ready to import'+extraMsg,'ok');
       const btn=document.getElementById('gmail-btn');
       btn.innerHTML='📧 Connected<span class="gmail-badge">'+parsed+'</span>';
     } else {
@@ -2414,6 +2456,194 @@ function showImportToast(msg){
   t.textContent='✓ '+msg;
   document.body.appendChild(t);
   setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity 0.3s';setTimeout(()=>t.remove(),300);},3500);
+}
+
+// ══════════════════════════════════════════════
+// 💰  QUICKBOOKS PAYMENT DETECTION
+// ══════════════════════════════════════════════
+const QB_PAYMENT_SUBJECT=/payment\s*(received|request|from|reminder)|paid.*invoice|invoice.*paid|new payment|payment\s+for\s+invoice/i;
+const QB_PAYMENT_FROM=/quickbooks|intuit|qb@|notifications@.*intuit/i;
+
+function isQBPaymentEmail(subject,from){
+  return QB_PAYMENT_SUBJECT.test(subject)||QB_PAYMENT_FROM.test(from);
+}
+
+function extractPaymentInfo(subject,body){
+  const text=subject+' '+body;
+  // Extract invoice number
+  const invMatch=text.match(/invoice\s*#?\s*(\d{3,})/i);
+  const invoiceNum=invMatch?invMatch[1]:null;
+  // Extract amount paid
+  const amtMatch=text.match(/\$\s*([\d,]+\.?\d{0,2})/);
+  const amount=amtMatch?parseFloat(amtMatch[1].replace(/,/g,'')):0;
+  // Extract client name — try common QB patterns
+  const namePatterns=[
+    /from\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})/,
+    /payment.*?(?:from|by)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})/i,
+    /(?:client|customer|bill to|sold to)[:\s]+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})/i,
+  ];
+  let clientName='';
+  for(const p of namePatterns){
+    const m=text.match(p);
+    if(m){clientName=m[1].trim();break;}
+  }
+  if(!invoiceNum&&!clientName&&!amount)return null;
+  return {invoiceNum,clientName,amount};
+}
+
+function matchEventForPayment(payInfo){
+  // Priority 1: Match by invoice number in notes
+  if(payInfo.invoiceNum){
+    const match=events.find(e=>e.notes&&e.notes.includes(payInfo.invoiceNum));
+    if(match)return match;
+    const match2=events.find(e=>e.invoice_name&&e.invoice_name.includes(payInfo.invoiceNum));
+    if(match2)return match2;
+  }
+  // Priority 2: Match by total amount (exact match)
+  if(payInfo.amount>0){
+    const amtMatches=events.filter(e=>{
+      const tot=parseFloat(e.total_amount)||0;
+      return tot>0&&Math.abs(tot-payInfo.amount)<0.02;
+    });
+    if(amtMatches.length===1)return amtMatches[0];
+  }
+  // Priority 3: Fuzzy match by client name
+  if(payInfo.clientName){
+    const nameLower=payInfo.clientName.toLowerCase();
+    const nameWords=nameLower.split(/\s+/);
+    const match=events.find(e=>{
+      const eName=(e.name||'').toLowerCase();
+      return nameWords.some(w=>w.length>2&&eName.includes(w));
+    });
+    if(match)return match;
+  }
+  return null;
+}
+
+function applyPaymentUpdate(event,payInfo){
+  const total=parseFloat(event.total_amount)||0;
+  const existingDep=parseFloat(event.deposit_amount)||0;
+  const existingBal=parseFloat(event.balance_amount)||0;
+  const paid=payInfo.amount;
+
+  if(total>0&&paid>=total*0.95){
+    // Full payment (within 5% tolerance for fees)
+    event.stage='payment_full';
+    event.deposit_amount=String(existingDep||paid);
+    event.balance_amount=String(Math.max(0,total-(existingDep||paid)));
+    event.pay_notes=(event.pay_notes?event.pay_notes+' | ':'')+'QB payment $'+paid.toLocaleString()+' (auto-synced)';
+  } else if(paid>0){
+    // Partial payment (deposit)
+    if(event.stage==='lead'||!event.stage)event.stage='deposit_paid';
+    if(!existingDep)event.deposit_amount=String(paid);
+    event.balance_amount=String(Math.max(0,total-paid-existingBal));
+    event.pay_notes=(event.pay_notes?event.pay_notes+' | ':'')+'QB deposit $'+paid.toLocaleString()+' (auto-synced)';
+  }
+  // Trigger stamp alert if needed
+  if(event.stamp_status==='Not ordered'&&event.stage!=='lead'&&event.stage!=='passed'){
+    sendTelegramStampAlert(event,paid);
+  }
+  console.log('Payment auto-synced:',event.name,'$'+paid,'→',event.stage);
+}
+
+// ══════════════════════════════════════════════
+// 📲  TELEGRAM STAMP BOT
+// ══════════════════════════════════════════════
+const TG_BOT_TOKEN=localStorage.getItem('hc_tg_bot_token')||'';
+const TG_CHAT_ID=localStorage.getItem('hc_tg_chat_id')||'';
+
+function getTgConfig(){
+  return {
+    token:localStorage.getItem('hc_tg_bot_token')||'',
+    chatId:localStorage.getItem('hc_tg_chat_id')||''
+  };
+}
+
+function saveTgConfig(){
+  const token=document.getElementById('tg-bot-token')?.value?.trim();
+  const chatId=document.getElementById('tg-chat-id')?.value?.trim();
+  if(!token||!chatId){alert('Enter both bot token and chat ID');return;}
+  localStorage.setItem('hc_tg_bot_token',token);
+  localStorage.setItem('hc_tg_chat_id',chatId);
+  document.getElementById('tg-setup').style.display='none';
+  showImportToast('Telegram bot connected');
+  // Send test message
+  sendTelegram('✅ Hamptons Coconuts dashboard connected! You will receive stamp ordering alerts here.');
+}
+
+async function sendTelegram(text){
+  const cfg=getTgConfig();
+  if(!cfg.token||!cfg.chatId)return false;
+  try{
+    const resp=await fetch(`https://api.telegram.org/bot${cfg.token}/sendMessage`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({chat_id:cfg.chatId,text:text,parse_mode:'Markdown'})
+    });
+    return resp.ok;
+  }catch(e){console.error('Telegram error:',e);return false;}
+}
+
+function sendTelegramStampAlert(event,paymentAmount){
+  const nuts=parseInt(event.coconuts)||0;
+  const boxes=nuts>0?Math.ceil(nuts/9):0;
+  const evDate=event.event_date?new Date(event.event_date+'T12:00:00').toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}):'TBD';
+  const market=event.market==='ny'?'NY':event.market==='miami'?'Miami':'';
+
+  let msg=`🥥 *STAMP ALERT — Hamptons Coconuts*\n\n`;
+  if(paymentAmount>0)msg+=`💰 Payment received: $${paymentAmount.toLocaleString()}\n`;
+  msg+=`👤 ${event.name||'Unknown'}`;
+  if(event.venue)msg+=` — ${event.venue}`;
+  msg+=`\n📅 Event: ${evDate}`;
+  if(market)msg+=` (${market})`;
+  msg+=`\n🥥 ${nuts} coconuts`;
+  if(boxes)msg+=` (${boxes} boxes)`;
+  msg+=`\n\n⚠️ *Stamp not yet ordered!*`;
+  if(event.stamp_design)msg+=`\n🎨 Design: ${event.stamp_design}`;
+  msg+=`\nPlease send the logo/design for this event.`;
+
+  sendTelegram(msg);
+}
+
+// Check for confirmed events with unordered stamps on load
+function checkPendingStamps(){
+  const cfg=getTgConfig();
+  if(!cfg.token||!cfg.chatId)return;
+  const today=new Date();today.setHours(0,0,0,0);
+  const lastCheck=localStorage.getItem('hc_stamp_check_date');
+  const todayStr=today.toISOString().split('T')[0];
+  if(lastCheck===todayStr)return; // Only once per day
+  localStorage.setItem('hc_stamp_check_date',todayStr);
+
+  const urgent=events.filter(e=>{
+    if(e.type==='recurring')return false;
+    if(e.stage==='lead'||e.stage==='passed'||e.stage==='completed')return false;
+    if(e.stamp_status!=='Not ordered')return false;
+    const d=parseLocalDate(e.event_date);
+    if(!d)return false;
+    const days=Math.round((d-today)/(1000*60*60*24));
+    return days>=0&&days<=14;
+  });
+
+  if(urgent.length>0){
+    let msg=`🚨 *DAILY STAMP REMINDER*\n\n${urgent.length} event${urgent.length>1?'s':''} need stamps ordered:\n`;
+    urgent.forEach(e=>{
+      const d=parseLocalDate(e.event_date);
+      const days=Math.round((d-today)/(1000*60*60*24));
+      msg+=`\n• *${e.name}* — ${days===0?'TODAY':days+'d away'} (${parseInt(e.coconuts)||'?'} nuts)`;
+    });
+    sendTelegram(msg);
+  }
+}
+
+// Run stamp check after session activates
+setTimeout(()=>{if(currentRole)checkPendingStamps();},5000);
+
+// ── TELEGRAM SETUP UI INIT
+function initTgUI(){
+  const cfg=getTgConfig();
+  const el=document.getElementById('tg-setup');
+  if(el&&cfg.token&&cfg.chatId)el.style.display='none';
 }
 
 </script>
