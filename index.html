@@ -521,10 +521,30 @@ const EVENT_TYPES=['Wedding','Corporate Event','Wellness Event','Birthday Party'
 let events=[], currentView='list', editingId=null;
 let calYear=new Date().getFullYear(), calMonth=new Date().getMonth();
 
-// ── API KEY
-const HC_API_KEY='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';
-function getKey(){return HC_API_KEY;}
-function initKeyUI(){}
+// ── API KEY (stored in localStorage, never hardcoded for security)
+function getKey(){return localStorage.getItem('hc_apikey')||'';}
+function saveApiKeyInline(){
+  const k=document.getElementById('api-key-inline')?.value?.trim();
+  if(!k||!k.startsWith('sk-')){alert('Key must start with sk-ant-');return;}
+  localStorage.setItem('hc_apikey',k);
+  const prompt=document.getElementById('api-key-prompt');
+  if(prompt)prompt.remove();
+  showImportToast&&showImportToast('API key saved');
+}
+function showApiKeyPrompt(){
+  if(document.getElementById('api-key-prompt'))return;
+  const div=document.createElement('div');
+  div.id='api-key-prompt';
+  div.className='gmail-setup-bar';
+  div.innerHTML='<span>🔑 Anthropic API key needed:</span>'+
+    '<input type="text" id="api-key-inline" placeholder="sk-ant-api03-..." style="flex:1;min-width:200px">'+
+    '<button onclick="saveApiKeyInline()">Save</button>'+
+    '<span style="font-size:10px;color:#b45309"><a href="https://console.anthropic.com/settings/keys" target="_blank" style="color:#b45309;text-decoration:underline">Get a key</a></span>';
+  const panel=document.getElementById('import-panel');
+  if(panel&&panel.parentNode)panel.parentNode.insertBefore(div,panel);
+  else document.body.insertBefore(div,document.body.firstChild);
+}
+function initKeyUI(){if(!getKey())setTimeout(showApiKeyPrompt,500);}
 
 // ── STORAGE
 const SEED=[
