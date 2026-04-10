@@ -2310,7 +2310,8 @@ async function gmailBatchParse(emailTexts,candidateMap){
 
 const GMAIL_PARSE_PROMPT_SINGLE=`Parse this email/invoice for Hamptons Coconuts (coconut catering). Return ONLY JSON:
 {"name":"","venue":"","contact":"","email":"","phone":"","event_date":"YYYY-MM-DD","event_end_date":"","delivery_date":"","delivery_time":"","coconuts":"int","total_amount":"num","deposit_amount":"","balance_amount":"","stamp_design":"","delivery_notes":"address","market":"ny|miami|other","event_type":"Wedding|Corporate Event|Birthday Party|Holiday Party","notes":"","is_event":true/false}
-Leave unknown fields empty. is_event=false for spam/newsletters/unrelated.`;
+CRITICAL — event_date extraction: Scan the entire invoice/PDF for the service/event date. It may be labeled "Service date", "Event date", "Date of service", "Activity date", "Delivery date", or appear inline in a line item description (e.g., "Coconut catering — July 3, 2026", "Wedding 7/3/26", etc.). Do NOT use the invoice date, due date, sent date, or overdue date. If you find ANY service date in the document, ALWAYS populate BOTH event_date AND delivery_date with it (YYYY-MM-DD format). Only leave blank if no service date appears anywhere.
+Leave other unknown fields empty. is_event=false for spam/newsletters/unrelated.`;
 
 function GMAIL_PARSE_PROMPT_BATCH(n){
   return `Parse ${n} emails for Hamptons Coconuts (coconut catering). Return ONLY a JSON array of ${n} objects, one per email in order:
