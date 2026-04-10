@@ -521,30 +521,36 @@ const EVENT_TYPES=['Wedding','Corporate Event','Wellness Event','Birthday Party'
 let events=[], currentView='list', editingId=null;
 let calYear=new Date().getFullYear(), calMonth=new Date().getMonth();
 
-// ── API KEY (stored in localStorage, never hardcoded for security)
-function getKey(){return localStorage.getItem('hc_apikey')||'';}
-function saveApiKeyInline(){
-  const k=document.getElementById('api-key-inline')?.value?.trim();
-  if(!k||!k.startsWith('sk-')){alert('Key must start with sk-ant-');return;}
-  localStorage.setItem('hc_apikey',k);
-  const prompt=document.getElementById('api-key-prompt');
-  if(prompt)prompt.remove();
-  showImportToast&&showImportToast('API key saved');
+// ── AI PROXY (all Claude calls go through Cloudflare Worker — no keys in browser)
+const WORKER_URL='https://hc-telegram-bot.hamptonscoconutsdash.workers.dev';
+function getKey(){return 'proxy';} // Legacy stub — worker handles the actual key
+function initKeyUI(){}
+
+// Proxy function for batch text parsing (used by Gmail batch parser)
+async function workerParseBatch(systemPrompt,messages,maxTokens){
+  const resp=await fetch(WORKER_URL+'/parse-batch',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({systemPrompt,messages,maxTokens:maxTokens||1200})
+  });
+  if(!resp.ok)throw new Error('Worker HTTP '+resp.status);
+  const data=await resp.json();
+  if(data.error)throw new Error(data.error);
+  return data.text||'';
 }
-function showApiKeyPrompt(){
-  if(document.getElementById('api-key-prompt'))return;
-  const div=document.createElement('div');
-  div.id='api-key-prompt';
-  div.className='gmail-setup-bar';
-  div.innerHTML='<span>🔑 Anthropic API key needed:</span>'+
-    '<input type="text" id="api-key-inline" placeholder="sk-ant-api03-..." style="flex:1;min-width:200px">'+
-    '<button onclick="saveApiKeyInline()">Save</button>'+
-    '<span style="font-size:10px;color:#b45309"><a href="https://console.anthropic.com/settings/keys" target="_blank" style="color:#b45309;text-decoration:underline">Get a key</a></span>';
-  const panel=document.getElementById('import-panel');
-  if(panel&&panel.parentNode)panel.parentNode.insertBefore(div,panel);
-  else document.body.insertBefore(div,document.body.firstChild);
+
+// Proxy function for file/attachment parsing (used by invoice upload + email attachments)
+async function workerParseFile(systemPrompt,contentBlocks,maxTokens){
+  const resp=await fetch(WORKER_URL+'/parse-file',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({systemPrompt,contentBlocks,maxTokens:maxTokens||1000})
+  });
+  if(!resp.ok)throw new Error('Worker HTTP '+resp.status);
+  const data=await resp.json();
+  if(data.error)throw new Error(data.error);
+  return data.text||'';
 }
-function initKeyUI(){if(!getKey())setTimeout(showApiKeyPrompt,500);}
 
 // ── STORAGE
 const SEED=[
@@ -1552,8 +1558,6 @@ function delEvent(id){
 
 // ── INVOICE PARSE
 async function onInvoiceFile(file){
-  const apiKey=getKey();
-  if(!apiKey){alert('Add your Anthropic API key in the yellow bar first.');return;}
   const inv=document.getElementById('f-inv');if(inv)inv.value=file.name;
   const ps=document.getElementById('pstatus');if(!ps)return;
   ps.innerHTML=`<div class="parsing-bar"><div class="spinner"></div><span>Reading invoice with Claude...</span></div>`;
@@ -1562,11 +1566,8 @@ async function onInvoiceFile(file){
     const isImg=file.type.startsWith('image/');
     const mt=isImg?file.type:'application/pdf';
     const cb=isImg?{type:'image',source:{type:'base64',media_type:mt,data:b64}}:{type:'document',source:{type:'base64',media_type:'application/pdf',data:b64}};
-    const resp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:1000,system:`You are an invoice parser for Hamptons Coconuts. Return ONLY valid JSON, no markdown, no backticks: {"name":"client or event name","venue":"venue","contact":"contact person","email":"email","phone":"phone","event_date":"YYYY-MM-DD or empty","coconuts":"integer string or empty","total_amount":"number string no $ sign","deposit_amount":"deposit as number string","balance_amount":"balance as number string","stamp_design":"branding notes","delivery_notes":"delivery address or location","notes":"other info"}`,messages:[{role:'user',content:[cb,{type:'text',text:'Extract invoice details. JSON only.'}]}]})});
-    const raw=await resp.text();
-    if(!resp.ok){let m=`HTTP ${resp.status}`;try{const j=JSON.parse(raw);m=j.error?.message||m;}catch(x){}throw new Error(m);}
-    const data=JSON.parse(raw);
-    const txt=data.content?.find(c=>c.type==='text')?.text||'{}';
+    const sysPrompt=`You are an invoice parser for Hamptons Coconuts. Return ONLY valid JSON, no markdown, no backticks: {"name":"client or event name","venue":"venue","contact":"contact person","email":"email","phone":"phone","event_date":"YYYY-MM-DD or empty","coconuts":"integer string or empty","total_amount":"number string no $ sign","deposit_amount":"deposit as number string","balance_amount":"balance as number string","stamp_design":"branding notes","delivery_notes":"delivery address or location","notes":"other info"}`;
+    const txt=await workerParseFile(sysPrompt,[cb,{type:'text',text:'Extract invoice details. JSON only.'}],1000);
     const parsed=JSON.parse(txt.replace(/```json|```/g,'').trim());
     const map={name:'f-name',venue:'f-venue',contact:'f-contact',email:'f-email',phone:'f-phone',event_date:'f-event-date',coconuts:'f-coconuts',total_amount:'f-total',deposit_amount:'f-deposit',balance_amount:'f-balance',stamp_design:'f-stamp-design',delivery_notes:'f-delivery-notes',notes:'f-notes'};
     let filled=0;
@@ -2162,7 +2163,7 @@ async function gmailCheckInbox(){
       return;
     }
 
-    if(!getKey()){setGmailStatus('Found '+candidates.length+' emails — API key missing for parsing','err');saveProcessedIds(processed.slice(-500));return;}
+    // API key is managed by the worker — no local check needed
 
     // Phase 2: Fetch full content only for candidates and batch-parse
     setGmailStatus(`Parsing ${candidates.length} email${candidates.length>1?'s':''}...`,'');
@@ -2270,9 +2271,6 @@ async function gmailGetMessage(id){
 
 // Batch parse: one API call for all emails (huge token savings)
 async function gmailBatchParse(emailTexts,candidateMap){
-  const apiKey=getKey();
-  if(!apiKey)return emailTexts.map(()=>null);
-
   // If any email has an attachment, send it separately (can't batch images)
   const withAttachment=candidateMap.findIndex(c=>c.attachment);
   const results=new Array(emailTexts.length).fill(null);
@@ -2284,21 +2282,11 @@ async function gmailBatchParse(emailTexts,candidateMap){
     const contentBlocks=[];
     const isImg=att.mimeType.startsWith('image/');
     contentBlocks.push(isImg?{type:'image',source:{type:'base64',media_type:att.mimeType,data:att.data}}:{type:'document',source:{type:'base64',media_type:'application/pdf',data:att.data}});
-    // The attached document is the SOURCE OF TRUTH. The email body is often just a forwarder cover
-    // (e.g., "Fwd:" with the forwarder's own name/email in the headers) and must NOT be used for customer info.
     contentBlocks.push({type:'text',text:`The attached ${isImg?'image':'PDF'} is the actual order/invoice — extract ALL fields (customer name, contact, email, phone, address, dates, coconut count, amounts, etc.) from the attachment ONLY. Ignore the forwarder's name/email in the cover text below; it is just the person who forwarded the email to us, NOT the customer.\n\nForwarder cover (context only, do NOT extract customer info from this):\n${emailTexts[withAttachment]}\n\nReturn JSON.`});
     try{
-      const resp=await fetch('https://api.anthropic.com/v1/messages',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-        body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:500,system:GMAIL_PARSE_PROMPT_SINGLE,messages:[{role:'user',content:contentBlocks}]})
-      });
-      if(resp.ok){
-        const d=await resp.json();
-        const t=d.content?.find(x=>x.type==='text')?.text||'{}';
-        const p=JSON.parse(t.replace(/```json|```/g,'').trim());
-        if(p.is_event!==false)results[withAttachment]=p;
-      }
+      const t=await workerParseFile(GMAIL_PARSE_PROMPT_SINGLE,contentBlocks,500);
+      const p=JSON.parse(t.replace(/```json|```/g,'').trim());
+      if(p.is_event!==false)results[withAttachment]=p;
     }catch(e){console.error('Attachment parse error:',e);}
   }
 
@@ -2307,22 +2295,14 @@ async function gmailBatchParse(emailTexts,candidateMap){
   if(batchIdxs.length>0){
     const batchText=batchIdxs.map((idx,n)=>emailTexts[idx]).join('\n\n');
     try{
-      const resp=await fetch('https://api.anthropic.com/v1/messages',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-        body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:batchIdxs.length*400,system:GMAIL_PARSE_PROMPT_BATCH(batchIdxs.length),messages:[{role:'user',content:[{type:'text',text:batchText}]}]})
+      const t=await workerParseBatch(GMAIL_PARSE_PROMPT_BATCH(batchIdxs.length),[{role:'user',content:[{type:'text',text:batchText}]}],batchIdxs.length*400);
+      const arr=JSON.parse(t.replace(/```json|```/g,'').trim());
+      const parsed=Array.isArray(arr)?arr:[arr];
+      parsed.forEach((p,n)=>{
+        if(n<batchIdxs.length&&p&&p.is_event!==false){
+          results[batchIdxs[n]]=p;
+        }
       });
-      if(resp.ok){
-        const d=await resp.json();
-        const t=d.content?.find(x=>x.type==='text')?.text||'[]';
-        const arr=JSON.parse(t.replace(/```json|```/g,'').trim());
-        const parsed=Array.isArray(arr)?arr:[arr];
-        parsed.forEach((p,n)=>{
-          if(n<batchIdxs.length&&p&&p.is_event!==false){
-            results[batchIdxs[n]]=p;
-          }
-        });
-      }
     }catch(e){console.error('Batch parse error:',e);}
   }
   return results;
@@ -2446,30 +2426,6 @@ function updateGmailBadge(){
   } else {
     btn.textContent='📧 Connected';
   }
-}
-
-function showApiKeyPrompt(){
-  const existing=document.getElementById('api-key-prompt');
-  if(existing)return;
-  const div=document.createElement('div');
-  div.id='api-key-prompt';
-  div.className='gmail-setup-bar';
-  div.innerHTML=`<span>🔑 Anthropic API Key needed to parse emails:</span>
-    <input type="text" id="api-key-inline" placeholder="sk-ant-api03-..." style="flex:1;min-width:200px">
-    <button onclick="saveApiKeyInline()">Save & Parse</button>
-    <span style="font-size:10px;color:#b45309"><a href="https://console.anthropic.com/settings/keys" target="_blank" style="color:#b45309;text-decoration:underline">Get a key</a></span>`;
-  const panel=document.getElementById('import-panel');
-  panel.parentNode.insertBefore(div,panel);
-}
-
-function saveApiKeyInline(){
-  const k=document.getElementById('api-key-inline').value.trim();
-  if(!k.startsWith('sk-')){alert('Key should start with sk-');return;}
-  localStorage.setItem('hc_apikey',k);
-  const prompt=document.getElementById('api-key-prompt');
-  if(prompt)prompt.remove();
-  setGmailStatus('Key saved — checking inbox...','ok');
-  gmailCheckInbox();
 }
 
 function showImportToast(msg){

@@ -42,10 +42,32 @@ RULES:
 - When creating events, always set type:"event", stage:"lead", stamp_status:"Not ordered"
 - Use Telegram markdown in replies: *bold* for names, _italic_ for dates`;
 
+// CORS headers for dashboard proxy calls
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // Handle CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: CORS_HEADERS });
+    }
+
     if (request.method !== 'POST') {
       return new Response('Hamptons Coconuts Telegram Bot is running 🥥', { status: 200 });
+    }
+
+    // Dashboard proxy endpoints
+    if (url.pathname === '/parse-batch') {
+      return handleParseBatch(request, env);
+    }
+    if (url.pathname === '/parse-file') {
+      return handleParseFile(request, env);
     }
 
     try {
@@ -260,5 +282,82 @@ async function callClaude(apiKey, userMessage, eventsContext, today) {
   } catch (e) {
     console.error('Claude call error:', e);
     return { error: 'Network/fetch error: ' + e.message };
+  }
+}
+
+// ── DASHBOARD PROXY HANDLERS ──
+
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+  });
+}
+
+// Handles batch email parsing from the dashboard Gmail integration
+async function handleParseBatch(request, env) {
+  try {
+    const body = await request.json();
+    const { systemPrompt, messages, maxTokens } = body;
+    if (!messages || !Array.isArray(messages)) {
+      return jsonResponse({ error: 'Missing messages array' }, 400);
+    }
+    const resp = await fetch(CLAUDE_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: maxTokens || 1200,
+        system: systemPrompt || '',
+        messages,
+      }),
+    });
+    const raw = await resp.text();
+    if (!resp.ok) {
+      return jsonResponse({ error: `Claude HTTP ${resp.status}: ${raw.slice(0, 200)}` }, 500);
+    }
+    const data = JSON.parse(raw);
+    const txt = data.content?.find(c => c.type === 'text')?.text || '';
+    return jsonResponse({ text: txt });
+  } catch (e) {
+    return jsonResponse({ error: e.message }, 500);
+  }
+}
+
+// Handles file (PDF/image) parsing from the dashboard invoice uploader
+async function handleParseFile(request, env) {
+  try {
+    const body = await request.json();
+    const { systemPrompt, contentBlocks, maxTokens } = body;
+    if (!contentBlocks || !Array.isArray(contentBlocks)) {
+      return jsonResponse({ error: 'Missing contentBlocks' }, 400);
+    }
+    const resp = await fetch(CLAUDE_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: maxTokens || 1000,
+        system: systemPrompt || '',
+        messages: [{ role: 'user', content: contentBlocks }],
+      }),
+    });
+    const raw = await resp.text();
+    if (!resp.ok) {
+      return jsonResponse({ error: `Claude HTTP ${resp.status}: ${raw.slice(0, 200)}` }, 500);
+    }
+    const data = JSON.parse(raw);
+    const txt = data.content?.find(c => c.type === 'text')?.text || '';
+    return jsonResponse({ text: txt });
+  } catch (e) {
+    return jsonResponse({ error: e.message }, 500);
   }
 }
