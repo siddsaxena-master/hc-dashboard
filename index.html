@@ -2216,10 +2216,10 @@ async function gmailGetMessage(id){
   }
   extractText(data.payload);
 
-  // Only fetch attachments for invoices (expensive in tokens) — skip for regular emails
+  // Always check for PDF/image attachments — email already passed GMAIL_MUST_PARSE screening,
+  // so if there's a PDF/image attached it's almost certainly the source of truth (forwarded order, invoice, quote, etc).
   let attachmentData=null;
-  const isInvoice=GMAIL_MUST_PARSE.test(subject)&&/invoice|payment request|quote/i.test(subject);
-  if(isInvoice){
+  {
     let attachments=[];
     function findAttachments(part){
       if(part.filename&&part.body?.attachmentId){
@@ -2264,7 +2264,9 @@ async function gmailBatchParse(emailTexts,candidateMap){
     const contentBlocks=[];
     const isImg=att.mimeType.startsWith('image/');
     contentBlocks.push(isImg?{type:'image',source:{type:'base64',media_type:att.mimeType,data:att.data}}:{type:'document',source:{type:'base64',media_type:'application/pdf',data:att.data}});
-    contentBlocks.push({type:'text',text:emailTexts[withAttachment]+'\n\nExtract event/invoice details as JSON.'});
+    // The attached document is the SOURCE OF TRUTH. The email body is often just a forwarder cover
+    // (e.g., "Fwd:" with the forwarder's own name/email in the headers) and must NOT be used for customer info.
+    contentBlocks.push({type:'text',text:`The attached ${isImg?'image':'PDF'} is the actual order/invoice — extract ALL fields (customer name, contact, email, phone, address, dates, coconut count, amounts, etc.) from the attachment ONLY. Ignore the forwarder's name/email in the cover text below; it is just the person who forwarded the email to us, NOT the customer.\n\nForwarder cover (context only, do NOT extract customer info from this):\n${emailTexts[withAttachment]}\n\nReturn JSON.`});
     try{
       const resp=await fetch('https://api.anthropic.com/v1/messages',{
         method:'POST',
