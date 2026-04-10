@@ -109,8 +109,9 @@ export default {
 
       // Call Claude
       const claudeResp = await callClaude(env.ANTHROPIC_API_KEY, userText, evContext, today);
-      if (!claudeResp) {
-        await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ AI processing failed. Try again.');
+      if (!claudeResp || claudeResp.error) {
+        const errMsg = claudeResp?.error || 'Unknown error';
+        await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ AI error: ' + errMsg);
         return ok();
       }
 
@@ -229,7 +230,7 @@ async function callClaude(apiKey, userMessage, eventsContext, today) {
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 800,
+        max_tokens: 1200,
         system: SYSTEM_PROMPT,
         messages: [{
           role: 'user',
@@ -237,15 +238,27 @@ async function callClaude(apiKey, userMessage, eventsContext, today) {
         }],
       }),
     });
+    const raw = await resp.text();
     if (!resp.ok) {
-      console.error('Claude API error:', resp.status);
-      return null;
+      console.error('Claude API error:', resp.status, raw);
+      return { error: `HTTP ${resp.status}: ${raw.slice(0, 200)}` };
     }
-    const data = await resp.json();
-    const txt = data.content?.find(c => c.type === 'text')?.text || '{}';
-    return JSON.parse(txt.replace(/```json|```/g, '').trim());
+    let data;
+    try { data = JSON.parse(raw); }
+    catch (e) { return { error: 'Invalid API response: ' + raw.slice(0, 150) }; }
+    const txt = data.content?.find(c => c.type === 'text')?.text || '';
+    if (!txt) return { error: 'Empty response from Claude' };
+    const cleaned = txt.replace(/```json|```/g, '').trim();
+    // Extract JSON even if Claude wrapped it in text
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return { error: 'No JSON found: ' + cleaned.slice(0, 150) };
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      return { error: 'JSON parse failed: ' + cleaned.slice(0, 150) };
+    }
   } catch (e) {
-    console.error('Claude parse error:', e);
-    return null;
+    console.error('Claude call error:', e);
+    return { error: 'Network/fetch error: ' + e.message };
   }
 }
