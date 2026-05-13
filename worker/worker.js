@@ -87,6 +87,7 @@ export default {
     // Inbound webhooks (lead sources, phone events, etc.)
     if (url.pathname === '/webhooks/formspree') return handleFormspreeWebhook(request, env);
     if (url.pathname === '/webhooks/quo') return handleQuoWebhook(request, env);
+    if (url.pathname === '/webhooks/ms-graph') return handleMsGraphWebhook(request, env, url);
 
     try {
       const update = await request.json();
@@ -826,6 +827,126 @@ async function handleQuoWebhook(request, env) {
     return jsonResponse({ ok: true });
   } catch (e) {
     console.error('Quo webhook error:', e);
+    return jsonResponse({ ok: false, error: e.message }, 200);
+  }
+}
+
+const MS_GRAPH_CLASSIFIER_PROMPT = `You receive an email payload fetched from Microsoft Graph (Outlook / Microsoft 365). The mailbox is operated by Hamptons Coconuts, a premium coconut catering business.
+
+Classify the email. Respond with ONLY valid JSON:
+{
+  "category": "lead_inquiry | customer_reply | vendor | noise",
+  "from_email": "sender email or null",
+  "from_name": "sender name or null",
+  "subject": "subject line",
+  "summary": "1-sentence summary for Telegram alert",
+  "should_alert": true/false,
+  "extracted_lead": null OR {
+    "client_name": "...",
+    "client_email": "...",
+    "client_phone": "... or null",
+    "event_type": "wedding|corporate|wellness|other",
+    "event_date": "YYYY-MM-DD or null",
+    "headcount": number or null,
+    "venue": "venue or null",
+    "market": "ny|miami|other",
+    "notes": "context"
+  }
+}
+
+Rules:
+- "noise" = marketing emails, newsletters, automated noise (e.g. Weee promotional). should_alert = false.
+- "vendor" = supplier comms (Weee, stamp vendor, etc.). should_alert = true (Sidd wants to know).
+- "customer_reply" = email from someone already in the system. should_alert = true. extracted_lead = null.
+- "lead_inquiry" = NEW inquiry asking about pricing, availability, booking. should_alert = true. fill extracted_lead.`;
+
+async function handleMsGraphWebhook(request, env, url) {
+  // Microsoft Graph subscriptions send a validationToken on creation; echo it back.
+  const validationToken = url.searchParams.get('validationToken');
+  if (validationToken) {
+    return new Response(validationToken, { status: 200, headers: { 'Content-Type': 'text/plain' } });
+  }
+
+  try {
+    const body = await request.json();
+    // Graph batches notifications under body.value
+    const notifications = body.value || [body];
+
+    for (const n of notifications) {
+      // Each notification has a resource URL (the email). For now we expect the
+      // caller (or a future step) to also POST the full email payload under
+      // n.resourceData or we'd fetch it via Graph here. Stub: classify the
+      // notification payload directly.
+      const cResp = await fetch(CLAUDE_API, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 800,
+          system: MS_GRAPH_CLASSIFIER_PROMPT,
+          messages: [{ role: 'user', content: 'Graph notification:\n' + JSON.stringify(n, null, 2) }],
+        }),
+      });
+      if (!cResp.ok) continue;
+      const d = await cResp.json();
+      const txt = d.content?.find(c => c.type === 'text')?.text || '{}';
+      const cleaned = txt.replace(/```json|```/g, '').trim();
+      const m = cleaned.match(/\{[\s\S]*\}/);
+      let cls = {};
+      try { cls = m ? JSON.parse(m[0]) : {}; } catch (e) {}
+
+      // If classified as lead_inquiry, insert orders row
+      if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
+        const e = cls.extracted_lead;
+        const orderRow = {
+          id: crypto.randomUUID(),
+          client_name: e.client_name || 'Unknown',
+          client_email: e.client_email || cls.from_email || null,
+          client_phone: e.client_phone || null,
+          event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(e.event_type) ? e.event_type : 'other',
+          event_start_at: e.event_date ? e.event_date + 'T12:00:00Z' : null,
+          event_tz: 'America/New_York',
+          headcount: parseInt(e.headcount) || null,
+          venue: e.venue || null,
+          market: ['ny','miami','other'].includes(e.market) ? e.market : 'ny',
+          stage: 'inquiry',
+          source: 'website',
+          notes: 'Email lead via MS Graph: ' + (cls.subject || '') + '\n\n' + (e.notes || ''),
+          stamp_status: 'not_ordered',
+          logo_received: false,
+          deposit_cents: 0,
+          coi_required: false,
+          coi_submitted: false,
+          is_recurring: false,
+        };
+        await fetch(env.SUPABASE_URL + '/rest/v1/orders', {
+          method: 'POST',
+          headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+          body: JSON.stringify(orderRow),
+        });
+      }
+
+      // Telegram alert if should_alert
+      if (cls.should_alert) {
+        const emoji = { lead_inquiry: '🌱', customer_reply: '💬', vendor: '📦', noise: '🗑️' }[cls.category] || '📧';
+        const text = emoji + ' *Email: ' + (cls.category || 'unknown') + '*\n' +
+          '*From:* ' + (cls.from_name || cls.from_email || 'unknown') + '\n' +
+          '*Subject:* ' + (cls.subject || '') + '\n\n' +
+          (cls.summary || '');
+        const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+        for (const cid of chatIds) {
+          await sendTelegram(env.TG_BOT_TOKEN, cid, text);
+        }
+      }
+    }
+
+    return jsonResponse({ ok: true });
+  } catch (e) {
+    console.error('MS Graph webhook error:', e);
     return jsonResponse({ ok: false, error: e.message }, 200);
   }
 }
