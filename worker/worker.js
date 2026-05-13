@@ -1,12 +1,12 @@
-// Hamptons Coconuts — Telegram Dashboard Bot
+// Hamptons Coconuts — Telegram Dashboard Bot ("Claudia")
 // Cloudflare Worker that receives Telegram messages, uses Claude to parse intent,
-// and reads/writes events in JSONBin (same data store as the web dashboard).
+// and reads/writes events in Supabase orders (migrated from JSONBin 2026-05-13).
 
-const JSONBIN_API = 'https://api.jsonbin.io/v3/b';
 const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
 const TG_API = 'https://api.telegram.org/bot';
 
 // ── SYSTEM PROMPT FOR CLAUDE ──
+// Uses the dashboard's UI vocabulary; the storage layer translates to Supabase values.
 const SYSTEM_PROMPT = `You are Claudia, the Hamptons Coconuts dashboard assistant on Telegram. You manage events for a coconut catering business.
 
 You will receive the user's message and a JSON list of current events. Respond with ONLY valid JSON (no markdown, no backticks):
@@ -49,11 +49,24 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type',
 };
 
+// ── VOCAB MAPS (mirror of dashboard's maps; keep in sync) ──
+const SB_STAGE_TO_UI = {'inquiry':'lead','quoted':'lead','invoiced':'deposit_paid','deposit_paid':'deposit_paid','paid_full':'payment_full','fulfilled':'completed','complete':'completed','cancelled':'passed'};
+const UI_STAGE_TO_SB = {'lead':'inquiry','deposit_paid':'deposit_paid','stamp_ordered':'invoiced','in_kind':'complete','payment_full':'paid_full','completed':'complete','passed':'complete'};
+const SB_ETYPE_TO_UI = {'wedding':'Wedding','corporate':'Corporate Event','trade_show':'Networking Event','hospitality':'Other','cruise':'Other','wellness':'Wellness Event','other':'Other'};
+const UI_ETYPE_TO_SB = {'Wedding':'wedding','Corporate Event':'corporate','Wellness Event':'wellness','Birthday Party':'other','Holiday Party':'other','Networking Event':'trade_show','Product Launch':'corporate','Charity Event':'other','Bachelor/Bachelorette':'other','Other':'other'};
+const SB_STAMP_TO_UI = {'not_ordered':'Not ordered','ordered':'Ordered — pending','received':'Received','not_needed':'Not ordered'};
+const UI_STAMP_TO_SB = {'Not ordered':'not_ordered','Ordered — pending':'ordered','Received':'received'};
+const SB_FREQ_TO_UI = {'weekly':'Weekly','biweekly':'Bi-weekly','monthly':'Monthly','quarterly':'Seasonal'};
+const UI_FREQ_TO_SB = {'Weekly':'weekly','Bi-weekly':'biweekly','Monthly':'monthly','Seasonal':'quarterly'};
+const SB_SOURCE_TO_UI = {'website':'Google Search','referral':'WeddingPro / The Knot','sales_engine':'Cold Email Outreach','direct':'Word of Mouth','recurring':'Other','other':'Other'};
+const UI_SOURCE_TO_SB = {'Google Search':'website','Cold Email Outreach':'sales_engine','Referral — Event':'referral','Referral — Venue':'referral','WeddingPro / The Knot':'referral','Instagram / Social':'website','Word of Mouth':'direct','Telegram bot':'other','Other':'other'};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS_HEADERS });
     }
@@ -63,12 +76,8 @@ export default {
     }
 
     // Dashboard proxy endpoints
-    if (url.pathname === '/parse-batch') {
-      return handleParseBatch(request, env);
-    }
-    if (url.pathname === '/parse-file') {
-      return handleParseFile(request, env);
-    }
+    if (url.pathname === '/parse-batch') return handleParseBatch(request, env);
+    if (url.pathname === '/parse-file') return handleParseFile(request, env);
 
     try {
       const update = await request.json();
@@ -84,7 +93,6 @@ export default {
 
       const userText = message.text.trim();
 
-      // Handle /start command
       if (userText === '/start') {
         await sendTelegram(env.TG_BOT_TOKEN, chatId,
           '🥥 *Hey! I\'m Claudia, your Hamptons Coconuts assistant.*\n\n' +
@@ -99,14 +107,14 @@ export default {
         return ok();
       }
 
-      // Read current events from JSONBin
+      // Read current events from Supabase
       const events = await readEvents(env);
       if (!events) {
-        await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ Could not connect to dashboard data. Try again.');
+        await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ Could not connect to Supabase. Try again.');
         return ok();
       }
 
-      // Build compressed events context for Claude
+      // Build compressed events context for Claude (UI vocabulary)
       const today = new Date().toISOString().split('T')[0];
       const evContext = events.map(e => ({
         id: e.id,
@@ -141,14 +149,12 @@ export default {
       if (claudeResp.action === 'update' && claudeResp.eventId && claudeResp.params) {
         const idx = events.findIndex(e => e.id === claudeResp.eventId);
         if (idx >= 0) {
-          Object.entries(claudeResp.params).forEach(([k, v]) => {
-            events[idx][k] = v;
-          });
-          await writeEvents(env, events);
+          Object.entries(claudeResp.params).forEach(([k, v]) => { events[idx][k] = v; });
+          await updateEvent(env, events[idx]);
         }
       } else if (claudeResp.action === 'create' && claudeResp.params) {
         const newEvent = {
-          id: 'ev_' + Date.now() + '_tg',
+          id: crypto.randomUUID(),
           type: 'event',
           stage: 'lead',
           stamp_status: 'Not ordered',
@@ -168,61 +174,200 @@ export default {
           event_type: '', notes: '',
           ...claudeResp.params,
         };
-        events.push(newEvent);
-        await writeEvents(env, events);
+        await insertEvent(env, newEvent);
       } else if (claudeResp.action === 'delete' && claudeResp.eventId) {
-        const filtered = events.filter(e => e.id !== claudeResp.eventId);
-        if (filtered.length < events.length) {
-          await writeEvents(env, filtered);
-        }
+        await deleteEvent(env, claudeResp.eventId);
       }
 
-      // Send reply
       await sendTelegram(env.TG_BOT_TOKEN, chatId, claudeResp.reply || '✅ Done');
       return ok();
 
     } catch (err) {
       console.error('Worker error:', err);
-      return ok(); // Always return 200 to Telegram
+      return ok();
     }
   }
 };
 
-// ── HELPERS ──
+// ── SUPABASE STORAGE LAYER ──
 
-function ok() {
-  return new Response('ok', { status: 200 });
+function sbHeaders(env, extras = {}) {
+  return {
+    'apikey': env.SUPABASE_SERVICE_KEY,
+    'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY,
+    ...extras,
+  };
+}
+
+function supabaseRowToEvent(o) {
+  const dateOnly = (ts) => ts ? ts.split('T')[0] : '';
+  const dollars = (cents) => (cents !== null && cents !== undefined) ? (cents / 100).toString() : '';
+  const qty = o.coconuts_qty ? o.coconuts_qty.toString() : '';
+  return {
+    id: o.id,
+    type: o.is_recurring ? 'recurring' : 'event',
+    name: o.client_name || '',
+    venue: o.venue || '',
+    contact: o.client_name || '',
+    email: o.client_email || '',
+    phone: o.client_phone || '',
+    market: o.market || '',
+    coi_requested: !!o.coi_required,
+    source: SB_SOURCE_TO_UI[o.source] || '',
+    venue_type: o.venue_type || '',
+    event_type: SB_ETYPE_TO_UI[o.event_type] || '',
+    event_date: dateOnly(o.event_start_at),
+    event_end_date: dateOnly(o.event_end_at),
+    next_order_date: o.next_order_date || '',
+    frequency: SB_FREQ_TO_UI[o.frequency] || '',
+    coconuts: qty,
+    crack_straw: o.crack_type === 'straw' ? qty : '',
+    crack_circle: o.crack_type === 'circle' ? qty : '',
+    crack_whole: o.crack_type === 'whole' ? qty : '',
+    stamp_design: o.stamp_design || '',
+    stamp_status: SB_STAMP_TO_UI[o.stamp_status] || '',
+    logo_received: o.logo_received ? 'Yes' : '',
+    stage: SB_STAGE_TO_UI[o.stage] || 'lead',
+    pre_tax_amount: dollars(o.pre_tax_cents),
+    tax_amount: dollars(o.tax_cents),
+    total_amount: dollars(o.total_cents),
+    deposit_amount: dollars(o.deposit_cents),
+    balance_amount: dollars(o.balance_cents),
+    pay_notes: o.pay_notes || '',
+    delivery_date: dateOnly(o.delivery_at_utc),
+    delivery_notes: o.delivery_notes || '',
+    invoice_url: o.external_invoice_url || '',
+    notes: o.notes || '',
+  };
+}
+
+function eventToSupabaseRow(e) {
+  const ts = (d) => d ? d + 'T12:00:00Z' : null;
+  const cents = (s) => { const n = parseFloat(s); return isNaN(n) ? null : Math.round(n * 100); };
+  const row = {
+    client_name: e.name || 'Unnamed',
+    client_email: e.email || null,
+    client_phone: e.phone || null,
+    venue: e.venue || null,
+    venue_type: e.venue_type || null,
+    event_type: e.event_type ? (UI_ETYPE_TO_SB[e.event_type] || 'other') : null,
+    event_start_at: ts(e.event_date),
+    event_end_at: ts(e.event_end_date),
+    event_tz: 'America/New_York',
+    coconuts_qty: parseInt(e.coconuts) || null,
+    crack_type: e.crack_whole ? 'whole' : (e.crack_circle ? 'circle' : (e.crack_straw ? 'straw' : null)),
+    stamp_design: e.stamp_design || null,
+    stamp_status: UI_STAMP_TO_SB[e.stamp_status] || 'not_ordered',
+    logo_received: e.logo_received === 'Yes',
+    pre_tax_cents: cents(e.pre_tax_amount),
+    tax_cents: cents(e.tax_amount),
+    total_cents: cents(e.total_amount),
+    deposit_cents: cents(e.deposit_amount) ?? 0,
+    balance_cents: cents(e.balance_amount),
+    pay_notes: e.pay_notes || null,
+    external_invoice_url: e.invoice_url || null,
+    stage: UI_STAGE_TO_SB[e.stage] || 'inquiry',
+    market: e.market || null,
+    source: e.source ? (UI_SOURCE_TO_SB[e.source] || 'other') : null,
+    delivery_at_utc: ts(e.delivery_date),
+    delivery_notes: e.delivery_notes || null,
+    coi_required: !!e.coi_requested,
+    is_recurring: e.type === 'recurring',
+    frequency: e.frequency ? (UI_FREQ_TO_SB[e.frequency] || null) : null,
+    next_order_date: e.next_order_date || null,
+    notes: e.notes || null,
+  };
+  if (UUID_RE.test(e.id || '')) row.id = e.id;
+  return row;
 }
 
 async function readEvents(env) {
   try {
-    const resp = await fetch(`${JSONBIN_API}/${env.JSONBIN_BIN_ID}/latest`, {
-      headers: { 'X-Master-Key': env.JSONBIN_MASTER_KEY }
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?select=*', {
+      headers: sbHeaders(env),
     });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    return data.record?.events || [];
+    if (!resp.ok) {
+      console.error('Supabase read error:', resp.status, await resp.text());
+      return null;
+    }
+    const rows = await resp.json();
+    return Array.isArray(rows) ? rows.map(supabaseRowToEvent) : [];
   } catch (e) {
-    console.error('JSONBin read error:', e);
+    console.error('Supabase read exception:', e);
     return null;
   }
 }
 
-async function writeEvents(env, events) {
+async function insertEvent(env, event) {
   try {
-    const resp = await fetch(`${JSONBIN_API}/${env.JSONBIN_BIN_ID}`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Master-Key': env.JSONBIN_MASTER_KEY,
-      },
-      body: JSON.stringify({ events }),
+    const row = eventToSupabaseRow(event);
+    // Ensure new event has a UUID
+    if (!row.id) row.id = crypto.randomUUID();
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders', {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+      body: JSON.stringify(row),
     });
-    return resp.ok;
+    if (!resp.ok) {
+      console.error('Supabase insert error:', resp.status, await resp.text());
+      return false;
+    }
+    return true;
   } catch (e) {
-    console.error('JSONBin write error:', e);
+    console.error('Supabase insert exception:', e);
     return false;
   }
+}
+
+async function updateEvent(env, event) {
+  if (!UUID_RE.test(event.id || '')) {
+    console.error('updateEvent: invalid UUID', event.id);
+    return false;
+  }
+  try {
+    const row = eventToSupabaseRow(event);
+    delete row.id; // Don't send id in body for PATCH; it's in the URL
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + event.id, {
+      method: 'PATCH',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(row),
+    });
+    if (!resp.ok) {
+      console.error('Supabase update error:', resp.status, await resp.text());
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error('Supabase update exception:', e);
+    return false;
+  }
+}
+
+async function deleteEvent(env, eventId) {
+  if (!UUID_RE.test(eventId || '')) {
+    console.error('deleteEvent: invalid UUID', eventId);
+    return false;
+  }
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + eventId, {
+      method: 'DELETE',
+      headers: sbHeaders(env),
+    });
+    if (!resp.ok) {
+      console.error('Supabase delete error:', resp.status, await resp.text());
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error('Supabase delete exception:', e);
+    return false;
+  }
+}
+
+// ── TELEGRAM + CLAUDE HELPERS ──
+
+function ok() {
+  return new Response('ok', { status: 200 });
 }
 
 async function sendTelegram(token, chatId, text) {
@@ -230,11 +375,7 @@ async function sendTelegram(token, chatId, text) {
     await fetch(`${TG_API}${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text,
-        parse_mode: 'Markdown',
-      }),
+      body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: 'Markdown' }),
     });
   } catch (e) {
     console.error('Telegram send error:', e);
@@ -271,7 +412,6 @@ async function callClaude(apiKey, userMessage, eventsContext, today) {
     const txt = data.content?.find(c => c.type === 'text')?.text || '';
     if (!txt) return { error: 'Empty response from Claude' };
     const cleaned = txt.replace(/```json|```/g, '').trim();
-    // Extract JSON even if Claude wrapped it in text
     const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return { error: 'No JSON found: ' + cleaned.slice(0, 150) };
     try {
@@ -285,7 +425,7 @@ async function callClaude(apiKey, userMessage, eventsContext, today) {
   }
 }
 
-// ── DASHBOARD PROXY HANDLERS ──
+// ── DASHBOARD PROXY HANDLERS (unchanged) ──
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -294,7 +434,6 @@ function jsonResponse(obj, status = 200) {
   });
 }
 
-// Handles batch email parsing from the dashboard Gmail integration
 async function handleParseBatch(request, env) {
   try {
     const body = await request.json();
@@ -328,7 +467,6 @@ async function handleParseBatch(request, env) {
   }
 }
 
-// Handles file (PDF/image) parsing from the dashboard invoice uploader
 async function handleParseFile(request, env) {
   try {
     const body = await request.json();
