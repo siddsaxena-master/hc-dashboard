@@ -64,6 +64,11 @@ const UI_SOURCE_TO_SB = {'Google Search':'website','Cold Email Outreach':'sales_
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export default {
+  // ── SCHEDULED (Cloudflare Cron Triggers) ──
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runScheduled(event, env));
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -78,6 +83,10 @@ export default {
     // Dashboard proxy endpoints
     if (url.pathname === '/parse-batch') return handleParseBatch(request, env);
     if (url.pathname === '/parse-file') return handleParseFile(request, env);
+
+    // Inbound webhooks (lead sources, phone events, etc.)
+    if (url.pathname === '/webhooks/formspree') return handleFormspreeWebhook(request, env);
+    if (url.pathname === '/webhooks/quo') return handleQuoWebhook(request, env);
 
     try {
       const update = await request.json();
@@ -464,6 +473,360 @@ async function handleParseBatch(request, env) {
     return jsonResponse({ text: txt });
   } catch (e) {
     return jsonResponse({ error: e.message }, 500);
+  }
+}
+
+// ── SCHEDULED JOBS ──
+
+// Cron schedule (in wrangler.toml [triggers]):
+//   "0 12 * * *"  — daily 8am ET (12 UTC) — Weee box math digest
+//   "0 * * * *"   — hourly — reconfirmation scan + post-event debrief scan
+async function runScheduled(event, env, alsoNotify = true) {
+  const cron = event.cron;
+  try {
+    if (cron === '0 12 * * *') {
+      await runDailyDigest(env);
+    } else if (cron === '0 * * * *') {
+      await runReconfirmationScan(env);
+      await runDebriefScan(env);
+    }
+  } catch (e) {
+    console.error('runScheduled error:', e);
+    if (alsoNotify) {
+      const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+      for (const cid of chatIds) {
+        await sendTelegram(env.TG_BOT_TOKEN, cid, '⚠️ Scheduled job failed (' + cron + '): ' + e.message);
+      }
+    }
+  }
+}
+
+// Daily 8am ET — compute Weee coconut orders for the next 5 days
+async function runDailyDigest(env) {
+  const today = new Date();
+  const horizon = new Date(today.getTime() + 5 * 86400000);
+  const todayStr = today.toISOString().slice(0, 10);
+  const horizonStr = horizon.toISOString().slice(0, 10);
+
+  const resp = await fetch(
+    env.SUPABASE_URL +
+      '/rest/v1/orders?select=client_name,event_start_at,coconuts_qty,market,delivery_at_utc' +
+      '&event_start_at=gte.' + todayStr +
+      '&event_start_at=lte.' + horizonStr +
+      '&stage=in.(deposit_paid,invoiced,paid_full)' +
+      '&order=event_start_at.asc',
+    { headers: sbHeaders(env) }
+  );
+  if (!resp.ok) throw new Error('Daily digest fetch failed: ' + resp.status);
+  const rows = await resp.json();
+
+  // Group by date and market
+  const byDay = {};
+  rows.forEach(r => {
+    const d = (r.event_start_at || '').slice(0, 10);
+    if (!d) return;
+    const m = r.market || 'ny';
+    const key = d + '|' + m;
+    byDay[key] = byDay[key] || { date: d, market: m, events: [], coconuts: 0 };
+    byDay[key].events.push(r);
+    byDay[key].coconuts += (r.coconuts_qty || 0);
+  });
+
+  const lines = ['🥥 *Daily Weee Order Digest*', '_Events in the next 5 days_', ''];
+  if (rows.length === 0) {
+    lines.push('No upcoming committed events in the next 5 days.');
+  } else {
+    Object.values(byDay)
+      .sort((a, b) => (a.date + a.market).localeCompare(b.date + b.market))
+      .forEach(g => {
+        const boxes = Math.ceil(g.coconuts / 9);  // Weee sells 9-coconut boxes
+        lines.push('*' + g.date + '* — ' + g.market.toUpperCase() + ' — ' + g.coconuts + ' coconuts (≈ ' + boxes + ' boxes)');
+        g.events.forEach(e => {
+          lines.push('  • ' + (e.client_name || 'Unnamed') + ' — ' + (e.coconuts_qty || 0));
+        });
+        lines.push('');
+      });
+    lines.push('Weee caps per account — split across accounts and confirm fresh stock before ordering.');
+  }
+
+  const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (const cid of chatIds) {
+    await sendTelegram(env.TG_BOT_TOKEN, cid, lines.join('\n'));
+  }
+}
+
+// Hourly — find events ~1 week out and draft a reconfirmation
+async function runReconfirmationScan(env) {
+  const target = new Date(Date.now() + 7 * 86400000);
+  const dayStr = target.toISOString().slice(0, 10);
+
+  const resp = await fetch(
+    env.SUPABASE_URL +
+      '/rest/v1/orders?select=id,client_name,client_email,event_start_at,venue,coconuts_qty,total_cents,stage' +
+      '&event_start_at=gte.' + dayStr + 'T00:00:00Z' +
+      '&event_start_at=lt.' + dayStr + 'T23:59:59Z' +
+      '&stage=in.(deposit_paid,invoiced,paid_full)',
+    { headers: sbHeaders(env) }
+  );
+  if (!resp.ok) return;
+  const rows = await resp.json();
+  if (!rows.length) return;
+
+  const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (const r of rows) {
+    const lines = [
+      '📩 *Reconfirmation Draft* (event in 7 days)',
+      '',
+      '*' + (r.client_name || 'Unnamed') + '*',
+      '_' + (r.event_start_at || '').slice(0, 10) + '_',
+      r.venue ? '📍 ' + r.venue : '',
+      r.coconuts_qty ? '🥥 ' + r.coconuts_qty + ' coconuts' : '',
+      '',
+      'Draft email:',
+      '> Hi ' + (r.client_name || '').split(' ')[0] + ', wanted to confirm everything for next week\'s event. Final headcount, delivery window, and stamp design all locked in?',
+      '',
+      'Reply *send* in Telegram to send (manual for now).',
+    ].filter(Boolean);
+    for (const cid of chatIds) {
+      await sendTelegram(env.TG_BOT_TOKEN, cid, lines.join('\n'));
+    }
+  }
+}
+
+// Hourly — find events whose delivery was 4-5 hours ago and prompt for debrief
+async function runDebriefScan(env) {
+  const fourHoursAgo = new Date(Date.now() - 4 * 3600000);
+  const fiveHoursAgo = new Date(Date.now() - 5 * 3600000);
+
+  const resp = await fetch(
+    env.SUPABASE_URL +
+      '/rest/v1/orders?select=id,client_name,venue,coconuts_qty,delivery_at_utc' +
+      '&delivery_at_utc=gte.' + fiveHoursAgo.toISOString() +
+      '&delivery_at_utc=lt.' + fourHoursAgo.toISOString(),
+    { headers: sbHeaders(env) }
+  );
+  if (!resp.ok) return;
+  const rows = await resp.json();
+  if (!rows.length) return;
+
+  const issues = [
+    'Stamp size incorrect', 'Stamp arrived late', 'Logo PNG not received in time',
+    'No customer phone number', 'No walk-in cooler at venue',
+    'Delivery window miscommunication', 'Wrong coconut quantity',
+    'Cracking breakdown error', 'Late delivery', 'Venue access issues',
+    'Payment collected late', 'Customer hard to reach',
+    'Coconuts not fresh enough', 'Packaging issue',
+  ];
+
+  const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (const r of rows) {
+    const lines = [
+      '📝 *Post-event debrief* (delivery ~4h ago)',
+      '',
+      '*' + (r.client_name || 'Unnamed') + '*',
+      r.venue ? '📍 ' + r.venue : '',
+      r.coconuts_qty ? '🥥 ' + r.coconuts_qty + ' coconuts' : '',
+      '',
+      'Any issues? Reply with numbers (e.g., "1, 7"):',
+      ...issues.map((iss, i) => `${i + 1}. ${iss}`),
+      '',
+      'Rating: 1=Flawless 2=Good 3=OK 4=Rough 5=Major',
+    ].filter(Boolean);
+    for (const cid of chatIds) {
+      await sendTelegram(env.TG_BOT_TOKEN, cid, lines.join('\n'));
+    }
+  }
+}
+
+// ── INBOUND WEBHOOK HANDLERS ──
+
+const FORMSPREE_EXTRACTION_PROMPT = `You receive a JSON object from a Formspree contact form for Hamptons Coconuts (a premium coconut catering business).
+
+Extract structured booking info. Respond with ONLY valid JSON, no markdown:
+{
+  "client_name": "best guess at customer's name",
+  "client_email": "email or null",
+  "client_phone": "phone in original format or null",
+  "company": "company name if mentioned, else null",
+  "event_type": "wedding | corporate | wellness | other",
+  "event_date": "YYYY-MM-DD if mentioned, else null",
+  "headcount": "number if mentioned, else null",
+  "venue": "venue name if mentioned, else null",
+  "market": "ny | miami | other",
+  "notes": "any other useful context the operator should see",
+  "summary": "one-sentence summary for Telegram alert"
+}`;
+
+async function handleFormspreeWebhook(request, env) {
+  try {
+    const body = await request.json();
+
+    // Step 1: ask Claude to extract structured fields
+    const extractResp = await fetch(CLAUDE_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 800,
+        system: FORMSPREE_EXTRACTION_PROMPT,
+        messages: [{ role: 'user', content: 'Form submission:\n' + JSON.stringify(body, null, 2) }],
+      }),
+    });
+    if (!extractResp.ok) {
+      console.error('Claude extract failed:', extractResp.status);
+      return jsonResponse({ ok: false, error: 'extraction failed' }, 200);
+    }
+    const extractData = await extractResp.json();
+    const txt = extractData.content?.find(c => c.type === 'text')?.text || '{}';
+    const cleaned = txt.replace(/```json|```/g, '').trim();
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    let extracted = {};
+    try { extracted = m ? JSON.parse(m[0]) : {}; } catch (e) { extracted = {}; }
+
+    // Step 2: insert into orders as a new lead
+    const newId = crypto.randomUUID();
+    const orderRow = {
+      id: newId,
+      client_name: extracted.client_name || body.name || 'Unknown',
+      client_email: extracted.client_email || body.email || null,
+      client_phone: extracted.client_phone || body.phone || null,
+      company: extracted.company || null,
+      event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(extracted.event_type) ? extracted.event_type : 'other',
+      event_start_at: extracted.event_date ? extracted.event_date + 'T12:00:00Z' : null,
+      event_tz: 'America/New_York',
+      headcount: parseInt(extracted.headcount) || null,
+      venue: extracted.venue || null,
+      market: ['ny','miami','other'].includes(extracted.market) ? extracted.market : 'ny',
+      stage: 'inquiry',
+      source: 'website',
+      notes: extracted.notes || JSON.stringify(body).slice(0, 500),
+      stamp_status: 'not_ordered',
+      logo_received: false,
+      deposit_cents: 0,
+      coi_required: false,
+      coi_submitted: false,
+      is_recurring: false,
+    };
+    const insertResp = await fetch(env.SUPABASE_URL + '/rest/v1/orders', {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+      body: JSON.stringify(orderRow),
+    });
+    if (!insertResp.ok) {
+      console.error('Formspree insert failed:', insertResp.status, await insertResp.text());
+    }
+
+    // Step 3: Telegram alert
+    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+    const alertText = '🌐 *New website lead* (Formspree)\n\n' +
+      '*' + (orderRow.client_name) + '*' +
+      (orderRow.client_email ? '\n📧 ' + orderRow.client_email : '') +
+      (orderRow.client_phone ? '\n📞 ' + orderRow.client_phone : '') +
+      (orderRow.event_start_at ? '\n📅 _' + orderRow.event_start_at.split('T')[0] + '_' : '') +
+      (orderRow.headcount ? '\n👥 ' + orderRow.headcount + ' guests' : '') +
+      (orderRow.venue ? '\n📍 ' + orderRow.venue : '') +
+      '\n\n' + (extracted.summary || 'Open dashboard to review.');
+    for (const cid of chatIds) {
+      await sendTelegram(env.TG_BOT_TOKEN, cid, alertText);
+    }
+
+    return jsonResponse({ ok: true, order_id: newId });
+  } catch (e) {
+    console.error('Formspree webhook error:', e);
+    return jsonResponse({ ok: false, error: e.message }, 200);
+  }
+}
+
+const QUO_EXTRACTION_PROMPT = `You receive a webhook payload from Quo (phone system: SMS, voicemail, call events).
+
+Classify the inbound event for Hamptons Coconuts (premium coconut catering). Respond with ONLY valid JSON:
+{
+  "kind": "inbound_sms | inbound_call | inbound_voicemail | outbound_log | other",
+  "from_number": "caller phone number or null",
+  "body_text": "message text or voicemail transcript or null",
+  "is_lead": true/false,
+  "lead_name": "name if discernible, else null",
+  "lead_intent": "short summary of what they want, or null",
+  "summary": "one-sentence summary for Telegram alert"
+}`;
+
+async function handleQuoWebhook(request, env) {
+  try {
+    const body = await request.json();
+
+    // Step 1: classify with Claude
+    const cResp = await fetch(CLAUDE_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 600,
+        system: QUO_EXTRACTION_PROMPT,
+        messages: [{ role: 'user', content: 'Quo webhook payload:\n' + JSON.stringify(body, null, 2) }],
+      }),
+    });
+    let extracted = {};
+    if (cResp.ok) {
+      const d = await cResp.json();
+      const txt = d.content?.find(c => c.type === 'text')?.text || '{}';
+      const cleaned = txt.replace(/```json|```/g, '').trim();
+      const m = cleaned.match(/\{[\s\S]*\}/);
+      try { extracted = m ? JSON.parse(m[0]) : {}; } catch (e) {}
+    }
+
+    // Step 2: if lead, insert order row
+    if (extracted.is_lead && extracted.lead_name) {
+      const orderRow = {
+        id: crypto.randomUUID(),
+        client_name: extracted.lead_name,
+        client_phone: extracted.from_number || null,
+        stage: 'inquiry',
+        source: 'direct',  // phone inquiry
+        market: 'ny',
+        notes: (extracted.lead_intent || '') + '\n\n' + (extracted.body_text || ''),
+        stamp_status: 'not_ordered',
+        logo_received: false,
+        deposit_cents: 0,
+        coi_required: false,
+        coi_submitted: false,
+        is_recurring: false,
+      };
+      await fetch(env.SUPABASE_URL + '/rest/v1/orders', {
+        method: 'POST',
+        headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify(orderRow),
+      });
+    }
+
+    // Step 3: Telegram alert (always notify Sidd of inbound activity)
+    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+    const kindEmoji = {
+      inbound_sms: '💬',
+      inbound_call: '📞',
+      inbound_voicemail: '🎙️',
+      outbound_log: '➡️',
+      other: '📡',
+    }[extracted.kind] || '📡';
+    const alertText = kindEmoji + ' *Quo: ' + (extracted.kind || 'unknown') + '*\n\n' +
+      (extracted.from_number ? '*From:* ' + extracted.from_number + '\n' : '') +
+      (extracted.body_text ? '\n' + extracted.body_text.slice(0, 400) + '\n' : '') +
+      '\n' + (extracted.summary || '');
+    for (const cid of chatIds) {
+      await sendTelegram(env.TG_BOT_TOKEN, cid, alertText);
+    }
+
+    return jsonResponse({ ok: true });
+  } catch (e) {
+    console.error('Quo webhook error:', e);
+    return jsonResponse({ ok: false, error: e.message }, 200);
   }
 }
 

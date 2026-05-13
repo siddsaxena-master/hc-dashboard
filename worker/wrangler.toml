@@ -2,6 +2,12 @@ name = "hc-telegram-bot"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
+[triggers]
+crons = [
+  "0 12 * * *",     # 8am ET (12 UTC) — daily Weee box math digest
+  "0 * * * *",      # every hour — reconfirmation scan + post-event debrief scan
+]
+
 # Secrets (set via `wrangler secret put <NAME>`):
 # ANTHROPIC_API_KEY - Claude API key for natural language processing
 # SUPABASE_URL - https://omdcfphbwuwsrffdszlg.supabase.co
