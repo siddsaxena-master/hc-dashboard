@@ -3,8 +3,17 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Hamptons Coconuts — Event Tracker</title>
+<!-- Install-to-home-screen (PWA) so the iPad opens it fullscreen, no Safari bars -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="HC Deliveries">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1c4532">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" href="icon-192.png">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -390,6 +399,77 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
   .topbar-right{gap:4px}
   .view-toggle .vt-btn{padding:4px 7px;font-size:10px}
 }
+
+/* ════════════════════════════════════════════════
+   🚚 DELIVERIES VIEW + ✍️ SIGNATURE PAD (v2.2.0)
+   ════════════════════════════════════════════════ */
+.deliv-wrap{max-width:760px;margin:0 auto;padding:16px 20px 40px}
+.deliv-head{display:flex;align-items:center;justify-content:space-between;margin:8px 0 4px}
+.deliv-head h2{font-size:20px;font-weight:700;letter-spacing:-0.4px;color:var(--text)}
+.deliv-sync-chip{font-size:11px;font-weight:600;color:var(--amber-dark);background:var(--amber-pale);border-radius:20px;padding:4px 11px;display:none}
+.deliv-sync-chip.show{display:inline-block}
+.deliv-sync-chip.allsynced{color:var(--green-mid);background:var(--green-pale)}
+.deliv-group-label{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-hint);margin:22px 4px 10px}
+.deliv-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px 18px;margin-bottom:12px;box-shadow:var(--shadow-sm)}
+.deliv-card.done{background:var(--green-wash);border-color:var(--green-mid2)}
+.deliv-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:8px}
+.deliv-name{font-size:17px;font-weight:700;letter-spacing:-0.3px;color:var(--text);line-height:1.25}
+.deliv-when{flex-shrink:0;font-size:11px;font-weight:700;border-radius:6px;padding:3px 9px;white-space:nowrap}
+.deliv-when.today{background:#fff1f0;color:var(--red-dark)}
+.deliv-when.soon{background:var(--blue-pale);color:#0055cc}
+.deliv-when.later{background:#f0ede8;color:var(--text-muted)}
+.deliv-meta{display:flex;flex-direction:column;gap:4px;margin:8px 0 2px}
+.deliv-meta-row{display:flex;align-items:flex-start;gap:7px;font-size:13px;color:var(--text-muted)}
+.deliv-meta-row .ic{width:16px;text-align:center;flex-shrink:0}
+.deliv-meta-row strong{color:var(--text);font-weight:600}
+.deliv-amount{font-size:15px;font-weight:700;color:var(--green-mid);margin-top:2px}
+.deliv-amount .owed{color:var(--amber-dark)}
+.deliv-invoice-link{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;color:var(--blue);text-decoration:none;margin-top:6px}
+.deliv-confirm{width:100%;margin-top:14px;background:var(--green-mid);color:#fff;border:none;border-radius:var(--radius);padding:15px;font-size:16px;font-weight:700;font-family:inherit;cursor:pointer;letter-spacing:-0.2px;transition:background 0.15s;-webkit-tap-highlight-color:transparent}
+.deliv-confirm:hover{background:var(--green-light)}
+.deliv-confirm:active{background:var(--green)}
+.deliv-done-badge{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:14px;font-weight:600;color:var(--green-mid)}
+.deliv-done-badge .pending{font-size:11px;font-weight:600;color:var(--amber-dark);background:var(--amber-pale);border-radius:20px;padding:2px 9px}
+.deliv-done-badge .synced{font-size:11px;font-weight:600;color:var(--green-mid);background:var(--green-pale);border-radius:20px;padding:2px 9px}
+.deliv-empty{text-align:center;color:var(--text-muted);padding:48px 20px;font-size:14px}
+.deliv-empty .big{font-size:34px;display:block;margin-bottom:10px}
+
+/* Signature / confirm sheet */
+.sig-overlay{position:fixed;inset:0;background:rgba(20,30,25,0.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);z-index:1000;display:flex;align-items:flex-end;justify-content:center;padding:0}
+@media (min-width:560px){.sig-overlay{align-items:center;padding:20px}}
+.sig-sheet{background:var(--surface);width:100%;max-width:560px;max-height:96vh;overflow-y:auto;border-radius:var(--radius-2xl) var(--radius-2xl) 0 0;padding:22px 20px calc(20px + env(safe-area-inset-bottom));box-shadow:var(--shadow-lg);-webkit-overflow-scrolling:touch}
+@media (min-width:560px){.sig-sheet{border-radius:var(--radius-2xl)}}
+.sig-title{font-size:20px;font-weight:700;letter-spacing:-0.4px;color:var(--text)}
+.sig-sub{font-size:13px;color:var(--text-muted);margin-top:2px;margin-bottom:14px}
+.sig-details{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-bottom:14px}
+.sig-detail-row{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:3px 0}
+.sig-detail-row .lbl{color:var(--text-muted)}
+.sig-detail-row .val{color:var(--text);font-weight:600;text-align:right}
+.sig-detail-row.amt .val{color:var(--green-mid);font-size:15px}
+.sig-invoice-link{display:inline-flex;align-items:center;gap:5px;font-size:13px;font-weight:600;color:var(--blue);text-decoration:none;margin-top:6px}
+.sig-name-wrap{margin-bottom:12px}
+.sig-name-wrap label{display:block;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.3px;margin-bottom:5px}
+.sig-name-wrap input{width:100%;border:1px solid var(--border-mid);border-radius:var(--radius);padding:11px 13px;font-size:15px;font-family:inherit;color:var(--text)}
+.sig-pad-label{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.sig-pad-label span{font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.3px}
+.sig-clear{background:none;border:none;color:var(--blue);font-size:13px;font-weight:600;font-family:inherit;cursor:pointer;padding:2px 4px}
+.sig-pad-wrap{position:relative;border:2px dashed var(--border-mid);border-radius:var(--radius);background:#fff;overflow:hidden;touch-action:none}
+.sig-canvas{display:block;width:100%;height:220px;touch-action:none;cursor:crosshair}
+.sig-hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text-hint);font-size:14px;pointer-events:none}
+.sig-hint.hidden{display:none}
+.sig-baseline{position:absolute;left:18px;right:18px;bottom:46px;border-bottom:1px solid var(--border-mid);pointer-events:none}
+.sig-baseline::after{content:'✕';position:absolute;left:0;bottom:2px;color:var(--text-hint);font-size:12px}
+.sig-actions{display:flex;gap:10px;margin-top:16px}
+.sig-cancel-btn{flex:0 0 auto;background:var(--surface2);color:var(--text-muted);border:1px solid var(--border-mid);border-radius:var(--radius);padding:14px 20px;font-size:15px;font-weight:600;font-family:inherit;cursor:pointer}
+.sig-confirm-btn{flex:1;background:var(--green-mid);color:#fff;border:none;border-radius:var(--radius);padding:14px;font-size:16px;font-weight:700;font-family:inherit;cursor:pointer;letter-spacing:-0.2px;transition:background 0.15s}
+.sig-confirm-btn:hover{background:var(--green-light)}
+.sig-confirm-btn:disabled{background:var(--border-mid);color:var(--text-hint);cursor:default}
+.sig-toast{position:fixed;left:50%;bottom:32px;transform:translateX(-50%);background:var(--green);color:#fff;font-size:15px;font-weight:600;padding:14px 22px;border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);z-index:1100;display:flex;align-items:center;gap:9px;animation:sigToastIn 0.25s ease}
+@keyframes sigToastIn{from{opacity:0;transform:translate(-50%,12px)}to{opacity:1;transform:translate(-50%,0)}}
+
+/* Hide owner-only chrome on the Deliveries screen for clarity, but the screen
+   itself stays visible to team members (it is their main screen). */
+.team-view-only #vt-list,.team-view-only #vt-cal,.team-view-only #vt-report{display:none}
 </style>
 </head>
 <body>
@@ -418,6 +498,7 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
       <button class="vt-btn active" id="vt-list" onclick="setView('list')">≡ Dashboard</button>
       <button class="vt-btn" id="vt-cal" onclick="setView('cal')">▦ Calendar</button>
       <button class="vt-btn" id="vt-report" onclick="setView('report')">📊 Reports</button>
+      <button class="vt-btn" id="vt-deliv" onclick="setView('deliv')">🚚 Deliveries</button>
     </div>
     <div class="topbar-actions">
       <button class="icon-btn" onclick="lockOwner()" title="Sign out" style="color:#4ade80">🔓 Sign Out</button>
@@ -499,6 +580,7 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
 
 <div id="cal-wrap" class="cal-wrap" style="display:none"></div>
 <div id="report-wrap" style="display:none;max-width:1100px;margin:0 auto;padding:0 28px 32px"></div>
+<div id="deliveries-wrap" class="deliv-wrap" style="display:none"></div>
 
 <script>
 const STAGES=[
@@ -623,11 +705,14 @@ function setView(v){
   document.getElementById('vt-list').className='vt-btn'+(v==='list'?' active':'');
   document.getElementById('vt-cal').className='vt-btn'+(v==='cal'?' active':'');
   document.getElementById('vt-report').className='vt-btn'+(v==='report'?' active':'');
+  document.getElementById('vt-deliv').className='vt-btn'+(v==='deliv'?' active':'');
   document.getElementById('dashboard-view').style.display=v==='list'?'block':'none';
   document.getElementById('cal-wrap').style.display=v==='cal'?'block':'none';
   document.getElementById('report-wrap').style.display=v==='report'?'block':'none';
+  document.getElementById('deliveries-wrap').style.display=v==='deliv'?'block':'none';
   if(v==='cal')renderCal();
   if(v==='report')renderReports();
+  if(v==='deliv')renderDeliveries();
 }
 
 // ── RENDER
@@ -715,7 +800,7 @@ function renderTodos(){
   </div>`).join('');
 }
 
-function render(){renderUrgent();renderTodos();renderStats();renderLists();if(currentView==='cal')renderCal();if(currentView==='report')renderReports();}
+function render(){renderUrgent();renderTodos();renderStats();renderLists();if(currentView==='cal')renderCal();if(currentView==='report')renderReports();if(currentView==='deliv')renderDeliveries();}
 
 function renderUrgent(){
   const banner=document.getElementById('urgent-banner');
@@ -1755,8 +1840,8 @@ function renderReports(){
 const AUTH_USERS={
   'siddsaxena@gmail.com':{role:'owner',label:'Owner',market:null},
   'hamptonscoconuts@gmail.com':{role:'owner',label:'Owner',market:null},
-  // Add team members here:
-  // 'nyperson@gmail.com':{role:'ny',label:'NY Team',market:'ny'},
+  // Field team (view-only, scoped to their market):
+  'jayden.martin1100@gmail.com':{role:'ny',label:'NY Team',market:'ny'},
   // 'miamiperson@gmail.com':{role:'miami',label:'Miami Team',market:'miami'},
 };
 let currentRole=null; // 'owner','ny','miami'
@@ -1817,6 +1902,8 @@ function activateSession(){
   applyRole();
   document.getElementById('pin-overlay').classList.add('hidden');
   render();
+  // Field team's home screen is Deliveries; owners stay on the Dashboard.
+  if(currentRole&&currentRole!=='owner')setView('deliv');
   jbPull();
   // Background sync
   if(!window._jbSyncInterval){
@@ -1870,6 +1957,7 @@ function initOwner(){
     document.getElementById('pin-overlay').classList.add('hidden');
     const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
     document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
+    if(currentRole&&currentRole!=='owner')setView('deliv');
     jbPull();
     if(!window._jbSyncInterval){
       window._jbSyncInterval=setInterval(()=>{
@@ -1985,6 +2073,8 @@ function supabaseRowToEvent(o){
     delivery_date:dateOnly(o.delivery_at_utc),
     delivery_time:'',
     delivery_notes:o.delivery_notes||'',
+    delivery_signed_at:o.delivery_signed_at||'',
+    delivery_signed_by:o.delivery_signed_by||'',
     invoice_name:'',
     invoice_url:o.external_invoice_url||'',
     cost_per_box:'',
@@ -2132,6 +2222,7 @@ async function jbPull(){
     const rows=await resp.json();
     if(Array.isArray(rows)){
       events=rows.map(supabaseRowToEvent);
+      applyPendingToEvents();
       localStorage.setItem('hc_events',JSON.stringify(events));
       render();
       const now=new Date();
@@ -2741,6 +2832,305 @@ function initTgUI(){
   const cfg=getTgConfig();
   const el=document.getElementById('tg-setup');
   if(el&&cfg.token&&cfg.chatId)el.style.display='none';
+}
+
+// ══════════════════════════════════════════════
+// 🚚  DELIVERIES + ✍️ SIGNATURE CAPTURE (v2.2.0)
+// ══════════════════════════════════════════════
+// Field team flow: open Deliveries → tap a delivery → customer signs → done.
+// Built to NEVER get stuck: signing saves to the phone first (works with no
+// internet), then a background job pushes it to the cloud and retries on its own.
+
+const PENDING_KEY='hc_pending_deliveries';        // offline queue (holds signature images until they reach the cloud)
+function loadQueue(){try{return JSON.parse(localStorage.getItem(PENDING_KEY)||'[]');}catch(_){return [];}}
+function saveQueue(q){try{localStorage.setItem(PENDING_KEY,JSON.stringify(q));}catch(_){}}
+function saveEventsLocalOnly(){try{localStorage.setItem('hc_events',JSON.stringify(events));}catch(_){}}
+
+// Re-apply locally-confirmed (not-yet-synced) deliveries after a cloud refresh,
+// so a delivery the employee just signed doesn't visually "un-deliver" itself.
+function applyPendingToEvents(){
+  const q=loadQueue();
+  if(!q.length)return;
+  q.forEach(item=>{
+    const ev=events.find(e=>e.id===item.orderId);
+    if(ev){
+      if(!ev.delivery_signed_at)ev.delivery_signed_at=item.signedAt;
+      if(!ev.delivery_signed_by)ev.delivery_signed_by=item.signedBy;
+      ev._sig_pending=true;
+    }
+  });
+}
+
+// ── DELIVERIES SCREEN ──
+function delivWhenBadge(e){
+  const ds=e.delivery_date||e.event_date;
+  const d=daysUntil(ds);
+  if(d===null)return {cls:'later',txt:'No date'};
+  if(d<0)return {cls:'today',txt:Math.abs(d)+'d overdue'};
+  if(d===0)return {cls:'today',txt:'TODAY'};
+  if(d===1)return {cls:'soon',txt:'TOMORROW'};
+  if(d<=7)return {cls:'soon',txt:'in '+d+' days'};
+  return {cls:'later',txt:parseLocalDate(ds).toLocaleDateString('en-US',{month:'short',day:'numeric'})};
+}
+
+function delivCard(e){
+  const done=!!e.delivery_signed_at;
+  // Delivered cards show a neutral date; only open ones show TODAY/overdue urgency.
+  const w=done
+    ?{cls:'later',txt:(e.delivery_date||e.event_date)?parseLocalDate(e.delivery_date||e.event_date).toLocaleDateString('en-US',{month:'short',day:'numeric'}):'Delivered'}
+    :delivWhenBadge(e);
+  const total=parseFloat(e.total_amount)||0;
+  const paid=(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0);
+  const owed=Math.max(0,total-paid);
+  const addr=e.delivery_notes||e.venue||'';
+  let meta='';
+  if(addr)meta+=`<div class="deliv-meta-row"><span class="ic">📍</span><span>${esc(addr)}</span></div>`;
+  if(e.delivery_time)meta+=`<div class="deliv-meta-row"><span class="ic">🕐</span><span>${esc(e.delivery_time)}</span></div>`;
+  if(e.coconuts)meta+=`<div class="deliv-meta-row"><span class="ic">🥥</span><span><strong>${esc(e.coconuts)}</strong> coconuts</span></div>`;
+  if(!meta)meta='<div class="deliv-meta-row"><span class="ic">📅</span><span>No address on file — call customer</span></div>';
+  let amount='';
+  if(total>0)amount=owed>0
+    ?`<div class="deliv-amount">Balance due <span class="owed">$${owed.toLocaleString()}</span></div>`
+    :`<div class="deliv-amount">Paid in full ✓</div>`;
+  const invoice=e.invoice_url?`<a class="deliv-invoice-link" href="${esc(e.invoice_url)}" target="_blank" rel="noopener">📄 View invoice</a>`:'';
+  let action;
+  if(done){
+    const when=new Date(e.delivery_signed_at);
+    const wt=isNaN(when.getTime())?'':when.toLocaleDateString('en-US',{month:'short',day:'numeric'})+' '+when.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    const chip=e._sig_pending?'<span class="pending">☁️ saving…</span>':'<span class="synced">✓ saved</span>';
+    action=`<div class="deliv-done-badge"><span>✓ Delivered${e.delivery_signed_by?' · signed by '+esc(e.delivery_signed_by):''}${wt?' · '+wt:''}</span>${chip}</div>`;
+  } else {
+    action=`<button class="deliv-confirm" onclick="openDeliveryConfirm('${e.id}')">✍️ Confirm Delivery</button>`;
+  }
+  return `<div class="deliv-card${done?' done':''}">
+    <div class="deliv-card-top"><div class="deliv-name">${esc(e.name||'Unnamed')}</div><span class="deliv-when ${w.cls}">${w.txt}</span></div>
+    <div class="deliv-meta">${meta}</div>
+    ${amount}${invoice}${action}
+  </div>`;
+}
+
+function renderDeliveries(){
+  const wrap=document.getElementById('deliveries-wrap');
+  if(!wrap)return;
+  // Same market scoping the dashboard uses: team members only see their market.
+  const mf=e=>!currentMarket||!e.market||e.market===currentMarket||e.market==='';
+  const deliveries=events.filter(e=>{
+    if(!mf(e))return false;
+    if(e.type==='recurring')return false;            // recurring templates aren't single deliveries
+    if(e.stage==='passed'||e.stage==='lead')return false; // not a booked job
+    return !!(e.delivery_date||e.event_date);        // needs a date to be deliverable
+  });
+  const dateVal=e=>{const d=parseLocalDate(e.delivery_date||e.event_date);return d?d.getTime():Infinity;};
+  const isDone=e=>!!e.delivery_signed_at;
+  const open=deliveries.filter(e=>!isDone(e)).sort((a,b)=>dateVal(a)-dateVal(b));
+  const done=deliveries.filter(isDone).sort((a,b)=>new Date(b.delivery_signed_at)-new Date(a.delivery_signed_at));
+  const todayOrPast=e=>{const d=daysUntil(e.delivery_date||e.event_date);return d!==null&&d<=0;};
+  const todayGroup=open.filter(todayOrPast);
+  const upcomingGroup=open.filter(e=>!todayOrPast(e));
+
+  let html=`<div class="deliv-head"><h2>🚚 Deliveries</h2><span class="deliv-sync-chip" id="deliv-sync-chip"></span></div>`;
+  if(!deliveries.length){
+    html+=`<div class="deliv-empty"><span class="big">🌴</span>No deliveries scheduled${currentMarket?' for '+currentMarket.toUpperCase():''} yet.<br>Booked events with a delivery date show up here.</div>`;
+    wrap.innerHTML=html;updateDelivSyncChip();return;
+  }
+  if(todayGroup.length)html+=`<div class="deliv-group-label">Today &amp; overdue</div>`+todayGroup.map(delivCard).join('');
+  if(upcomingGroup.length)html+=`<div class="deliv-group-label">Upcoming</div>`+upcomingGroup.map(delivCard).join('');
+  if(done.length)html+=`<div class="deliv-group-label">Delivered</div>`+done.slice(0,25).map(delivCard).join('');
+  wrap.innerHTML=html;
+  updateDelivSyncChip();
+}
+
+function updateDelivSyncChip(){
+  const chip=document.getElementById('deliv-sync-chip');
+  if(!chip)return;
+  const n=loadQueue().length;
+  if(n>0){chip.textContent='☁️ '+n+' saving…';chip.className='deliv-sync-chip show';}
+  else{chip.textContent='✓ All synced';chip.className='deliv-sync-chip show allsynced';
+    setTimeout(()=>{const c=document.getElementById('deliv-sync-chip');if(c&&!loadQueue().length)c.className='deliv-sync-chip';},2500);}
+}
+
+// ── SIGNATURE CONFIRM SHEET ──
+let _sig=null; // the active signature pad
+
+function openDeliveryConfirm(id){
+  const e=events.find(x=>x.id===id);
+  if(!e)return;
+  if(!UUID_RE.test(e.id||'')){alert('This delivery is still syncing. Give it a few seconds and try again.');return;}
+  const total=parseFloat(e.total_amount)||0;
+  const paid=(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0);
+  const owed=Math.max(0,total-paid);
+  const addr=e.delivery_notes||e.venue||'';
+  const ds=e.delivery_date||e.event_date;
+  const dateTxt=ds?parseLocalDate(ds).toLocaleDateString('en-US',{weekday:'long',month:'short',day:'numeric'}):'';
+  const rows=[];
+  rows.push(`<div class="sig-detail-row"><span class="lbl">Client</span><span class="val">${esc(e.name||'—')}</span></div>`);
+  if(addr)rows.push(`<div class="sig-detail-row"><span class="lbl">Address</span><span class="val">${esc(addr)}</span></div>`);
+  if(dateTxt)rows.push(`<div class="sig-detail-row"><span class="lbl">Delivery</span><span class="val">${esc(dateTxt)}${e.delivery_time?' · '+esc(e.delivery_time):''}</span></div>`);
+  if(e.coconuts)rows.push(`<div class="sig-detail-row"><span class="lbl">Coconuts</span><span class="val">${esc(e.coconuts)}</span></div>`);
+  if(total>0)rows.push(`<div class="sig-detail-row amt"><span class="lbl">${owed>0?'Balance due':'Total (paid)'}</span><span class="val">$${(owed>0?owed:total).toLocaleString()}</span></div>`);
+  const invoiceLink=e.invoice_url?`<a class="sig-invoice-link" href="${esc(e.invoice_url)}" target="_blank" rel="noopener">📄 View invoice</a>`:'';
+
+  const ov=document.createElement('div');
+  ov.className='sig-overlay';ov.id='sig-overlay';
+  ov.innerHTML=`<div class="sig-sheet" role="dialog" aria-modal="true">
+    <div class="sig-title">Confirm delivery</div>
+    <div class="sig-sub">Have the customer sign below to complete this delivery.</div>
+    <div class="sig-details">${rows.join('')}${invoiceLink}</div>
+    <div class="sig-name-wrap"><label>Signed by (name)</label><input type="text" id="sig-name" placeholder="Customer name" value="${esc(e.name||'')}" autocomplete="off"></div>
+    <div class="sig-pad-label"><span>Customer signature</span><button type="button" class="sig-clear" onclick="if(_sig)_sig.clear()">Clear</button></div>
+    <div class="sig-pad-wrap"><canvas class="sig-canvas" id="sig-canvas"></canvas><div class="sig-baseline"></div><div class="sig-hint">✍️ Sign here with your finger</div></div>
+    <div class="sig-actions">
+      <button type="button" class="sig-cancel-btn" onclick="closeDeliveryConfirm()">Cancel</button>
+      <button type="button" class="sig-confirm-btn" id="sig-confirm-btn" disabled onclick="confirmDelivery('${e.id}')">Confirm delivery ✓</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  document.body.style.overflow='hidden';
+  // Initialize the pad synchronously. Reading offsetWidth forces the browser to
+  // lay the canvas out first, so it gets sized correctly even if the tab isn't
+  // actively painting (rAF can be throttled in background/standalone contexts).
+  const c=document.getElementById('sig-canvas');
+  if(c){ void c.offsetWidth; _sig=initSigPad(c); }
+  ov.addEventListener('mousedown',ev=>{if(ev.target===ov)closeDeliveryConfirm();});
+}
+
+function closeDeliveryConfirm(){
+  const ov=document.getElementById('sig-overlay');
+  if(ov)ov.remove();
+  document.body.style.overflow='';
+  _sig=null;
+}
+
+// The drawing surface. Pointer events cover both finger (iPad) and mouse.
+function initSigPad(canvas){
+  const wrap=canvas.parentElement;
+  const hint=wrap.querySelector('.sig-hint');
+  const ctx=canvas.getContext('2d');
+  let drawing=false,hasInk=false,last=null;
+  function fit(){
+    const r=canvas.getBoundingClientRect();
+    const dpr=window.devicePixelRatio||1;
+    canvas.width=Math.max(1,Math.round(r.width*dpr));
+    canvas.height=Math.max(1,Math.round(r.height*dpr));
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.lineWidth=2.5;ctx.lineCap='round';ctx.lineJoin='round';ctx.strokeStyle='#1c1c1e';
+  }
+  fit();
+  function pt(ev){const r=canvas.getBoundingClientRect();return{x:ev.clientX-r.left,y:ev.clientY-r.top};}
+  function down(ev){drawing=true;last=pt(ev);try{canvas.setPointerCapture(ev.pointerId);}catch(_){}ev.preventDefault();}
+  function move(ev){
+    if(!drawing)return;
+    const p=pt(ev);
+    ctx.beginPath();ctx.moveTo(last.x,last.y);ctx.lineTo(p.x,p.y);ctx.stroke();
+    last=p;
+    if(!hasInk){hasInk=true;if(hint)hint.classList.add('hidden');const b=document.getElementById('sig-confirm-btn');if(b)b.disabled=false;}
+    ev.preventDefault();
+  }
+  function up(ev){if(!drawing)return;drawing=false;ev.preventDefault();}
+  canvas.addEventListener('pointerdown',down);
+  canvas.addEventListener('pointermove',move);
+  canvas.addEventListener('pointerup',up);
+  canvas.addEventListener('pointercancel',up);
+  return {
+    clear(){ctx.clearRect(0,0,canvas.width,canvas.height);hasInk=false;if(hint)hint.classList.remove('hidden');const b=document.getElementById('sig-confirm-btn');if(b)b.disabled=true;},
+    isEmpty(){return !hasInk;},
+    png(){
+      const o=document.createElement('canvas');o.width=canvas.width;o.height=canvas.height;
+      const c=o.getContext('2d');c.fillStyle='#fff';c.fillRect(0,0,o.width,o.height);c.drawImage(canvas,0,0);
+      return o.toDataURL('image/png');
+    }
+  };
+}
+
+function confirmDelivery(id){
+  const e=events.find(x=>x.id===id);
+  if(!e){closeDeliveryConfirm();return;}
+  if(!_sig||_sig.isEmpty()){alert('Please have the customer sign first.');return;}
+  const signedBy=((document.getElementById('sig-name')||{}).value||'').trim()||e.name||'Customer';
+  const signedAt=new Date().toISOString();
+  const dataUrl=_sig.png();
+  // 1) Save on the device FIRST. This is what lets it work with no internet.
+  e.delivery_signed_at=signedAt;
+  e.delivery_signed_by=signedBy;
+  e._sig_pending=true;
+  saveEventsLocalOnly();
+  // 2) Queue it for the cloud (the queue holds the signature image until it lands).
+  const q=loadQueue();
+  q.push({localKey:id+'|'+signedAt,orderId:id,signedBy,signedAt,dataUrl});
+  saveQueue(q);
+  // 3) From the employee's point of view: instantly done.
+  closeDeliveryConfirm();
+  showSigToast('✓ Delivery confirmed — '+(e.name||'customer'));
+  if(currentView==='deliv')renderDeliveries();
+  // 4) Push to the cloud in the background (non-blocking, retries on its own).
+  syncPendingDeliveries();
+}
+
+// ── BACKGROUND SYNC TO SUPABASE ──
+let _delivSyncing=false;
+async function syncPendingDeliveries(){
+  if(_delivSyncing)return;
+  let q=loadQueue();
+  updateDelivSyncChip();
+  if(!q.length)return;
+  if(typeof navigator!=='undefined'&&navigator.onLine===false)return; // offline — try again later
+  _delivSyncing=true;
+  try{
+    for(const item of [...q]){
+      try{
+        if(!UUID_RE.test(item.orderId))continue; // can't target an unsynced order yet
+        // a) store the signature image + who/when in the delivery_signatures table
+        const sigRow={order_id:item.orderId,signed_by:item.signedBy||null,signed_at:item.signedAt,signature_data_url:item.dataUrl,signed_via:currentUserEmail||'field-app'};
+        const r1=await fetch(SUPABASE_URL+'/rest/v1/delivery_signatures',{
+          method:'POST',
+          headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'return=minimal'},
+          body:JSON.stringify(sigRow)
+        });
+        if(!r1.ok)throw new Error('signature save HTTP '+r1.status);
+        // b) stamp the order itself as delivered
+        const patch={delivery_signed_at:item.signedAt,delivery_signed_by:item.signedBy||null};
+        const r2=await fetch(SUPABASE_URL+'/rest/v1/orders?id=eq.'+item.orderId,{
+          method:'PATCH',
+          headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'return=minimal'},
+          body:JSON.stringify(patch)
+        });
+        if(!r2.ok)throw new Error('order update HTTP '+r2.status);
+        // success → remove from queue + clear the "saving" flag
+        q=q.filter(x=>x.localKey!==item.localKey);
+        saveQueue(q);
+        const ev=events.find(x=>x.id===item.orderId);
+        if(ev)ev._sig_pending=false;
+        saveEventsLocalOnly();
+      }catch(err){
+        console.warn('Delivery sync will retry:',err.message);
+        break; // stop this round, try again on the next tick
+      }
+    }
+  }finally{
+    _delivSyncing=false;
+    updateDelivSyncChip();
+    if(currentView==='deliv')renderDeliveries();
+  }
+}
+
+function showSigToast(msg){
+  const t=document.createElement('div');
+  t.className='sig-toast';
+  t.innerHTML='<span>🥥</span><span>'+esc(msg)+'</span>';
+  document.body.appendChild(t);
+  setTimeout(()=>{t.style.transition='opacity 0.3s';t.style.opacity='0';setTimeout(()=>t.remove(),320);},2600);
+}
+
+// Retry the queue when the network comes back, on a slow timer, and shortly after load.
+window.addEventListener('online',syncPendingDeliveries);
+setInterval(()=>{if(loadQueue().length)syncPendingDeliveries();},20000);
+setTimeout(()=>{if(loadQueue().length)syncPendingDeliveries();},4000);
+
+// ── PWA: register the offline service worker (works on HTTPS / localhost only) ──
+if('serviceWorker' in navigator){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('sw.js').catch(err=>console.warn('Service worker registration failed:',err));
+  });
 }
 
 </script>
