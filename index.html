@@ -2004,8 +2004,6 @@ function calcProfit(e){
 }
 function hasProfit(e){return !!(e.cost_per_box||e.cost_labor||e.cost_other);}
 
-initKeyUI();initOwner();loadEvents();render();
-
 // ══════════════════════════════════════════════
 // ☁️  SUPABASE CLOUD SYNC (migrated from JSONBin 2026-05-13)
 // ══════════════════════════════════════════════
@@ -2129,6 +2127,12 @@ function eventToSupabaseRow(e){
   if(UUID_RE.test(e.id||''))row.id=e.id;
   return row;
 }
+
+// Boot the UI and restore the saved session. This must run AFTER the Supabase
+// config and vocab maps above are initialized, because initOwner() calls jbPull(),
+// which reads SUPABASE_URL/SB_HEADERS. (Previously this ran above the config and
+// threw a harmless "Cannot access 'SUPABASE_URL' before initialization" on load.)
+initKeyUI();initOwner();loadEvents();render();
 
 // Auto-connect on load
 (function(){
