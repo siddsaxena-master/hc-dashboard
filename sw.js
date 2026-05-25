@@ -5,7 +5,7 @@
 //  - Cross-origin calls (Supabase, Google sign-in, fonts) always go to the network.
 //  - Writes (POST/PATCH) are never touched, so signing/saving works normally.
 
-const CACHE = 'hc-deliveries-v1';
+const CACHE = 'hc-deliveries-v2';
 const SHELL = [
   './',
   './index.html',
