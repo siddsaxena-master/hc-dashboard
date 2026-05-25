@@ -476,6 +476,24 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
 .dash-search{flex:1;border:1px solid var(--border-mid);border-radius:var(--radius);padding:11px 14px;font-size:14px;font-family:inherit;color:var(--text);background:var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E") no-repeat 14px center;padding-left:40px;box-shadow:var(--shadow-sm)}
 .dash-search:focus{outline:none;border-color:var(--green-light);box-shadow:0 0 0 3px var(--green-pale)}
 .dash-search-count{font-size:12px;font-weight:600;color:var(--text-muted);white-space:nowrap}
+
+/* Repeat-venue groups (collapsed by default) */
+.venue-group{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);margin-bottom:8px;overflow:hidden;box-shadow:var(--shadow-sm)}
+.vg-header{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;user-select:none}
+.vg-header:hover{background:var(--surface2)}
+.vg-chevron{font-size:12px;color:var(--text-muted);transition:transform 0.2s;flex-shrink:0;width:12px}
+.venue-group.open .vg-chevron{transform:rotate(90deg)}
+.vg-main{flex:1;min-width:0}
+.vg-name{font-size:14px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vg-sub{font-size:11px;color:var(--text-muted);margin-top:2px}
+.vg-count{flex-shrink:0;background:var(--green-pale);color:var(--green-mid);font-size:12px;font-weight:700;border-radius:20px;padding:3px 10px}
+.vg-body{display:none;border-top:1px solid var(--border);max-height:340px;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.venue-group.open .vg-body{display:block}
+.vg-row{display:flex;align-items:center;gap:10px;padding:8px 14px 8px 36px;border-bottom:1px solid var(--border);cursor:pointer;font-size:12px}
+.vg-row:last-child{border-bottom:none}
+.vg-row:hover{background:var(--green-wash)}
+.vg-row-date{color:var(--text-muted);min-width:118px}
+.vg-row-amt{margin-left:auto;font-weight:600;color:var(--text)}
 </style>
 </head>
 <body>
@@ -900,6 +918,43 @@ function logoBadge(e){
   return'';
 }
 
+// Render one collapsible card for a repeat venue (a group of one-time orders
+// that share a client name). Header shows order count + total; body lists each
+// order (click to open). `expanded` opens it immediately (used during search).
+function venueGroupCard(group,expanded){
+  const name=group[0].name||'Unnamed venue';
+  const n=group.length;
+  const total=group.reduce((s,e)=>s+(parseFloat(e.total_amount)||0),0);
+  const market=(group.find(e=>e.market)||{}).market||'';
+  const dated=group.map(e=>parseLocalDate(e.delivery_date||e.event_date)).filter(Boolean).sort((a,b)=>b-a);
+  const latest=dated[0];
+  const rows=group.slice().sort((a,b)=>{
+    const da=parseLocalDate(a.delivery_date||a.event_date)||new Date(0);
+    const db=parseLocalDate(b.delivery_date||b.event_date)||new Date(0);
+    return db-da;
+  }).map(e=>{
+    const d=parseLocalDate(e.delivery_date||e.event_date);
+    const dstr=d?d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'No date';
+    const amt=parseFloat(e.total_amount)||0;
+    return `<div class="vg-row" onclick="event.stopPropagation();openEdit('${e.id}')"><span class="vg-row-date">${dstr}</span>${stageBadge(e.stage)}<span class="vg-row-amt">${amt?'$'+amt.toLocaleString():''}</span></div>`;
+  }).join('');
+  return `<div class="venue-group${expanded?' open':''}">
+    <div class="vg-header" onclick="toggleVenueGroup(this)">
+      <span class="vg-chevron">▸</span>
+      <div class="vg-main">
+        <div class="vg-name">${marketBadge(market)} ${esc(name)}</div>
+        <div class="vg-sub">${n} orders${total?' · $'+Math.round(total).toLocaleString()+' total':''}${latest?' · last '+latest.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):''}</div>
+      </div>
+      <span class="vg-count">${n}</span>
+    </div>
+    <div class="vg-body">${rows}</div>
+  </div>`;
+}
+function toggleVenueGroup(headerEl){
+  const g=headerEl.closest('.venue-group');
+  if(g)g.classList.toggle('open');
+}
+
 function renderLists(){
   // Filter by market role
   const mf=e=>!currentMarket||!e.market||e.market===currentMarket||e.market==='';
@@ -989,10 +1044,21 @@ function renderLists(){
   } else {
     const upcomingCount=oneTime.filter(e=>{const d=parseLocalDate(e.event_date);return d&&d>=today;}).length;
     const noDateCount=oneTime.filter(e=>!e.event_date).length;
-    el.innerHTML=oneTime.map((e,i)=>{
+    // Group repeat venues (same client name with 2+ orders) into one collapsible
+    // card so a weekly venue shows once instead of dozens of rows. Genuine
+    // one-offs render chronologically below, exactly as before.
+    const keyOf=e=>(e.name||'').trim().toLowerCase();
+    const counts={};
+    oneTime.forEach(e=>{const k=keyOf(e);if(k)counts[k]=(counts[k]||0)+1;});
+    const singles=oneTime.filter(e=>(counts[keyOf(e)]||0)<=1);
+    const seen={},groups=[];
+    oneTime.forEach(e=>{const k=keyOf(e);if(counts[k]>1&&!seen[k]){seen[k]=1;groups.push(oneTime.filter(x=>keyOf(x)===k));}});
+    groups.sort((a,b)=>b.length-a.length);
+    const groupsHTML=groups.map(g=>venueGroupCard(g,!!sq)).join('');
+    el.innerHTML=groupsHTML+singles.map((e,i)=>{
       const d=parseLocalDate(e.event_date);
       const isPastItem=d&&d<today;
-      const prevE=oneTime[i-1];
+      const prevE=singles[i-1];
       const prevD=prevE?parseLocalDate(prevE.event_date):null;
       const prevPast=prevD&&prevD<today;
       // Insert divider when transitioning from upcoming to past
