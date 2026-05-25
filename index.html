@@ -470,6 +470,12 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
 /* Hide owner-only chrome on the Deliveries screen for clarity, but the screen
    itself stays visible to team members (it is their main screen). */
 .team-view-only #vt-list,.team-view-only #vt-cal,.team-view-only #vt-report{display:none}
+
+/* Dashboard search bar */
+.dash-search-wrap{max-width:1140px;margin:0 auto 4px;padding:0 24px;display:flex;align-items:center;gap:12px}
+.dash-search{flex:1;border:1px solid var(--border-mid);border-radius:var(--radius);padding:11px 14px;font-size:14px;font-family:inherit;color:var(--text);background:var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E") no-repeat 14px center;padding-left:40px;box-shadow:var(--shadow-sm)}
+.dash-search:focus{outline:none;border-color:var(--green-light);box-shadow:0 0 0 3px var(--green-pale)}
+.dash-search-count{font-size:12px;font-weight:600;color:var(--text-muted);white-space:nowrap}
 </style>
 </head>
 <body>
@@ -558,6 +564,10 @@ input.autofilled{border-color:var(--green)!important;background:#f0fdf4!importan
   </div>
 </div>
 <div class="stats-area"><div class="stats-grid" id="stats-grid"></div></div>
+  <div class="dash-search-wrap">
+    <input type="search" id="dash-search" class="dash-search" placeholder="Search all orders by client, venue, or contact…" oninput="setSearch(this.value)" autocomplete="off">
+    <span id="dash-search-count" class="dash-search-count"></span>
+  </div>
   <div class="two-col">
     <!-- RECURRING ACCOUNTS -->
     <div>
@@ -601,6 +611,8 @@ const VENUE_TYPES=['Beach Club','Nightclub','Restaurant','Hotel','Country Club',
 const EVENT_TYPES=['Wedding','Corporate Event','Wellness Event','Birthday Party','Holiday Party','Networking Event','Product Launch','Charity Event','Bachelor/Bachelorette','Other'];
 
 let events=[], currentView='list', editingId=null;
+let searchQuery=''; // dashboard search filter (matches name/venue/contact)
+function setSearch(v){searchQuery=(v||'').toLowerCase().trim();renderLists();}
 let calYear=new Date().getFullYear(), calMonth=new Date().getMonth();
 
 // ── AI PROXY (all Claude calls go through Cloudflare Worker — no keys in browser)
@@ -891,9 +903,12 @@ function logoBadge(e){
 function renderLists(){
   // Filter by market role
   const mf=e=>!currentMarket||!e.market||e.market===currentMarket||e.market==='';
-  const recurring=events.filter(e=>e.type==='recurring'&&mf(e)).sort((a,b)=>a.name.localeCompare(b.name));
+  // Filter by the search box (matches client name, venue, contact)
+  const sq=searchQuery;
+  const sm=e=>!sq||(((e.name||'')+' '+(e.venue||'')+' '+(e.contact||'')).toLowerCase().indexOf(sq)>-1);
+  const recurring=events.filter(e=>e.type==='recurring'&&mf(e)&&sm(e)).sort((a,b)=>(a.name||'').localeCompare(b.name||''));
   const today=new Date();today.setHours(0,0,0,0);
-  const oneTime=events.filter(e=>e.type!=='recurring'&&mf(e)).sort((a,b)=>{
+  const oneTime=events.filter(e=>e.type!=='recurring'&&mf(e)&&sm(e)).sort((a,b)=>{
     const da=parseLocalDate(a.event_date)||new Date('9999-01-01');
     const db=parseLocalDate(b.event_date)||new Date('9999-01-01');
     const daEnd=a.event_end_date?parseLocalDate(a.event_end_date):da;
@@ -912,6 +927,8 @@ function renderLists(){
 
   document.getElementById('recurring-count').textContent=recurring.filter(e=>e.stage!=='passed'&&e.stage!=='dnb').length;
   document.getElementById('events-count').textContent=oneTime.filter(e=>e.stage!=='passed'&&e.stage!=='dnb').length;
+  const scEl=document.getElementById('dash-search-count');
+  if(scEl){const n=recurring.length+oneTime.length;scEl.textContent=sq?(n+' match'+(n===1?'':'es')):'';}
 
   // Recurring accounts
   const rl=document.getElementById('recurring-list');
