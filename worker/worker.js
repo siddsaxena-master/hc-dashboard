@@ -858,7 +858,21 @@ Rules:
 - "noise" = marketing emails, newsletters, automated noise (e.g. Weee promotional). should_alert = false.
 - "vendor" = supplier comms (Weee, stamp vendor, etc.). should_alert = true (Sidd wants to know).
 - "customer_reply" = email from someone already in the system. should_alert = true. extracted_lead = null.
-- "lead_inquiry" = NEW inquiry asking about pricing, availability, booking. should_alert = true. fill extracted_lead.`;
+- "lead_inquiry" = NEW inquiry asking about pricing, availability, booking. should_alert = true. fill extracted_lead.
+
+Emails for from_email and extracted_lead.client_email come from the PROSPECT / CUSTOMER, never from the mailbox owner. Sidd@hamptonscoconuts.com (any case) is the mailbox owner, not a customer; if that is the only email you see in resourceData.from, the message is likely a self-forward and the original sender is in the BODY. Use null rather than emit the mailbox owner's address. Same rule for any @hamptonscoconuts.com address.`;
+
+// Deterministic guard. Even with the prompt updated, a model can still
+// echo back the mailbox owner's address as the "sender" on a forwarded
+// inquiry (the 2026-05-30 Sarah Pressler / Cody Larkin lead-row dups).
+// Drops any address that ends with the operator's domain.
+const OPERATOR_EMAIL_DOMAIN = '@hamptonscoconuts.com';
+function _scrubOperatorEmail(email) {
+  if (!email) return null;
+  const lower = String(email).trim().toLowerCase();
+  if (!lower) return null;
+  return lower.endsWith(OPERATOR_EMAIL_DOMAIN) ? null : email;
+}
 
 async function handleMsGraphWebhook(request, env, url) {
   // Microsoft Graph subscriptions send a validationToken on creation; echo it back.
@@ -905,7 +919,8 @@ async function handleMsGraphWebhook(request, env, url) {
         const orderRow = {
           id: crypto.randomUUID(),
           client_name: e.client_name || 'Unknown',
-          client_email: e.client_email || cls.from_email || null,
+          client_email: _scrubOperatorEmail(e.client_email) ||
+                        _scrubOperatorEmail(cls.from_email) || null,
           client_phone: e.client_phone || null,
           event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(e.event_type) ? e.event_type : 'other',
           event_start_at: e.event_date ? e.event_date + 'T12:00:00Z' : null,
@@ -932,9 +947,10 @@ async function handleMsGraphWebhook(request, env, url) {
 
       // Telegram alert if should_alert
       if (cls.should_alert) {
+        const safeFromEmail = _scrubOperatorEmail(cls.from_email);
         const emoji = { lead_inquiry: '🌱', customer_reply: '💬', vendor: '📦', noise: '🗑️' }[cls.category] || '📧';
         const text = emoji + ' *Email: ' + (cls.category || 'unknown') + '*\n' +
-          '*From:* ' + (cls.from_name || cls.from_email || 'unknown') + '\n' +
+          '*From:* ' + (cls.from_name || safeFromEmail || 'unknown') + '\n' +
           '*Subject:* ' + (cls.subject || '') + '\n\n' +
           (cls.summary || '');
         const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
