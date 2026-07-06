@@ -511,7 +511,7 @@ async function runDailyDigest(env) {
 
   const resp = await fetch(
     env.SUPABASE_URL +
-      '/rest/v1/orders?select=client_name,event_start_at,coconuts_qty,market,delivery_at_utc' +
+      '/rest/v1/orders?select=client_name,event_start_at,coconuts_qty,market,delivery_at_utc,venue,delivery_notes' +
       '&event_start_at=gte.' + todayStr +
       '&event_start_at=lte.' + horizonStr +
       '&stage=in.(deposit_paid,invoiced,paid_full)' +
@@ -533,7 +533,19 @@ async function runDailyDigest(env) {
     byDay[key].coconuts += (r.coconuts_qty || 0);
   });
 
-  const lines = ['🥥 *Daily Weee Order Digest*', '_Events in the next 5 days_', ''];
+  const lines = ['🥥 *Daily Game Plan*', '_Committed events, next 5 days_', ''];
+  // BUY TODAY: coconuts must be ordered at least 2 days ahead, so anything
+  // delivering the day after tomorrow (or sooner) needs ordering NOW.
+  const buyCutoff = new Date(today.getTime() + 2 * 86400000).toISOString().slice(0, 10);
+  const buyNow = rows.filter(r => (r.event_start_at || '').slice(0, 10) <= buyCutoff);
+  const buyCoco = buyNow.reduce((s, r) => s + (r.coconuts_qty || 0), 0);
+  if (buyCoco > 0) {
+    lines.push('🛒 *ORDER TODAY: ' + Math.ceil(buyCoco / 9) + ' boxes* (' + buyCoco + ' coconuts) for deliveries through ' + buyCutoff + ':');
+    buyNow.forEach(r => {
+      if (r.coconuts_qty) lines.push('  • ' + (r.event_start_at || '').slice(0, 10) + ' — ' + (r.client_name || '?') + ' (' + r.coconuts_qty + ')');
+    });
+    lines.push('');
+  }
   if (rows.length === 0) {
     lines.push('No upcoming committed events in the next 5 days.');
   } else {
@@ -543,7 +555,8 @@ async function runDailyDigest(env) {
         const boxes = Math.ceil(g.coconuts / 9);  // Weee sells 9-coconut boxes
         lines.push('*' + g.date + '* — ' + g.market.toUpperCase() + ' — ' + g.coconuts + ' coconuts (≈ ' + boxes + ' boxes)');
         g.events.forEach(e => {
-          lines.push('  • ' + (e.client_name || 'Unnamed') + ' — ' + (e.coconuts_qty || 0));
+          const where = e.venue || (e.delivery_notes || '').split(',')[0] || '';
+          lines.push('  • ' + (e.client_name || 'Unnamed') + ' — ' + (e.coconuts_qty || 0) + (where ? ' @ ' + where : ''));
         });
         lines.push('');
       });

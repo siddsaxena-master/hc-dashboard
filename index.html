@@ -517,6 +517,37 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
   .stat-val{font-size:18px}
   .topbar-right{gap:4px}
 }
+
+/* ═══════════ OPS PLAN VIEW ═══════════ */
+.ops-wrap{max-width:900px;margin:0 auto;padding:16px 24px 40px}
+.ops-head h2{font-size:20px;font-weight:800;letter-spacing:-.4px;margin:8px 0 12px}
+.ops-buy{background:linear-gradient(135deg,#0b2b1d,#155a3c);border-radius:var(--radius-lg);padding:14px 16px;color:#e6faf1;margin-bottom:18px;border:1px solid rgba(255,255,255,.07)}
+.ops-buy-title{font-size:10.5px;font-weight:800;text-transform:uppercase;letter-spacing:.9px;color:#7fdcb5;margin-bottom:8px}
+.ops-buy-row{font-size:13px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.08)}
+.ops-buy-row:last-child{border-bottom:none}
+.ops-buy-row.late{color:#ffd9a8}
+.ops-buy-qty{font-weight:800;color:#4fe3a6}
+.ops-buy-row.late .ops-buy-qty{color:#fbbf24}
+.ops-day{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);margin-bottom:14px;overflow:hidden;box-shadow:var(--shadow-sm)}
+.ops-day-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 16px;background:linear-gradient(180deg,var(--surface),var(--surface2));border-bottom:1px solid var(--border);font-size:13.5px;font-weight:800}
+.ops-day-total{font-size:11.5px;font-weight:700;color:var(--green-mid);background:var(--green-pale);border-radius:20px;padding:3px 10px;white-space:nowrap}
+.ops-row{display:grid;grid-template-columns:92px 1fr 110px;gap:12px;padding:11px 16px;border-bottom:1px solid var(--border);cursor:pointer;align-items:center;transition:background .12s}
+.ops-row:last-child{border-bottom:none}
+.ops-row:hover{background:var(--green-wash)}
+.ops-qty{font-size:14px;font-weight:800;color:var(--text)}
+.ops-qty span{display:block;font-size:10px;font-weight:600;color:var(--text-hint)}
+.ops-who strong{font-size:13.5px;font-weight:700;display:block}
+.ops-who span{font-size:11.5px;color:var(--text-muted);display:block;margin-top:1px}
+.ops-when{text-align:right;font-size:13px;font-weight:700;color:var(--text)}
+.ops-when span{display:block;font-size:10px;font-weight:700;color:var(--green-mid);text-transform:uppercase;letter-spacing:.4px}
+.ops-missing{color:var(--red-dark);font-weight:600}
+.team-view-only #vt-ops{display:none}
+@media (max-width:768px){
+  .ops-wrap{padding:8px 14px 28px}
+  .ops-row{grid-template-columns:74px 1fr 86px;gap:8px;padding:10px 12px}
+  .ops-who strong{font-size:12.5px}
+  .ops-who span{font-size:10.5px}
+}
 </style>
 </head>
 <body>
@@ -545,6 +576,7 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
     <div class="view-toggle">
       <button class="vt-btn active" id="vt-list" onclick="setView('list')">≡ Dashboard</button>
       <button class="vt-btn" id="vt-cal" onclick="setView('cal')">▦ Calendar</button>
+      <button class="vt-btn" id="vt-ops" onclick="setView('ops')">📋 Ops Plan</button>
       <button class="vt-btn" id="vt-report" onclick="setView('report')">📊 Reports</button>
       <button class="vt-btn" id="vt-deliv" onclick="setView('deliv')">🚚 Deliveries</button>
     </div>
@@ -632,6 +664,7 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
 </div>
 
 <div id="cal-wrap" class="cal-wrap" style="display:none"></div>
+<div id="ops-wrap" class="ops-wrap" style="display:none"></div>
 <div id="report-wrap" style="display:none;max-width:1100px;margin:0 auto;padding:0 28px 32px"></div>
 <div id="deliveries-wrap" class="deliv-wrap" style="display:none"></div>
 
@@ -759,15 +792,90 @@ function setView(v){
   currentView=v;
   document.getElementById('vt-list').className='vt-btn'+(v==='list'?' active':'');
   document.getElementById('vt-cal').className='vt-btn'+(v==='cal'?' active':'');
+  document.getElementById('vt-ops').className='vt-btn'+(v==='ops'?' active':'');
   document.getElementById('vt-report').className='vt-btn'+(v==='report'?' active':'');
   document.getElementById('vt-deliv').className='vt-btn'+(v==='deliv'?' active':'');
   document.getElementById('dashboard-view').style.display=v==='list'?'block':'none';
   document.getElementById('cal-wrap').style.display=v==='cal'?'block':'none';
+  document.getElementById('ops-wrap').style.display=v==='ops'?'block':'none';
   document.getElementById('report-wrap').style.display=v==='report'?'block':'none';
   document.getElementById('deliveries-wrap').style.display=v==='deliv'?'block':'none';
   if(v==='cal')renderCal();
+  if(v==='ops')renderOps();
   if(v==='report')renderReports();
   if(v==='deliv')renderDeliveries();
+}
+
+// ── OPS PLAN: Sidd's notebook, digitized (next 7 days) ──────────────────
+// Per day: boxes | customer | where | when | crack type, with day totals
+// and a coconut BUY PLAN on top (order at least 2 days ahead).
+function _opsTimeSort(t){
+  const m=/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(t||'');
+  if(!m)return 99;
+  let h=parseInt(m[1],10)||0;
+  if(/pm/i.test(m[3]||'')&&h<12)h+=12;
+  return h+(parseInt(m[2],10)||0)/60;
+}
+function _opsCrack(e){
+  const c=[];
+  if(parseFloat(e.crack_whole))c.push('whole');
+  if(parseFloat(e.crack_straw))c.push('straw');
+  if(parseFloat(e.crack_circle))c.push('circle');
+  return c.join(' + ')||'whole';
+}
+function renderOps(){
+  const wrap=document.getElementById('ops-wrap');
+  const today=new Date();today.setHours(12,0,0,0);
+  const dayKeys=[];
+  for(let i=0;i<7;i++)dayKeys.push(new Date(today.getTime()+i*86400000).toISOString().slice(0,10));
+  const mf=e=>!currentMarket||!e.market||e.market===currentMarket;
+  const dOf=e=>e.delivery_date||e.event_date||'';
+  const rows=events.filter(e=>mf(e)&&e.stage!=='passed'&&e.stage!=='dnb'&&dayKeys.includes(dOf(e)));
+  const fmt=ds=>new Date(ds+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'short',day:'numeric'});
+
+  // Buy plan: order coconuts at least 2 days before each delivery day.
+  let buy='';
+  dayKeys.forEach((ds,i)=>{
+    const evs=rows.filter(e=>dOf(e)===ds);
+    const coco=evs.reduce((s,e)=>s+(parseFloat(e.coconuts)||0),0);
+    if(!coco)return;
+    const boxes=Math.ceil(coco/9);
+    const late=i<=2;  // needs ordering today (or should already be ordered)
+    const orderBy=new Date(new Date(ds+'T12:00:00').getTime()-2*86400000)
+      .toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
+    buy+='<div class="ops-buy-row'+(late?' late':'')+'"><span class="ops-buy-qty">'
+      +boxes+' boxes</span> ('+coco+' coconuts) for '+fmt(ds)
+      +' — order by <strong>'+(late?'TODAY':orderBy)+'</strong></div>';
+  });
+  let html='<div class="ops-head"><h2>📋 Ops Plan — next 7 days</h2></div>'
+    +'<div class="ops-buy"><div class="ops-buy-title">🛒 Coconut buy plan (Weee boxes of 9 — order 2 days ahead)</div>'
+    +(buy||'<div class="ops-buy-row">Nothing needs ordering in the next 7 days.</div>')+'</div>';
+
+  let any=false;
+  dayKeys.forEach(ds=>{
+    const evs=rows.filter(e=>dOf(e)===ds)
+      .sort((a,b)=>_opsTimeSort(a.delivery_time)-_opsTimeSort(b.delivery_time));
+    if(!evs.length)return;
+    any=true;
+    const coco=evs.reduce((s,e)=>s+(parseFloat(e.coconuts)||0),0);
+    const boxes=Math.ceil(coco/9);
+    html+='<div class="ops-day"><div class="ops-day-head"><span>'+fmt(ds)+'</span>'
+      +'<span class="ops-day-total">'+evs.length+' stop'+(evs.length!==1?'s':'')+' · '
+      +coco+' coconuts · '+boxes+' boxes</span></div>';
+    evs.forEach(e=>{
+      const n=parseFloat(e.coconuts)||0;
+      const b=n?Math.ceil(n/9):0;
+      const where=e.delivery_notes||e.venue||'<span class="ops-missing">no address — tap to add</span>';
+      html+='<div class="ops-row" onclick="openEdit(\''+e.id+'\')">'
+        +'<div class="ops-qty">'+(b?b+' boxes':'—')+'<span>'+(n?n+' coco':'')+'</span></div>'
+        +'<div class="ops-who"><strong>'+esc(e.name||'?')+'</strong><span>'+ (typeof where==='string'?where:where) +'</span></div>'
+        +'<div class="ops-when">'+esc(e.delivery_time||'—')+'<span>'+_opsCrack(e)+'</span></div>'
+        +'</div>';
+    });
+    html+='</div>';
+  });
+  if(!any)html+='<div class="deliv-empty"><span class="big">🌴</span>No deliveries in the next 7 days.</div>';
+  wrap.innerHTML=html;
 }
 
 // ── RENDER
@@ -786,14 +894,14 @@ function renderTodos(){
     const hasPaid=dep>0||bal>0;
 
     // 1. Stamp needs ordering — deposit or full payment received, stamp not ordered
-    if(hasPaid && e.stamp_status==='Not ordered' && e.logo_received!=='unbranded'){
+    if(hasPaid && e.stage!=='lead' && e.stamp_status==='Not ordered' && e.logo_received!=='unbranded'){
       const urgency=days!==null&&days<=7?'urgent':'warn';
-      todos.push({urgency,tag:'stamp',text:`<strong>Order stamp</strong> for ${e.name}${days!==null?' — event in '+days+' day'+(days===1?'':'s'):''}`,id:e.id});
+      todos.push({urgency,tag:'stamp',text:`<strong>Make stamp</strong> (laser; buy brass stock if low) for ${e.name}${days!==null?' — event in '+days+' day'+(days===1?'':'s'):''}`,id:e.id});
     }
 
     // 2. Logo PNG not received but stamp not yet ordered
-    if(hasPaid && e.logo_received==='No' && e.stamp_status==='Not ordered'){
-      todos.push({urgency:'warn',tag:'logo',text:`<strong>Chase logo PNG</strong> from ${e.name} — needed before stamp can be ordered`,id:e.id});
+    if(hasPaid && e.stage!=='lead' && e.logo_received==='No' && e.stamp_status==='Not ordered'){
+      todos.push({urgency:'warn',tag:'logo',text:`<strong>Chase logo PNG</strong> from ${e.name} — needed before the stamp can be made`,id:e.id});
     }
 
     // 3. COI requested but not yet sent (stage not completed)
@@ -827,8 +935,8 @@ function renderTodos(){
     }
 
     // 7. Event is tomorrow or today and stamp not received
-    if(days!==null&&days<=1&&days>=0&&e.stamp_status!=='Received'){
-      todos.push({urgency:'urgent',tag:'stamp',text:`<strong>${days===0?'TODAY':'TOMORROW'}: Stamp not received</strong> for ${e.name}`,id:e.id});
+    if(days!==null&&days<=1&&days>=0&&e.stage!=='lead'&&e.stamp_status!=='Received'){
+      todos.push({urgency:'urgent',tag:'stamp',text:`<strong>${days===0?'TODAY':'TOMORROW'}: Stamp not ready</strong> for ${e.name}`,id:e.id});
     }
   });
 
