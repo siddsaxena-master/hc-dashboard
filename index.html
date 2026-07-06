@@ -540,6 +540,8 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
 .ops-who span{font-size:11.5px;color:var(--text-muted);display:block;margin-top:1px}
 .ops-when{text-align:right;font-size:13px;font-weight:700;color:var(--text)}
 .ops-when span{display:block;font-size:10px;font-weight:700;color:var(--green-mid);text-transform:uppercase;letter-spacing:.4px}
+.ops-row.ops-lead{border-left:3px dashed #a78bfa;opacity:.85}
+.ops-row .badge{margin-left:6px;vertical-align:1px}
 .ops-missing{color:var(--red-dark);font-weight:600}
 .team-view-only #vt-ops{display:none}
 @media (max-width:768px){
@@ -831,12 +833,13 @@ function renderOps(){
   const mf=e=>!currentMarket||!e.market||e.market===currentMarket;
   const dOf=e=>e.delivery_date||e.event_date||'';
   const rows=events.filter(e=>mf(e)&&e.stage!=='passed'&&e.stage!=='dnb'&&dayKeys.includes(dOf(e)));
+  const isLead=e=>e.stage==='lead';
   const fmt=ds=>new Date(ds+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'short',day:'numeric'});
 
   // Buy plan: order coconuts at least 2 days before each delivery day.
   let buy='';
   dayKeys.forEach((ds,i)=>{
-    const evs=rows.filter(e=>dOf(e)===ds);
+    const evs=rows.filter(e=>dOf(e)===ds&&!isLead(e));
     const coco=evs.reduce((s,e)=>s+(parseFloat(e.coconuts)||0),0);
     if(!coco)return;
     const boxes=Math.ceil(coco/9);
@@ -857,18 +860,20 @@ function renderOps(){
       .sort((a,b)=>_opsTimeSort(a.delivery_time)-_opsTimeSort(b.delivery_time));
     if(!evs.length)return;
     any=true;
-    const coco=evs.reduce((s,e)=>s+(parseFloat(e.coconuts)||0),0);
+    const conf=evs.filter(e=>!isLead(e));
+    const leads=evs.length-conf.length;
+    const coco=conf.reduce((s,e)=>s+(parseFloat(e.coconuts)||0),0);
     const boxes=Math.ceil(coco/9);
     html+='<div class="ops-day"><div class="ops-day-head"><span>'+fmt(ds)+'</span>'
       +'<span class="ops-day-total">'+evs.length+' stop'+(evs.length!==1?'s':'')+' · '
-      +coco+' coconuts · '+boxes+' boxes</span></div>';
+      +coco+' coconuts · '+boxes+' boxes'+(leads?' · '+leads+' lead'+(leads!==1?'s':''):'')+'</span></div>';
     evs.forEach(e=>{
       const n=parseFloat(e.coconuts)||0;
       const b=n?Math.ceil(n/9):0;
       const where=e.delivery_notes||e.venue||'<span class="ops-missing">no address — tap to add</span>';
-      html+='<div class="ops-row" onclick="openEdit(\''+e.id+'\')">'
+      html+='<div class="ops-row'+(isLead(e)?' ops-lead':'')+'" onclick="openEdit(\''+e.id+'\')">'
         +'<div class="ops-qty">'+(b?b+' boxes':'—')+'<span>'+(n?n+' coco':'')+'</span></div>'
-        +'<div class="ops-who"><strong>'+esc(e.name||'?')+'</strong><span>'+ (typeof where==='string'?where:where) +'</span></div>'
+        +'<div class="ops-who"><strong>'+esc(e.name||'?')+' '+(isLead(e)?'<span class="badge b-lead">Lead</span>':'<span class="badge b-paid">Confirmed</span>')+'</strong><span>'+ (typeof where==='string'?where:where) +'</span></div>'
         +'<div class="ops-when">'+esc(e.delivery_time||'—')+'<span>'+_opsCrack(e)+'</span></div>'
         +'</div>';
     });
