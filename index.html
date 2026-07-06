@@ -532,6 +532,7 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
       Sign in with Google
     </button>
     <div class="pin-error" id="pin-error"></div>
+    <button id="local-preview-btn" onclick="localPreviewSignIn()" style="display:none;margin-top:10px;width:100%;padding:10px;border-radius:10px;border:1.5px dashed var(--border-mid);background:var(--surface2);color:var(--text-muted);font-size:12px;font-weight:600;cursor:pointer">👀 Preview as owner (localhost only)</button>
   </div>
 </div>
 
@@ -1984,6 +1985,21 @@ let currentRole=null; // 'owner','ny','miami'
 let currentMarket=null; // null=all, 'ny', 'miami'
 let currentUserEmail=null;
 
+// Localhost-only design-review bypass: Google OAuth refuses to run on
+// localhost (origin not on the client's allowlist), so local previews
+// couldn't sign in at all. Never active on the deployed site, and the
+// session is not persisted (refresh = click again).
+if(['localhost','127.0.0.1'].includes(location.hostname)){
+  var _lpb=document.getElementById('local-preview-btn');
+  if(_lpb)_lpb.style.display='block';
+}
+function localPreviewSignIn(){
+  if(!['localhost','127.0.0.1'].includes(location.hostname))return;
+  currentUserEmail='siddsaxena@gmail.com';
+  currentRole='owner';
+  currentMarket=null;
+  activateSession();
+}
 function googleSignIn(){
   const btn=document.getElementById('google-signin-btn');
   btn.textContent='Signing in...';
