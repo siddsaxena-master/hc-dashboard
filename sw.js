@@ -5,7 +5,7 @@
 //  - Cross-origin calls (Supabase, Google sign-in, fonts) always go to the network.
 //  - Writes (POST/PATCH) are never touched, so signing/saving works normally.
 
-const CACHE = 'hc-deliveries-v3';  // v3: 2026-07-05 UI redesign — bump forces clients to fetch the new shell
+const CACHE = 'hc-deliveries-v4';  // v4: 2026-07-07 pending-payment excludes cancelled — bump forces clients to fetch the new shell
 const SHELL = [
   './',
   './index.html',

@@ -1032,7 +1032,7 @@ function renderStats(){renderStageStrip();
   const oneTime=filteredEvents.filter(e=>e.type!=='recurring'&&e.stage!=='passed');
   const nuts=filteredEvents.reduce((s,e)=>s+(parseInt(e.coconuts)||0),0);
   const coll=filteredEvents.reduce((s,e)=>s+(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0),0);
-  const pend=filteredEvents.filter(e=>e.stage!=='completed').reduce((s,e)=>s+Math.max(0,(parseFloat(e.total_amount)||0)-(parseFloat(e.deposit_amount)||0)-(parseFloat(e.balance_amount)||0)),0);
+  const pend=filteredEvents.filter(e=>e.stage!=='completed'&&e.stage!=='passed').reduce((s,e)=>s+Math.max(0,(parseFloat(e.total_amount)||0)-(parseFloat(e.deposit_amount)||0)-(parseFloat(e.balance_amount)||0)),0);
   const costedEvents=filteredEvents.filter(hasProfit);
   const totalProfit=costedEvents.reduce((s,e)=>{const p=calcProfit(e);return s+p.profit;},0);
   const ownerUnlocked=document.body.classList.contains('owner-unlocked');
