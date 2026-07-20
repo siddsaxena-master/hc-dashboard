@@ -392,6 +392,21 @@ async function sendTelegram(token, chatId, text) {
   }
 }
 
+// Same as sendTelegram but with NO parse mode. Use for anything that
+// includes customer-controlled text (like intake from-addresses), where
+// a stray _ or * would make Telegram reject the message as bad Markdown.
+async function sendTelegramPlain(token, chatId, text) {
+  try {
+    await fetch(`${TG_API}${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: text }),
+    });
+  } catch (e) {
+    console.error('Telegram send error:', e);
+  }
+}
+
 async function callClaude(apiKey, userMessage, eventsContext, today) {
   try {
     const resp = await fetch(CLAUDE_API, {
@@ -481,7 +496,7 @@ async function handleParseBatch(request, env) {
 
 // Cron schedule (in wrangler.toml [triggers]):
 //   "0 12 * * *"  — daily 8am ET (12 UTC) — Weee box math digest
-//   "0 * * * *"   — hourly — reconfirmation scan + post-event debrief scan
+//   "0 * * * *"   — hourly — reconfirmation scan + post-event debrief scan + intake nags
 async function runScheduled(event, env, alsoNotify = true) {
   const cron = event.cron;
   try {
@@ -563,6 +578,14 @@ async function runDailyDigest(env) {
     lines.push('Weee caps per account — split across accounts and confirm fresh stock before ordering.');
   }
 
+  // Order-intake backstop: pending intake cards + email dead-man warning.
+  // Quietly adds nothing if the intake_messages table does not exist yet.
+  const intakeLines = await buildIntakeDigestLines(env);
+  if (intakeLines.length) {
+    lines.push('');
+    intakeLines.forEach(l => lines.push(l));
+  }
+
   const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
   for (const cid of chatIds) {
     await sendTelegram(env.TG_BOT_TOKEN, cid, lines.join('\n'));
@@ -571,6 +594,10 @@ async function runDailyDigest(env) {
 
 // Hourly — find events ~1 week out and draft a reconfirmation
 async function runReconfirmationScan(env) {
+  // Intake nags ride the same hourly cron; run them first so the early
+  // returns below (no reconfirmations due) cannot skip them.
+  await runIntakeNagScan(env);
+
   const target = new Date(Date.now() + 7 * 86400000);
   const dayStr = target.toISOString().slice(0, 10);
 
@@ -648,6 +675,95 @@ async function runDebriefScan(env) {
     ].filter(Boolean);
     for (const cid of chatIds) {
       await sendTelegram(env.TG_BOT_TOKEN, cid, lines.join('\n'));
+    }
+  }
+}
+
+// ── ORDER INTAKE BACKSTOPS ──
+// The order-intake pipeline (n8n wf_16 -> intake_messages table -> Jarvis)
+// lives outside this worker. These jobs are the safety net in a separate
+// failure domain: if n8n or Jarvis goes quiet, the crons here still tell
+// Sidd what is waiting. Table added by migrations/004_intake_messages.sql.
+
+// Whole hours between a timestamp and now, for "oldest Xh" style messages.
+function hoursSince(iso) {
+  return Math.floor((Date.now() - new Date(iso).getTime()) / 3600000);
+}
+
+// Read from intake_messages. Returns null (and logs) on any failure so
+// callers can no-op gracefully, e.g. if the worker deploys before
+// migration 004 has run and the table does not exist yet.
+async function fetchIntake(env, query) {
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/intake_messages?' + query, {
+      headers: sbHeaders(env),
+    });
+    if (!resp.ok) {
+      console.error('intake_messages read error:', resp.status, await resp.text());
+      return null;
+    }
+    const rows = await resp.json();
+    return Array.isArray(rows) ? rows : null;
+  } catch (e) {
+    console.error('intake_messages read exception:', e);
+    return null;
+  }
+}
+
+// Lines appended to the 8am digest: how many intake messages are waiting,
+// plus a dead-man warning if the email channel itself looks dead.
+async function buildIntakeDigestLines(env) {
+  const lines = [];
+
+  // Pending cards, oldest first.
+  const pending = await fetchIntake(env,
+    'select=id,created_at&status=eq.pending_review&order=created_at.asc');
+  if (pending === null) return lines;  // table missing or query failed; skip quietly
+  if (pending.length > 0) {
+    lines.push('Intake: ' + pending.length + ' awaiting review (oldest ' +
+      hoursSince(pending[0].created_at) + 'h) - reply in the Jarvis chat: invoice ' + pending[0].id);
+  }
+
+  // Channel dead-man: if the pipeline has EVER stored a message but no
+  // email has arrived in 24h, the Gmail trigger (wf_16) is probably down.
+  const anyRow = await fetchIntake(env, 'select=id&limit=1');
+  if (anyRow && anyRow.length > 0) {
+    const newestEmail = await fetchIntake(env,
+      'select=created_at&channel=eq.email&order=created_at.desc&limit=1');
+    if (newestEmail && (newestEmail.length === 0 || hoursSince(newestEmail[0].created_at) >= 24)) {
+      lines.push('no email intake seen in 24h - check wf_16 / Gmail trigger in n8n');
+    }
+  }
+
+  return lines;
+}
+
+// Hourly one-shot nags for intake messages still awaiting review.
+// Stateless on purpose: each hourly run only alerts for rows whose age
+// crossed a threshold within the LAST hour (4h <= age < 5h, and again
+// 24h <= age < 25h), so every row nags exactly once per threshold with
+// nothing to store.
+async function runIntakeNagScan(env) {
+  for (const hours of [4, 24]) {
+    // age >= hours   ->  created_at at or before (now - hours)
+    // age < hours+1  ->  created_at after (now - hours - 1h)
+    const newestCutoff = new Date(Date.now() - hours * 3600000).toISOString();
+    const oldestCutoff = new Date(Date.now() - (hours + 1) * 3600000).toISOString();
+    const rows = await fetchIntake(env,
+      'select=id,from_addr&status=eq.pending_review' +
+      '&created_at=lte.' + newestCutoff +
+      '&created_at=gt.' + oldestCutoff +
+      '&order=created_at.asc');
+    if (!rows || !rows.length) continue;
+
+    const lines = ['[intake] ' + rows.length + ' message(s) waiting ' + hours + 'h+ for review:'];
+    rows.forEach(r => lines.push('#' + r.id + ' from ' + (r.from_addr || 'unknown sender')));
+    lines.push('Reply in the Jarvis chat: invoice <id> / show <id> / skip <id>');
+
+    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+    for (const cid of chatIds) {
+      // Plain text on purpose: from_addr is customer-controlled text.
+      await sendTelegramPlain(env.TG_BOT_TOKEN, cid, lines.join('\n'));
     }
   }
 }
