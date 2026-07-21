@@ -724,14 +724,29 @@ async function buildIntakeDigestLines(env) {
       hoursSince(pending[0].created_at) + 'h) - reply in the Jarvis chat: invoice ' + pending[0].id);
   }
 
+  // Classifier visibility: emails set aside as not-orders in the last
+  // 24h. A wrong not_order verdict must never be invisible to Sidd
+  // (2026-07-20 review note) - one digest line makes it auditable
+  // without SQL.
+  const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const ignored = await fetchIntake(env,
+    'select=id&status=eq.ignored&created_at=gte.' + cutoff +
+    '&order=created_at.desc');
+  if (ignored && ignored.length > 0) {
+    lines.push('Intake: ' + ignored.length + ' email' +
+      (ignored.length === 1 ? '' : 's') +
+      ' set aside as not-orders in the last 24h (double check with: show ' +
+      ignored[0].id + ')');
+  }
+
   // Channel dead-man: if the pipeline has EVER stored a message but no
-  // email has arrived in 24h, the Gmail trigger (wf_16) is probably down.
+  // email has arrived in 24h, the outlook-poller is probably down.
   const anyRow = await fetchIntake(env, 'select=id&limit=1');
   if (anyRow && anyRow.length > 0) {
     const newestEmail = await fetchIntake(env,
       'select=created_at&channel=eq.email&order=created_at.desc&limit=1');
     if (newestEmail && (newestEmail.length === 0 || hoursSince(newestEmail[0].created_at) >= 24)) {
-      lines.push('no email intake seen in 24h - check wf_16 / Gmail trigger in n8n');
+      lines.push('no email intake seen in 24h - check the outlook-poller service on the droplet');
     }
   }
 

@@ -54,13 +54,15 @@
 - The anon Supabase key in this file is public by design (row-level
   security limits what it can do).
 
-## Order intake backstops (added 2026-07-19)
+## Order intake backstops (added 2026-07-19; ingestion corrected 2026-07-20)
 
 - `intake_messages` (migration 004) is a QUARANTINE table: every inbound
-  order email (via n8n workflow wf_16 in the cold-email repo) and
-  forwarded text lands there first, then Jarvis (hc-invoice-bot) turns
-  it into an invoice when Sidd replies `invoice <id>` in the Jarvis
-  Telegram chat.
+  order email lands there first via Jarvis's outlook_poller (Microsoft
+  365 mailbox — the wf_16/Gmail plan is DEAD, see hc-invoice-bot
+  CLAUDE.md). Jarvis classifies each row every 2 minutes: clear orders
+  are AUTO-DRAFTED into Sidd's chat behind JARVIS_INTAKE_AUTODRAFT,
+  maybes get a numbered card he answers with `invoice <id>`, not-orders
+  are set aside (and surfaced as a count in the 8am digest).
 - RLS is ON with ZERO policies ON PURPOSE. Raw customer messages are
   sensitive; the public anon key in index.html must get nothing. The
   dashboard page and the HC Field app never read this table. Do not
