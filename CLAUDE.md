@@ -73,8 +73,13 @@
 - Thread matching lives HERE (not in Jarvis) and it NEVER suppresses a
   card. A row whose normalized subject (Re:/Fw: stacks stripped, 14-day
   window) matches an invoiced/approved/drafting/final sibling still
-  gets its card, with one extra line naming the sibling ("I did not
-  start a draft for it"), and the row stays pending_review. A sibling
+  gets its card, with one extra line naming that sibling's id, SENDER
+  and status ("check this is not a duplicate"), and the row stays
+  pending_review. Sender is deliberately NOT part of the match: the
+  2026-07-23 incident thread was answered by four people at three
+  different companies. Naming the sender in the note is what lets Sidd
+  tell a real thread reply from two unrelated leads that happen to
+  share a subject line. A sibling
   that was merely carded and is still undecided does NOT count as
   handled — the follow-up email is usually the one carrying the real
   order details. Rows from @hamptonscoconuts.com skip thread matching
