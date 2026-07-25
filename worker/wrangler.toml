@@ -6,6 +6,7 @@ compatibility_date = "2024-01-01"
 crons = [
   "0 12 * * *",     # 8am ET (12 UTC) — daily Weee box math digest
   "0 * * * *",      # every hour — reconfirmation scan + post-event debrief scan
+  "*/5 * * * *",    # every 5 minutes — intake approval cards (summary + buttons)
 ]
 
 # Secrets (set via `wrangler secret put <NAME>`):
@@ -14,3 +15,7 @@ crons = [
 # SUPABASE_SERVICE_KEY - service_role key (bypasses RLS, set via wrangler secret put)
 # TG_BOT_TOKEN - Telegram bot token from @BotFather
 # ALLOWED_CHAT_IDS - Comma-separated Telegram chat IDs allowed to use the bot
+# TG_WEBHOOK_SECRET - shared secret that verifies Telegram callback webhooks.
+#   Telegram echoes it back in the X-Telegram-Bot-Api-Secret-Token header on
+#   every button-tap delivery; it is also required as ?secret= on the one-time
+#   /setup-telegram-webhook route. Any random long string works.
