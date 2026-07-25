@@ -798,7 +798,8 @@ async function buildIntakeDigestLines(env) {
   return lines;
 }
 
-// Hourly one-shot nags for intake messages still awaiting review.
+// Hourly one-shot nags for intake messages still in flight: waiting on
+// Sidd (pending_review) or waiting on Jarvis (approved).
 // Stateless on purpose: each hourly run only alerts for rows whose age
 // crossed a threshold within the LAST hour (4h <= age < 5h, and again
 // 24h <= age < 25h), so every row nags exactly once per threshold with
@@ -1058,9 +1059,12 @@ async function runIntakeCardScan(env) {
       }
 
       // 4) Stamp the row with the sent message id so it is never
-      //    carded twice. Guarded the same way as above, plus
-      //    telegram_message_id=is.null so a concurrent stamp loses
-      //    cleanly. If the SEND failed we leave the row unstamped and
+      //    carded twice. This is the ONLY write in the scan, and it is
+      //    guarded: &status=in.(pending_review) so a tap that landed in
+      //    the meantime is not stomped, plus telegram_message_id=is.null
+      //    so a concurrent stamp loses cleanly. A row that lost the
+      //    guard race is already decided, so it is not re-carded either.
+      //    If the SEND failed we leave the row unstamped and
       //    the next tick retries. If the send worked but this stamp
       //    fails, the card may repeat once - accepted on purpose: a
       //    duplicate card beats a lost order.
