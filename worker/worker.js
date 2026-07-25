@@ -1103,11 +1103,22 @@ async function appendToCard(env, cb, suffix) {
 // list tells us "someone else got here first".
 async function approveOrSkipIntake(env, intakeId, newStatus) {
   try {
+    const body = { status: newStatus, reviewed_at: new Date().toISOString() };
+    if (newStatus === 'approved') {
+      // Clear Jarvis's auto-draft bookkeeping (attempts + the "final"
+      // parked flag it keeps in error_detail). Sidd tapping "Invoice it"
+      // is a FRESH human authorization, so a row Jarvis had given up on
+      // (2 attempts) or parked as a thread sibling must still draft.
+      // Without this, Jarvis skips every parked row and the card's
+      // "Jarvis is drafting it now" would be a lie - the lead would sit
+      // in 'approved', which no digest or nag looks at.
+      body.error_detail = null;
+    }
     const resp = await fetch(env.SUPABASE_URL + '/rest/v1/intake_messages' +
       '?id=eq.' + intakeId + '&status=eq.pending_review', {
       method: 'PATCH',
       headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
-      body: JSON.stringify({ status: newStatus, reviewed_at: new Date().toISOString() }),
+      body: JSON.stringify(body),
     });
     if (!resp.ok) {
       console.error('intake approve/skip error:', resp.status, await resp.text());
