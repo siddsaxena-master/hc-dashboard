@@ -54,30 +54,107 @@
 - The anon Supabase key in this file is public by design (row-level
   security limits what it can do).
 
-## Order intake backstops (added 2026-07-19; ingestion corrected 2026-07-20)
+## Order intake: Claudia's half (approval-first redesign, 2026-07-24)
 
-- `intake_messages` (migration 004) is a QUARANTINE table: every inbound
-  order email lands there first via Jarvis's outlook_poller (Microsoft
-  365 mailbox — the wf_16/Gmail plan is DEAD, see hc-invoice-bot
-  CLAUDE.md). Jarvis classifies each row every 2 minutes: clear orders
-  are AUTO-DRAFTED into Sidd's chat behind JARVIS_INTAKE_AUTODRAFT,
-  maybes get a numbered card he answers with `invoice <id>`, not-orders
-  are set aside (and surfaced as a count in the 8am digest).
+- `intake_messages` (migrations 004 + 005) is a QUARANTINE table: every
+  inbound order email lands there first via Jarvis's outlook_poller
+  (Microsoft 365 mailbox — the wf_16/Gmail plan is DEAD, see
+  hc-invoice-bot CLAUDE.md). Jarvis classifies each row every 2 minutes
+  and stamps `classified_at`; THIS worker is now the card sender:
+  every 5 minutes (`runIntakeCardScan`, cron `*/5 * * * *`) it sends
+  Sidd a one-sentence natural-language card (Haiku summary,
+  injection-fenced, plain text, fail-open to the subject line) with
+  inline buttons: Invoice it / Skip / Full email. Button taps arrive
+  as callback_query updates on the bot's EXISTING root webhook
+  (`handleIntakeCallback`): Invoice it -> status 'approved' (Jarvis
+  drafts ONLY approved rows, through its normal confirm gates), Skip
+  -> 'dismissed', Full email -> chunked raw text. Guarded PATCHes
+  everywhere; a decided card loses its buttons.
+- Thread matching lives HERE (not in Jarvis) and it NEVER suppresses a
+  card. A row whose normalized subject (Re:/Fw: stacks stripped, 14-day
+  window) matches an invoiced/approved/drafting/final sibling still
+  gets its card, with one extra line naming that sibling's id, SENDER
+  and status ("check this is not a duplicate"), and the row stays
+  pending_review. Sender is deliberately NOT part of the match: the
+  2026-07-23 incident thread was answered by four people at three
+  different companies. Naming the sender in the note is what lets Sidd
+  tell a real thread reply from two unrelated leads that happen to
+  share a subject line. A sibling
+  that was merely carded and is still undecided does NOT count as
+  handled — the follow-up email is usually the one carrying the real
+  order details. Rows from @hamptonscoconuts.com skip thread matching
+  entirely: those are the website's GoDaddy form notifications (same
+  subject, each a DIFFERENT lead; never suppress them).
+- A card also warns when the row carries an `external_invoice_id` while
+  back in pending_review: that means Jarvis created an invoice from this
+  email and then voided it at the PDF gate ("Heads up: invoice #N was
+  created from this email earlier and then voided"). Approving again is
+  allowed on purpose — under approval-first, Sidd's tap IS the
+  authorization.
+- Run the suppression tests before touching that logic:
+  `node worker/test-intake-suppression.mjs` (no framework, no network,
+  exits non-zero on failure). `normalizeSubject` and
+  `findHandledThreadSibling` are named exports for exactly this.
+- Telegram allows ONE webhook per bot. Buttons and chat messages share
+  the root entry point ON PURPOSE; never re-point the webhook to a new
+  path or pass `allowed_updates` to setWebhook (omitting it preserves
+  the previous setting; filtering would silently kill Claudia's chat).
+- **TG_WEBHOOK_SECRET is REQUIRED, not optional** (2026-07-25 security
+  review). Without it the worker verifies nothing, and the only thing
+  standing between the internet and a forged button tap is the chat id
+  in the attacker's own JSON (`cb.message.chat.id`; `cb.from` is never
+  consulted). A forged Skip would bury a real lead. It cannot cause a
+  QuickBooks write (a draft still stops at Jarvis's CONFIRM, and the
+  send at PDF_APPROVE, both needing Sidd's typed yes in his own chat),
+  and this exposure predates the buttons for Claudia's chat commands,
+  but close it: `wrangler secret put TG_WEBHOOK_SECRET` (long random
+  value), `wrangler deploy`, then IMMEDIATELY register it:
+  `curl -H "X-Setup-Secret: <value>" https://<worker-url>/setup-telegram-webhook`
+  Use the header, not `?secret=` — a query string lands in Chrome
+  history and Cloudflare logs. TIMING TRAP: between the deploy and that
+  curl the worker 401s every real Telegram delivery, so Claudia is deaf
+  to chat AND buttons until it lands. Telegram retries with backoff, so
+  nothing is lost, but do not stop halfway.
 - RLS is ON with ZERO policies ON PURPOSE. Raw customer messages are
   sensitive; the public anon key in index.html must get nothing. The
   dashboard page and the HC Field app never read this table. Do not
   add anon policies to it. Only service-role keys (this worker, Jarvis)
   and the n8n postgres role can reach it.
-- The worker is the backstop, in a separate failure domain from n8n:
+- The worker is the backstop, in a separate failure domain from n8n.
+  Both in-flight statuses are watched — pending_review is waiting on
+  Sidd, `approved` is waiting on Jarvis — because a tapped row that
+  Jarvis never picks up would otherwise be invisible forever:
   - The 8am digest appends "Intake: N awaiting review (oldest Xh)" when
-    anything is pending, plus a dead-man warning when no email intake
-    has been seen in 24h (means wf_16 / the Gmail trigger is down).
-  - The hourly cron sends one-shot plain-text nags when a pending row
-    crosses 4h of age, and again at 24h (stateless: each run only
-    alerts rows that crossed the threshold within the last hour).
-- Deploying this change = worker only (`cd worker; npx wrangler deploy`
-  with Sidd's "yes do it"). index.html is untouched, so NO sw.js cache
-  bump is needed.
+    anything is pending, a SEPARATE "Intake: N approved and still
+    waiting on Jarvis" line when any approved row exists, plus a
+    dead-man warning when no email intake has been seen in 24h (means
+    the outlook-poller is down).
+  - The hourly cron sends one-shot plain-text nags when a pending OR
+    approved row crosses 4h of age, and again at 24h (stateless: each
+    run only alerts rows that crossed the threshold within the last
+    hour). Approved rows are worded differently ("approved but Jarvis
+    has not drafted it yet") and add a line pointing at the jarvis-bot
+    service.
+- Deploying this change is CROSS-REPO and ORDER MATTERS (each step needs
+  Sidd's "yes do it"):
+  0. `cd worker && npx wrangler secret put TG_WEBHOOK_SECRET` (long
+     random value; required, see the security bullet above).
+  1. Run `migrations/005_intake_approvals.sql` in the Supabase SQL
+     editor.
+  2. Merge/deploy the Jarvis branch in hc-invoice-bot (autodeploy;
+     verify the DEPLOYED line lands) so Jarvis understands `approved`.
+  3. `cd worker && npx wrangler deploy`, then IMMEDIATELY
+     `curl -H "X-Setup-Secret: <value>" https://<worker-url>/setup-telegram-webhook`
+     (the worker 401s real Telegram traffic in between; do not stop
+     between these two).
+  `JARVIS_INTAKE_AUTODRAFT` must be ON in the droplet's .env or a tap
+  moves the row to `approved` and nothing drafts it (the digest and nag
+  lines above are what surface that).
+  Rollback runs the other way: once THIS worker is live, reverting
+  Jarvis to a version that does not understand `approved` strands every
+  tapped row (old Jarvis's manual `invoice N` refuses them). So roll the
+  worker back too, or re-run Jarvis's deploy. index.html is untouched
+  either way, so NO sw.js cache bump is needed.
 - Other halves of the feature: wf_16 + runbook docs/13_order_intake.md
   in the cold-email repo; the `invoice / show / skip` commands in
   hc-invoice-bot.

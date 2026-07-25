@@ -6,6 +6,7 @@ compatibility_date = "2024-01-01"
 crons = [
   "0 12 * * *",     # 8am ET (12 UTC) — daily Weee box math digest
   "0 * * * *",      # every hour — reconfirmation scan + post-event debrief scan
+  "*/5 * * * *",    # every 5 minutes — intake approval cards (summary + buttons)
 ]
 
 # Secrets (set via `wrangler secret put <NAME>`):
@@ -14,3 +15,14 @@ crons = [
 # SUPABASE_SERVICE_KEY - service_role key (bypasses RLS, set via wrangler secret put)
 # TG_BOT_TOKEN - Telegram bot token from @BotFather
 # ALLOWED_CHAT_IDS - Comma-separated Telegram chat IDs allowed to use the bot
+# TG_WEBHOOK_SECRET - REQUIRED (2026-07-25 security review). Any long
+#   random string. Without it the worker verifies nothing, so a stranger
+#   who knows this worker's URL and the allowed chat id could forge a
+#   button tap and bury a real lead (it cannot reach QuickBooks - Jarvis
+#   still needs Sidd's typed yes twice). Once set, the worker requires
+#   Telegram's X-Telegram-Bot-Api-Secret-Token header on every delivery
+#   (chat messages AND button taps), so IMMEDIATELY after the deploy
+#   register it with Telegram, header not query string:
+#     curl -H "X-Setup-Secret: <value>" https://<worker-url>/setup-telegram-webhook
+#   Between the deploy and that call, Telegram deliveries get 401 and are
+#   retried, so do not stop halfway.
