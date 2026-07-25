@@ -1107,7 +1107,7 @@ async function appendToCard(env, cb, suffix) {
   try {
     const msg = cb.message;
     if (!msg || !msg.chat) return;
-    await fetch(`${TG_API}${env.TG_BOT_TOKEN}/editMessageText`, {
+    const resp = await fetch(`${TG_API}${env.TG_BOT_TOKEN}/editMessageText`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1117,6 +1117,24 @@ async function appendToCard(env, cb, suffix) {
         text: (msg.text || '') + suffix,
       }),
     });
+    if (resp.ok) return;
+    // The rewrite failed (message too old, text too long, Telegram
+    // hiccup). Fall back to yanking the buttons on their own, so a card
+    // that has already been decided cannot be tapped a second time.
+    console.error('editMessageText error:', resp.status, await resp.text());
+    try {
+      await fetch(`${TG_API}${env.TG_BOT_TOKEN}/editMessageReplyMarkup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: msg.chat.id,
+          message_id: msg.message_id,
+          reply_markup: { inline_keyboard: [] },
+        }),
+      });
+    } catch (inner) {
+      console.error('editMessageReplyMarkup error:', inner);
+    }
   } catch (e) {
     console.error('editMessageText error:', e);
   }
@@ -1127,6 +1145,13 @@ async function appendToCard(env, cb, suffix) {
 // zero rows instead of overwriting a later status. return=representation
 // asks Supabase to send back the rows it actually changed, so an empty
 // list tells us "someone else got here first".
+//
+// Returns one of three words, never a bare true/false, because "someone
+// beat me to it" and "the database call broke" need different answers
+// on the phone:
+//   'changed' - this tap did the move
+//   'nomatch' - the row was no longer pending_review (already decided)
+//   'error'   - the call itself failed; nothing is known to have changed
 async function approveOrSkipIntake(env, intakeId, newStatus) {
   try {
     const body = { status: newStatus, reviewed_at: new Date().toISOString() };
@@ -1148,14 +1173,36 @@ async function approveOrSkipIntake(env, intakeId, newStatus) {
     });
     if (!resp.ok) {
       console.error('intake approve/skip error:', resp.status, await resp.text());
-      return false;
+      return 'error';
     }
     const changed = await resp.json();
-    return Array.isArray(changed) && changed.length > 0;
+    return (Array.isArray(changed) && changed.length > 0) ? 'changed' : 'nomatch';
   } catch (e) {
     console.error('intake approve/skip exception:', e);
-    return false;
+    return 'error';
   }
+}
+
+// The guarded PATCH matched nothing, so the row had already moved on.
+// Read it back and say what actually happened, instead of a vague
+// "Already handled." that could be hiding anything. Read-only, and it
+// never throws - the worst case is a generic sentence.
+async function describeIntakeStatus(env, intakeId) {
+  const rows = await fetchIntake(env,
+    'select=id,status,external_invoice_id&id=eq.' + intakeId + '&limit=1');
+  if (!rows || !rows.length) {
+    return 'Could not read intake #' + intakeId + ' back. Check the Jarvis chat: show ' + intakeId;
+  }
+  const status = String(rows[0].status || 'unknown');
+  const doc = rows[0].external_invoice_id;
+  if (status === 'approved') return 'Already approved - Jarvis has it.';
+  if (status === 'drafting') return 'Jarvis is already drafting this one.';
+  if (status === 'dismissed') return 'Already skipped.';
+  if (status === 'ignored') return 'Already set aside.';
+  if (status === 'invoiced') {
+    return doc ? ('Already invoiced as document #' + doc + '.') : 'Already invoiced.';
+  }
+  return 'Nothing changed - this one is now "' + status + '".';
 }
 
 // "Full email" button: send the raw stored email as plain-text chunks.
@@ -1211,20 +1258,26 @@ async function handleIntakeCallback(cb, env) {
       // Guarded pending_review -> approved. Jarvis drafts ONLY approved
       // rows, so this tap is what hands the email over to Jarvis.
       const moved = await approveOrSkipIntake(env, intakeId, 'approved');
-      if (moved) {
+      if (moved === 'changed') {
         await answerCallback(env, cb.id, 'Sent to Jarvis');
         await appendToCard(env, cb, '\n\n✅ Approved. Jarvis is drafting it now, check the Jarvis chat.');
-      } else {
+      } else if (moved === 'nomatch') {
         // The row already moved on (double-tap, or Jarvis got there).
-        await answerCallback(env, cb.id, 'Already handled.');
+        // Say WHICH way it went, read straight from the database.
+        await answerCallback(env, cb.id, await describeIntakeStatus(env, intakeId));
+      } else {
+        // Never claim it was handled: as far as we know, nothing moved.
+        await answerCallback(env, cb.id, 'Could not save that (database error). Tap it again.');
       }
     } else if (action === 'skip') {
       const moved = await approveOrSkipIntake(env, intakeId, 'dismissed');
-      if (moved) {
+      if (moved === 'changed') {
         await answerCallback(env, cb.id, 'Skipped');
         await appendToCard(env, cb, '\n\n❌ Skipped.');
+      } else if (moved === 'nomatch') {
+        await answerCallback(env, cb.id, await describeIntakeStatus(env, intakeId));
       } else {
-        await answerCallback(env, cb.id, 'Already handled.');
+        await answerCallback(env, cb.id, 'Could not save that (database error). Tap it again.');
       }
     } else if (action === 'full') {
       await sendFullIntakeEmail(env, chatId, intakeId);
