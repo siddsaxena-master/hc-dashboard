@@ -861,8 +861,9 @@ export function normalizeSubject(subject) {
   return s.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-// THREAD SUPPRESSION: a reply on an email thread the owner already
-// handled is probably not a brand-new order. Returns the handled
+// THREAD MATCHING (it does NOT suppress anything): a reply on an email
+// thread the owner already decided is probably not a brand-new order,
+// but "probably" is not good enough to hide it. Returns the handled
 // sibling row if this row looks like such a reply, or null if it looks
 // standalone. A match only adds a NOTE to the card (see
 // runIntakeCardScan) - the card still goes out either way, because a
