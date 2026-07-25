@@ -784,6 +784,20 @@ async function buildIntakeDigestLines(env) {
       ignored[0].id + ')');
   }
 
+  // Skips are reported the same way, so NO exit from the pipeline is
+  // silent (2026-07-25 security review): a mis-tap, or a forged tap if
+  // the webhook secret is ever missing, would otherwise bury a real
+  // lead with nobody told.
+  const dismissed = await fetchIntake(env,
+    'select=id&status=eq.dismissed&reviewed_at=gte.' + cutoff +
+    '&order=reviewed_at.desc');
+  if (dismissed && dismissed.length > 0) {
+    lines.push('Intake: ' + dismissed.length + ' email' +
+      (dismissed.length === 1 ? '' : 's') +
+      ' skipped in the last 24h (double check with: show ' +
+      dismissed[0].id + ')');
+  }
+
   // Channel dead-man: if the pipeline has EVER stored a message but no
   // email has arrived in 24h, the outlook-poller is probably down.
   const anyRow = await fetchIntake(env, 'select=id&limit=1');
@@ -1050,7 +1064,15 @@ async function runIntakeCardScan(env) {
         notes.push('Heads up: invoice #' + row.external_invoice_id +
           ' was created from this email earlier and then voided.');
       }
-      const cardText = summary + '\nintake #' + row.id + ' · ' +
+      // The summary is written BY A MODEL FROM the sender's own email, so
+      // a determined sender can influence its wording. Label it, and put
+      // the email's real subject line next to it verbatim, so Sidd always
+      // has one piece of unfiltered evidence on the card before he
+      // authorizes a draft (2026-07-25 security review). Both fields are
+      // length-capped in the database, and the card carries no parse_mode.
+      const cardText = 'AI summary: ' + summary +
+        '\nSubject: ' + String(row.subject || '(no subject)').slice(0, 140) +
+        '\nintake #' + row.id + ' · ' +
         (row.from_addr || 'unknown sender') +
         (notes.length ? '\n' + notes.join('\n') : '');
       let sentMessageId = null;
@@ -1306,9 +1328,19 @@ async function handleIntakeCallback(cb, env) {
 // secret. The ?secret= check means a stranger cannot re-point the
 // bot's webhook.
 async function handleSetupTelegramWebhook(request, env, url) {
-  const given = url.searchParams.get('secret');
+  // Prefer the secret in a HEADER, not the query string: a URL with
+  // ?secret=... lands in Chrome history, in profile sync, and in
+  // Cloudflare's request logs (2026-07-25 security review). The query
+  // form still works so the route stays usable from a browser in a
+  // pinch, but the documented command uses the header.
+  const given = request.headers.get('X-Setup-Secret')
+    || url.searchParams.get('secret');
   if (!env.TG_WEBHOOK_SECRET || given !== env.TG_WEBHOOK_SECRET) {
     return new Response('unauthorized', { status: 401 });
+  }
+  if (!request.headers.get('X-Setup-Secret')) {
+    console.warn('setup-telegram-webhook: secret came in the query string; '
+      + 'prefer the X-Setup-Secret header (it stays out of logs and history)');
   }
   try {
     const resp = await fetch(`${TG_API}${env.TG_BOT_TOKEN}/setWebhook`, {

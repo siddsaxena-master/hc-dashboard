@@ -94,9 +94,22 @@
   the root entry point ON PURPOSE; never re-point the webhook to a new
   path or pass `allowed_updates` to setWebhook (omitting it preserves
   the previous setting; filtering would silently kill Claudia's chat).
-  Optional hardening: `wrangler secret put TG_WEBHOOK_SECRET` then curl
-  `/setup-telegram-webhook?secret=...` — the root handler requires
-  Telegram's secret header only when the secret is configured.
+- **TG_WEBHOOK_SECRET is REQUIRED, not optional** (2026-07-25 security
+  review). Without it the worker verifies nothing, and the only thing
+  standing between the internet and a forged button tap is the chat id
+  in the attacker's own JSON (`cb.message.chat.id`; `cb.from` is never
+  consulted). A forged Skip would bury a real lead. It cannot cause a
+  QuickBooks write (a draft still stops at Jarvis's CONFIRM, and the
+  send at PDF_APPROVE, both needing Sidd's typed yes in his own chat),
+  and this exposure predates the buttons for Claudia's chat commands,
+  but close it: `wrangler secret put TG_WEBHOOK_SECRET` (long random
+  value), `wrangler deploy`, then IMMEDIATELY register it:
+  `curl -H "X-Setup-Secret: <value>" https://<worker-url>/setup-telegram-webhook`
+  Use the header, not `?secret=` — a query string lands in Chrome
+  history and Cloudflare logs. TIMING TRAP: between the deploy and that
+  curl the worker 401s every real Telegram delivery, so Claudia is deaf
+  to chat AND buttons until it lands. Telegram retries with backoff, so
+  nothing is lost, but do not stop halfway.
 - RLS is ON with ZERO policies ON PURPOSE. Raw customer messages are
   sensitive; the public anon key in index.html must get nothing. The
   dashboard page and the HC Field app never read this table. Do not
@@ -119,11 +132,16 @@
     service.
 - Deploying this change is CROSS-REPO and ORDER MATTERS (each step needs
   Sidd's "yes do it"):
+  0. `cd worker && npx wrangler secret put TG_WEBHOOK_SECRET` (long
+     random value; required, see the security bullet above).
   1. Run `migrations/005_intake_approvals.sql` in the Supabase SQL
      editor.
   2. Merge/deploy the Jarvis branch in hc-invoice-bot (autodeploy;
      verify the DEPLOYED line lands) so Jarvis understands `approved`.
-  3. `cd worker && npx wrangler deploy`.
+  3. `cd worker && npx wrangler deploy`, then IMMEDIATELY
+     `curl -H "X-Setup-Secret: <value>" https://<worker-url>/setup-telegram-webhook`
+     (the worker 401s real Telegram traffic in between; do not stop
+     between these two).
   `JARVIS_INTAKE_AUTODRAFT` must be ON in the droplet's .env or a tap
   moves the row to `approved` and nothing drafts it (the digest and nag
   lines above are what surface that).
