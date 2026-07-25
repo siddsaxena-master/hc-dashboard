@@ -830,7 +830,7 @@ async function runIntakeNagScan(env) {
 // repeatedly strip leading "re:" / "fw:" / "fwd:" prefixes (any case,
 // optional spaces around the colon), squash runs of whitespace into one
 // space, and lowercase. "Re: RE: Coconut order " -> "coconut order".
-function normalizeSubject(subject) {
+export function normalizeSubject(subject) {
   let s = String(subject || '');
   let prev;
   do {
@@ -841,10 +841,12 @@ function normalizeSubject(subject) {
 }
 
 // THREAD SUPPRESSION: a reply on an email thread the owner already
-// handled is not a new order, so it should not get a fresh card.
-// Returns the already-handled sibling row if this row looks like such
-// a reply, or null if a card should go out.
-async function findHandledThreadSibling(env, row) {
+// handled is probably not a brand-new order. Returns the handled
+// sibling row if this row looks like such a reply, or null if it looks
+// standalone. A match only adds a NOTE to the card (see
+// runIntakeCardScan) - the card still goes out either way, because a
+// follow-up email often carries the real order details.
+export async function findHandledThreadSibling(env, row) {
   // OWN-DOMAIN EXEMPTION, do not remove: the website's GoDaddy contact
   // form emails us FROM our own domain, and every one of those
   // notifications shares ONE subject line even though each is a
@@ -856,11 +858,9 @@ async function findHandledThreadSibling(env, row) {
   const subj = normalizeSubject(row.subject);
   if (!subj) return null; // an empty subject can never match a thread
 
-  // Recent rows to compare against. telegram_message_id is fetched on
-  // top of the other columns because "a card already went out" counts
-  // as handled below.
+  // Recent rows to compare against.
   const recent = await fetchIntake(env,
-    'select=id,subject,status,error_detail,created_at,telegram_message_id' +
+    'select=id,subject,status,error_detail,created_at' +
     '&order=id.desc&limit=60');
   if (!recent) return null; // read failed; never suppress on a guess
 
@@ -871,12 +871,14 @@ async function findHandledThreadSibling(env, row) {
     // same subject can plausibly be brand new business again.
     const gapMs = Math.abs(new Date(row.created_at).getTime() - new Date(sib.created_at).getTime());
     if (!(gapMs <= 14 * 86400000)) continue;
-    // "Handled" = the owner or Jarvis already acted on the thread:
-    // it is being invoiced/drafted, a card was already sent, or Jarvis
-    // marked its conversation final in error_detail.
+    // "Handled" = a DECISION was already made on that thread: it is
+    // being invoiced/drafted, or Jarvis marked its conversation final
+    // in error_detail. A sibling that merely got a card and is still
+    // undecided does NOT count - a follow-up email on an undecided
+    // thread is usually the one carrying the actual order details, so
+    // treating it as handled would bury real business.
     const handled =
       ['invoiced', 'approved', 'drafting'].includes(sib.status) ||
-      !!sib.telegram_message_id ||
       String(sib.error_detail || '').includes('"final": true');
     if (handled) return sib;
   }
@@ -982,7 +984,7 @@ async function runIntakeCardScan(env) {
   // for review, no card sent yet, Jarvis has classified it, and the
   // classifier thought it is (or might be) an order.
   const rows = await fetchIntake(env,
-    'select=id,from_addr,subject,raw_text,classification,created_at' +
+    'select=id,from_addr,subject,raw_text,classification,created_at,external_invoice_id' +
     '&status=eq.pending_review' +
     '&telegram_message_id=is.null' +
     '&classified_at=not.is.null' +
@@ -997,34 +999,38 @@ async function runIntakeCardScan(env) {
     // Each row is wrapped on its own so one bad row never kills the
     // whole scan; the rest of the batch still gets processed.
     try {
-      // 1) Thread suppression: replies on handled threads get no card.
+      // 1) Thread context: does this look like a reply on a thread that
+      //    was already decided? If so we still send the card (a lead
+      //    must never be buried silently), we just say so on it. No
+      //    status change here at all - the row stays pending_review and
+      //    the message-id stamp in step 4 is what stops it being carded
+      //    again.
       const sib = await findHandledThreadSibling(env, row);
-      if (sib) {
-        // Guarded PATCH: &status=in.(pending_review) in the URL means
-        // this only lands if the row is STILL pending. If Jarvis or a
-        // button tap moved it in the meantime, we match zero rows and
-        // change nothing instead of stomping the newer status.
-        await fetch(env.SUPABASE_URL + '/rest/v1/intake_messages' +
-          '?id=eq.' + row.id + '&status=in.(pending_review)', {
-          method: 'PATCH',
-          headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-          body: JSON.stringify({
-            status: 'ignored',
-            error_detail: '[dash] reply on thread of intake #' + sib.id,
-          }),
-        });
-        continue;
-      }
 
       // 2) One-sentence natural-language summary (falls back to a
       //    plain from + subject line on any Claude failure).
       const summary = await summarizeIntakeEmail(env, row);
 
       // 3) Send the card to every allowed chat. Summary line first,
-      //    then a short second line so Sidd can see the id and sender.
-      //    No raw email body on the card - that is the "Full email"
-      //    button's job.
-      const cardText = summary + '\nintake #' + row.id + ' · ' + (row.from_addr || 'unknown sender');
+      //    then a short second line so Sidd can see the id and sender,
+      //    then any warnings. No raw email body on the card - that is
+      //    the "Full email" button's job.
+      const notes = [];
+      if (sib) {
+        notes.push('Note: this looks like a reply on the same thread as intake #' +
+          sib.id + ', so I did not start a draft for it.');
+      }
+      // A row that still carries a document number but came BACK to
+      // pending_review means Jarvis created that invoice from this email
+      // and then voided it at the PDF gate. Approving again is allowed
+      // (Sidd's tap is the authorization), he just needs to know.
+      if (row.external_invoice_id) {
+        notes.push('Heads up: invoice #' + row.external_invoice_id +
+          ' was created from this email earlier and then voided.');
+      }
+      const cardText = summary + '\nintake #' + row.id + ' · ' +
+        (row.from_addr || 'unknown sender') +
+        (notes.length ? '\n' + notes.join('\n') : '');
       let sentMessageId = null;
       for (const cid of chatIds) {
         const mid = await sendIntakeCard(env, cid, cardText, row.id);
