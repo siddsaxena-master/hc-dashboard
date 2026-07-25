@@ -744,6 +744,17 @@ async function fetchIntake(env, query) {
   }
 }
 
+// When a row STARTED waiting on whoever owns it now. For a tapped
+// ('approved') row that is the tap time (reviewed_at); otherwise it is
+// when the email arrived. Used by the digest ages and the hourly nag
+// windows so a card tapped days after it landed still gets its alarm
+// (2026-07-25 review).
+function intakeWaitingSince(row) {
+  if (!row) return null;
+  if (row.status === 'approved' && row.reviewed_at) return row.reviewed_at;
+  return row.created_at;
+}
+
 // Lines appended to the 8am digest: how many intake messages are waiting,
 // plus a dead-man warning if the email channel itself looks dead.
 async function buildIntakeDigestLines(env) {
@@ -755,32 +766,46 @@ async function buildIntakeDigestLines(env) {
   // or its auto-draft flag is off, a tapped lead would otherwise sit
   // there forever with nobody watching it.
   const waiting = await fetchIntake(env,
-    'select=id,created_at,status&status=in.(pending_review,approved)&order=created_at.asc');
-  if (waiting === null) return lines;  // table missing or query failed; skip quietly
-  const pending = waiting.filter(r => r.status === 'pending_review');
-  const approved = waiting.filter(r => r.status === 'approved');
+    'select=id,created_at,reviewed_at,status&status=in.(pending_review,approved)&order=created_at.asc');
+  // NOTE: no early return on a failed read (2026-07-25 review). Each
+  // section below stands on its own, so one flaky query only drops its
+  // own line instead of silently swallowing the skipped/not-order audit
+  // lines and the dead-man warning on exactly the flaky day.
+  const pending = (waiting || []).filter(r => r.status === 'pending_review');
+  const approved = (waiting || []).filter(r => r.status === 'approved');
   if (pending.length > 0) {
     lines.push('Intake: ' + pending.length + ' awaiting review (oldest ' +
       hoursSince(pending[0].created_at) + 'h) - reply in the Jarvis chat: invoice ' + pending[0].id +
       ' (approve/skip buttons in this chat)');
   }
   if (approved.length > 0) {
+    // Age from the TAP (reviewed_at), not from when the email arrived:
+    // this line exists to catch "Sidd tapped and nothing happened", so
+    // the email's own age would overstate the Jarvis wait and point him
+    // at a healthy service (2026-07-25 review).
+    const oldestApproved = approved.slice().sort(
+      (a, b) => new Date(intakeWaitingSince(a)) - new Date(intakeWaitingSince(b))
+    )[0];
     lines.push('Intake: ' + approved.length + ' approved and still waiting on Jarvis (oldest ' +
-      hoursSince(approved[0].created_at) + 'h) - if this does not clear, check the jarvis-bot service.');
+      hoursSince(intakeWaitingSince(oldestApproved)) + 'h) - if this does not clear, check the jarvis-bot service.');
   }
 
-  // Classifier visibility: emails set aside as not-orders in the last
-  // 24h. A wrong not_order verdict must never be invisible to Sidd
-  // (2026-07-20 review note) - one digest line makes it auditable
-  // without SQL.
-  const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  // Classifier visibility: emails set aside as not-orders. A wrong
+  // not_order verdict must never be invisible to Sidd (2026-07-20
+  // review note) - one digest line makes it auditable without SQL.
+  // Keyed on reviewed_at (WHEN it was set aside), not created_at (when
+  // the email arrived): after any Jarvis outage the backlog gets
+  // classified late, and a created_at window would silently skip
+  // exactly those rows (2026-07-25 review). 48 hours, so one missed or
+  // failed digest still self-heals the next morning.
+  const cutoff = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
   const ignored = await fetchIntake(env,
-    'select=id&status=eq.ignored&created_at=gte.' + cutoff +
-    '&order=created_at.desc');
+    'select=id&status=eq.ignored&reviewed_at=gte.' + cutoff +
+    '&order=reviewed_at.desc');
   if (ignored && ignored.length > 0) {
     lines.push('Intake: ' + ignored.length + ' email' +
       (ignored.length === 1 ? '' : 's') +
-      ' set aside as not-orders in the last 24h (double check with: show ' +
+      ' set aside as not-orders in the last 2 days (double check with: show ' +
       ignored[0].id + ')');
   }
 
@@ -794,7 +819,7 @@ async function buildIntakeDigestLines(env) {
   if (dismissed && dismissed.length > 0) {
     lines.push('Intake: ' + dismissed.length + ' email' +
       (dismissed.length === 1 ? '' : 's') +
-      ' skipped in the last 24h (double check with: show ' +
+      ' skipped in the last 2 days (double check with: show ' +
       dismissed[0].id + ')');
   }
 
@@ -820,20 +845,30 @@ async function buildIntakeDigestLines(env) {
 // nothing to store.
 async function runIntakeNagScan(env) {
   for (const hours of [4, 24]) {
-    // age >= hours   ->  created_at at or before (now - hours)
-    // age < hours+1  ->  created_at after (now - hours - 1h)
-    const newestCutoff = new Date(Date.now() - hours * 3600000).toISOString();
-    const oldestCutoff = new Date(Date.now() - (hours + 1) * 3600000).toISOString();
+    const newestCutoff = Date.now() - hours * 3600000;
+    const oldestCutoff = Date.now() - (hours + 1) * 3600000;
     // Both in-flight statuses are nagged: pending_review is waiting on
     // Sidd, approved is waiting on Jarvis. An approved row that never
     // clears is the tell that the jarvis-bot service (or its auto-draft
     // switch) needs a look.
-    const rows = await fetchIntake(env,
-      'select=id,from_addr,status&status=in.(pending_review,approved)' +
-      '&created_at=lte.' + newestCutoff +
-      '&created_at=gt.' + oldestCutoff +
-      '&order=created_at.asc');
-    if (!rows || !rows.length) continue;
+    //
+    // The age that matters is HOW LONG IT HAS BEEN WAITING, which for a
+    // tapped row is reviewed_at, not when the email first arrived
+    // (2026-07-25 review): a card tapped two days after it landed would
+    // otherwise be past both windows and never get the fast alarm that
+    // exists precisely to catch "the tap went nowhere". PostgREST
+    // cannot filter on "whichever column is later", so fetch the
+    // in-flight rows and window them here - this queue is small.
+    const inFlight = await fetchIntake(env,
+      'select=id,from_addr,status,created_at,reviewed_at' +
+      '&status=in.(pending_review,approved)&order=created_at.asc');
+    if (!inFlight || !inFlight.length) continue;
+    const rows = inFlight.filter(r => {
+      const since = new Date(intakeWaitingSince(r)).getTime();
+      if (!Number.isFinite(since)) return false;
+      return since <= newestCutoff && since > oldestCutoff;
+    });
+    if (!rows.length) continue;
 
     const lines = ['[intake] ' + rows.length + ' message(s) waiting ' + hours + 'h+:'];
     rows.forEach(r => lines.push('#' + r.id + ' from ' + (r.from_addr || 'unknown sender') +
@@ -896,13 +931,22 @@ export async function findHandledThreadSibling(env, row) {
 
   // Recent rows to compare against.
   const recent = await fetchIntake(env,
-    'select=id,subject,status,error_detail,created_at' +
+    'select=id,subject,from_addr,status,error_detail,created_at' +
     '&order=id.desc&limit=60');
   if (!recent) return null; // read failed; never suppress on a guess
 
   for (const sib of recent) {
     if (String(sib.id) === String(row.id)) continue;
     if (normalizeSubject(sib.subject) !== subj) continue;
+    // Sender is deliberately NOT required to match. The incident this
+    // exists for (2026-07-23) was one email thread answered by FOUR
+    // people at three different companies, so a same-sender rule would
+    // miss exactly that case. The cost is that two unrelated leads
+    // sharing a generic subject ("Coconuts") also match, which is why
+    // the card's note NAMES this sibling's sender and status instead of
+    // telling Sidd to disregard the email (2026-07-25 review). The note
+    // is information; it never suppresses a card and never blocks a
+    // draft.
     // Only siblings within 14 days count; a months-old thread with the
     // same subject can plausibly be brand new business again.
     const gapMs = Math.abs(new Date(row.created_at).getTime() - new Date(sib.created_at).getTime());
@@ -936,10 +980,14 @@ const INTAKE_SUMMARY_PROMPT = 'You summarize inbound emails for the owner of Ham
 // fall back to a plain from + subject line so the card still goes out.
 async function summarizeIntakeEmail(env, row) {
   // Caps keep the request small and blunt any attempt to bury
-  // instructions deep inside a huge email body.
-  const from = String(row.from_addr || 'unknown sender').slice(0, 200);
-  const subject = String(row.subject || '(no subject)').slice(0, 300);
-  const body = String(row.raw_text || '').slice(0, 4000);
+  // instructions deep inside a huge email body. The marker literals are
+  // neutralized in all three fields so a sender cannot close the fence
+  // early and have the rest of their text read as instructions
+  // (2026-07-25 review).
+  const defuse = (s) => s.replace(/<<<|>>>/g, '<');
+  const from = defuse(String(row.from_addr || 'unknown sender').slice(0, 200));
+  const subject = defuse(String(row.subject || '(no subject)').slice(0, 300));
+  const body = defuse(String(row.raw_text || '').slice(0, 4000));
   const fallback = 'Email from ' + from + ': "' + subject + '"';
   try {
     const resp = await fetch(CLAUDE_API, {
@@ -955,8 +1003,11 @@ async function summarizeIntakeEmail(env, row) {
         system: INTAKE_SUMMARY_PROMPT,
         messages: [{
           role: 'user',
-          content: 'From: ' + from + '\nSubject: ' + subject + '\n\n' +
-            '<<<BEGIN UNTRUSTED EMAIL>>>\n' + body + '\n<<<END UNTRUSTED EMAIL>>>',
+          // From and Subject go INSIDE the fence too: they are the
+          // sender's text as much as the body is (2026-07-25 review).
+          content: '<<<BEGIN UNTRUSTED EMAIL>>>\nFrom: ' + from +
+            '\nSubject: ' + subject + '\n\nBody:\n' + body +
+            '\n<<<END UNTRUSTED EMAIL>>>',
         }],
       }),
     });
@@ -1053,8 +1104,12 @@ async function runIntakeCardScan(env) {
       //    the "Full email" button's job.
       const notes = [];
       if (sib) {
-        notes.push('Note: this looks like a reply on the same thread as intake #' +
-          sib.id + ', so I did not start a draft for it.');
+        // Name the sibling's sender and where it got to, so Sidd can
+        // tell a genuine thread reply from two unrelated leads that
+        // happen to share a subject line (2026-07-25 review).
+        notes.push('Note: same subject as intake #' + sib.id + ' (from ' +
+          (sib.from_addr || 'unknown sender') + ', ' + (sib.status || 'unknown') +
+          '), so check this is not a duplicate of it.');
       }
       // A row that still carries a document number but came BACK to
       // pending_review means Jarvis created that invoice from this email
@@ -1287,7 +1342,13 @@ async function handleIntakeCallback(cb, env) {
       const moved = await approveOrSkipIntake(env, intakeId, 'approved');
       if (moved === 'changed') {
         await answerCallback(env, cb.id, 'Sent to Jarvis');
-        await appendToCard(env, cb, '\n\n✅ Approved. Jarvis is drafting it now, check the Jarvis chat.');
+        // Do not promise a draft that has not happened yet: Jarvis picks
+        // approved rows up on its own 2-minute tick, and if it is down
+        // or its switch is off, the digest and hourly nag are what tell
+        // Sidd (2026-07-25 review). Claiming "drafting it now" made the
+        // card lie in exactly that case.
+        await appendToCard(env, cb, '\n\n✅ Approved and sent to Jarvis. ' +
+          'He drafts it within a couple of minutes - watch the Jarvis chat.');
       } else if (moved === 'nomatch') {
         // The row already moved on (double-tap, or Jarvis got there).
         // Say WHICH way it went, read straight from the database.
@@ -1317,16 +1378,17 @@ async function handleIntakeCallback(cb, env) {
   }
 }
 
-// One-time OPTIONAL hardening: re-register this bot's Telegram webhook
-// at the worker ROOT url (its current target, so chat delivery does
-// not move) with a secret token attached. After this runs, Telegram
-// stamps X-Telegram-Bot-Api-Secret-Token on every delivery and the
-// root handler starts rejecting posts without it. The buttons work
-// WITHOUT ever calling this - it only adds the secret check. Visit
-//   https://<worker-url>/setup-telegram-webhook?secret=<TG_WEBHOOK_SECRET>
-// in a browser (or curl it) once, right after a deploy that set the
-// secret. The ?secret= check means a stranger cannot re-point the
-// bot's webhook.
+// One-time REQUIRED hardening step (2026-07-25 security review):
+// re-register this bot's Telegram webhook at the worker ROOT url (its
+// current target, so chat delivery does not move) with a secret token
+// attached. After this runs, Telegram stamps
+// X-Telegram-Bot-Api-Secret-Token on every delivery and the root handler
+// rejects posts without it - which is what stops a stranger from forging
+// a button tap. Run it ONCE, immediately after the deploy that set
+// TG_WEBHOOK_SECRET, with the secret in a HEADER so it stays out of
+// browser history and Cloudflare logs:
+//   curl -H "X-Setup-Secret: <value>" https://<worker-url>/setup-telegram-webhook
+// Buttons themselves work without this call; the secret check does not.
 async function handleSetupTelegramWebhook(request, env, url) {
   // Prefer the secret in a HEADER, not the query string: a URL with
   // ?secret=... lands in Chrome history, in profile sync, and in

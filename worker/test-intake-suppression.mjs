@@ -171,6 +171,35 @@ test('a failed read never suppresses', async () => {
   assert.equal(found, null);
 });
 
+// ── 10) a thread reply from a DIFFERENT sender still matches ─────
+// The 2026-07-23 incident thread ("7/28 Influencer Dinner") was answered
+// by four people at three different companies, and each reply became its
+// own intake row. Sender is deliberately NOT part of the match, or that
+// incident would go unflagged. The note the card carries names the
+// sibling's sender so Sidd can still tell a real thread reply from two
+// unrelated leads that happen to share a subject.
+test('a reply from a different sender on the same thread still matches', async () => {
+  const found = await lookup(
+    subjectRow({ id: 101, from_addr: 'david@nameandnumber.com' }),
+    [sibling({ id: 58, from_addr: 'mary.ryan@favour.agency', status: 'invoiced' })],
+  );
+  assert.ok(found, 'expected the invoiced sibling to be found');
+  assert.equal(found.id, 58);
+});
+
+// ── 11) the matcher returns the sibling's sender for the card note ─
+// The card wording depends on from_addr coming back from this lookup; if
+// the SELECT ever drops it the note would read "from unknown sender".
+test('the returned sibling carries its sender for the card note', async () => {
+  const found = await lookup(
+    subjectRow({ id: 102 }),
+    [sibling({ id: 59, from_addr: 'kristi@nameandnumber.com', status: 'drafting' })],
+  );
+  assert.ok(found);
+  assert.equal(found.from_addr, 'kristi@nameandnumber.com');
+  assert.equal(found.status, 'drafting');
+});
+
 // ── run ────────────────────────────────────────────────────────────
 let failed = 0;
 for (const c of cases) {
