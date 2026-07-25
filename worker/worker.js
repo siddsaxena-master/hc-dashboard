@@ -734,7 +734,8 @@ async function buildIntakeDigestLines(env) {
   if (pending === null) return lines;  // table missing or query failed; skip quietly
   if (pending.length > 0) {
     lines.push('Intake: ' + pending.length + ' awaiting review (oldest ' +
-      hoursSince(pending[0].created_at) + 'h) - reply in the Jarvis chat: invoice ' + pending[0].id);
+      hoursSince(pending[0].created_at) + 'h) - reply in the Jarvis chat: invoice ' + pending[0].id +
+      ' (approve/skip buttons in this chat)');
   }
 
   // Classifier visibility: emails set aside as not-orders in the last
@@ -786,7 +787,7 @@ async function runIntakeNagScan(env) {
 
     const lines = ['[intake] ' + rows.length + ' message(s) waiting ' + hours + 'h+ for review:'];
     rows.forEach(r => lines.push('#' + r.id + ' from ' + (r.from_addr || 'unknown sender')));
-    lines.push('Reply in the Jarvis chat: invoice <id> / show <id> / skip <id>');
+    lines.push('Approve or skip them with the buttons above, or in the Jarvis chat: invoice <id> / show <id> / skip <id>');
 
     const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
     for (const cid of chatIds) {
