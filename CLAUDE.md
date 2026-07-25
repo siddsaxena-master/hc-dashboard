@@ -54,15 +54,35 @@
 - The anon Supabase key in this file is public by design (row-level
   security limits what it can do).
 
-## Order intake backstops (added 2026-07-19; ingestion corrected 2026-07-20)
+## Order intake: Claudia's half (approval-first redesign, 2026-07-24)
 
-- `intake_messages` (migration 004) is a QUARANTINE table: every inbound
-  order email lands there first via Jarvis's outlook_poller (Microsoft
-  365 mailbox — the wf_16/Gmail plan is DEAD, see hc-invoice-bot
-  CLAUDE.md). Jarvis classifies each row every 2 minutes: clear orders
-  are AUTO-DRAFTED into Sidd's chat behind JARVIS_INTAKE_AUTODRAFT,
-  maybes get a numbered card he answers with `invoice <id>`, not-orders
-  are set aside (and surfaced as a count in the 8am digest).
+- `intake_messages` (migrations 004 + 005) is a QUARANTINE table: every
+  inbound order email lands there first via Jarvis's outlook_poller
+  (Microsoft 365 mailbox — the wf_16/Gmail plan is DEAD, see
+  hc-invoice-bot CLAUDE.md). Jarvis classifies each row every 2 minutes
+  and stamps `classified_at`; THIS worker is now the card sender:
+  every 5 minutes (`runIntakeCardScan`, cron `*/5 * * * *`) it sends
+  Sidd a one-sentence natural-language card (Haiku summary,
+  injection-fenced, plain text, fail-open to the subject line) with
+  inline buttons: Invoice it / Skip / Full email. Button taps arrive
+  as callback_query updates on the bot's EXISTING root webhook
+  (`handleIntakeCallback`): Invoice it -> status 'approved' (Jarvis
+  drafts ONLY approved rows, through its normal confirm gates), Skip
+  -> 'dismissed', Full email -> chunked raw text. Guarded PATCHes
+  everywhere; a decided card loses its buttons.
+- Thread suppression lives HERE (not in Jarvis): a row whose
+  normalized subject (Re:/Fw: stacks stripped, 14-day window) matches
+  an invoiced/approved/drafting/final/carded row is set 'ignored' with
+  a note instead of carded — EXCEPT rows from @hamptonscoconuts.com,
+  which are the website's GoDaddy form notifications (same subject,
+  each a DIFFERENT lead; never suppress them).
+- Telegram allows ONE webhook per bot. Buttons and chat messages share
+  the root entry point ON PURPOSE; never re-point the webhook to a new
+  path or pass `allowed_updates` to setWebhook (omitting it preserves
+  the previous setting; filtering would silently kill Claudia's chat).
+  Optional hardening: `wrangler secret put TG_WEBHOOK_SECRET` then curl
+  `/setup-telegram-webhook?secret=...` — the root handler requires
+  Telegram's secret header only when the secret is configured.
 - RLS is ON with ZERO policies ON PURPOSE. Raw customer messages are
   sensitive; the public anon key in index.html must get nothing. The
   dashboard page and the HC Field app never read this table. Do not
