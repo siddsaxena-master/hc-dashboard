@@ -749,14 +749,24 @@ async function fetchIntake(env, query) {
 async function buildIntakeDigestLines(env) {
   const lines = [];
 
-  // Pending cards, oldest first.
-  const pending = await fetchIntake(env,
-    'select=id,created_at&status=eq.pending_review&order=created_at.asc');
-  if (pending === null) return lines;  // table missing or query failed; skip quietly
+  // Everything still in flight, oldest first. Two statuses count as
+  // in flight: pending_review (waiting on Sidd) and approved (waiting
+  // on Jarvis). Approved rows MUST be reported too - if Jarvis is down
+  // or its auto-draft flag is off, a tapped lead would otherwise sit
+  // there forever with nobody watching it.
+  const waiting = await fetchIntake(env,
+    'select=id,created_at,status&status=in.(pending_review,approved)&order=created_at.asc');
+  if (waiting === null) return lines;  // table missing or query failed; skip quietly
+  const pending = waiting.filter(r => r.status === 'pending_review');
+  const approved = waiting.filter(r => r.status === 'approved');
   if (pending.length > 0) {
     lines.push('Intake: ' + pending.length + ' awaiting review (oldest ' +
       hoursSince(pending[0].created_at) + 'h) - reply in the Jarvis chat: invoice ' + pending[0].id +
       ' (approve/skip buttons in this chat)');
+  }
+  if (approved.length > 0) {
+    lines.push('Intake: ' + approved.length + ' approved and still waiting on Jarvis (oldest ' +
+      hoursSince(approved[0].created_at) + 'h) - if this does not clear, check the jarvis-bot service.');
   }
 
   // Classifier visibility: emails set aside as not-orders in the last
@@ -799,16 +809,26 @@ async function runIntakeNagScan(env) {
     // age < hours+1  ->  created_at after (now - hours - 1h)
     const newestCutoff = new Date(Date.now() - hours * 3600000).toISOString();
     const oldestCutoff = new Date(Date.now() - (hours + 1) * 3600000).toISOString();
+    // Both in-flight statuses are nagged: pending_review is waiting on
+    // Sidd, approved is waiting on Jarvis. An approved row that never
+    // clears is the tell that the jarvis-bot service (or its auto-draft
+    // switch) needs a look.
     const rows = await fetchIntake(env,
-      'select=id,from_addr&status=eq.pending_review' +
+      'select=id,from_addr,status&status=in.(pending_review,approved)' +
       '&created_at=lte.' + newestCutoff +
       '&created_at=gt.' + oldestCutoff +
       '&order=created_at.asc');
     if (!rows || !rows.length) continue;
 
-    const lines = ['[intake] ' + rows.length + ' message(s) waiting ' + hours + 'h+ for review:'];
-    rows.forEach(r => lines.push('#' + r.id + ' from ' + (r.from_addr || 'unknown sender')));
+    const lines = ['[intake] ' + rows.length + ' message(s) waiting ' + hours + 'h+:'];
+    rows.forEach(r => lines.push('#' + r.id + ' from ' + (r.from_addr || 'unknown sender') +
+      (r.status === 'approved'
+        ? ' - approved but Jarvis has not drafted it yet'
+        : ' - still waiting for review')));
     lines.push('Approve or skip them with the buttons above, or in the Jarvis chat: invoice <id> / show <id> / skip <id>');
+    if (rows.some(r => r.status === 'approved')) {
+      lines.push('An approved one stuck here means Jarvis is not picking it up - check the jarvis-bot service on the droplet.');
+    }
 
     const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
     for (const cid of chatIds) {
