@@ -15,7 +15,9 @@ crons = [
 # SUPABASE_SERVICE_KEY - service_role key (bypasses RLS, set via wrangler secret put)
 # TG_BOT_TOKEN - Telegram bot token from @BotFather
 # ALLOWED_CHAT_IDS - Comma-separated Telegram chat IDs allowed to use the bot
-# TG_WEBHOOK_SECRET - shared secret that verifies Telegram callback webhooks.
-#   Telegram echoes it back in the X-Telegram-Bot-Api-Secret-Token header on
-#   every button-tap delivery; it is also required as ?secret= on the one-time
-#   /setup-telegram-webhook route. Any random long string works.
+# TG_WEBHOOK_SECRET - OPTIONAL shared secret that hardens the Telegram
+#   webhook. If unset, the worker behaves exactly as before (no check).
+#   Once set, the worker requires Telegram's X-Telegram-Bot-Api-Secret-Token
+#   header on every delivery (chat messages AND button taps), so after
+#   setting it and deploying, promptly visit /setup-telegram-webhook?secret=...
+#   once to register the secret with Telegram. Any random long string works.

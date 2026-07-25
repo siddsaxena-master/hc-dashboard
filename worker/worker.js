@@ -76,9 +76,11 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // One-time Telegram webhook setup. Checked BEFORE the POST-only gate
-    // below so it also works from a browser address bar (a GET request).
-    // It requires ?secret=<TG_WEBHOOK_SECRET>, so it is safe to expose.
+    // One-time OPTIONAL webhook hardening (adds Telegram's secret
+    // header to deliveries; the buttons work without it). Checked
+    // BEFORE the POST-only gate below so it also works from a browser
+    // address bar (a GET request). It requires
+    // ?secret=<TG_WEBHOOK_SECRET>, so it is safe to expose.
     if (url.pathname === '/setup-telegram-webhook') {
       return handleSetupTelegramWebhook(request, env, url);
     }
@@ -96,11 +98,30 @@ export default {
     if (url.pathname === '/webhooks/quo') return handleQuoWebhook(request, env);
     if (url.pathname === '/webhooks/ms-graph') return handleMsGraphWebhook(request, env, url);
 
-    // Telegram button taps on the intake approval cards
-    if (url.pathname === '/webhooks/telegram') return handleTelegramCallbackWebhook(request, env);
-
     try {
+      // Optional hardening (see /setup-telegram-webhook): if a webhook
+      // secret is configured, require the header Telegram echoes on
+      // every delivery. This gates BOTH plain chat messages and the
+      // intake-card button taps, because both arrive right here on the
+      // bot's one webhook. If no secret is configured, skip the check
+      // entirely, so deploying this worker before the secret exists
+      // changes nothing about today's behavior.
+      if (env.TG_WEBHOOK_SECRET) {
+        const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+        if (got !== env.TG_WEBHOOK_SECRET) {
+          return new Response('unauthorized', { status: 401 });
+        }
+      }
+
       const update = await request.json();
+
+      // Button taps on the intake approval cards arrive as
+      // callback_query updates on this same webhook. Handle them and
+      // stop; everything below is for plain chat messages.
+      if (update.callback_query) {
+        return handleIntakeCallback(update.callback_query, env);
+      }
+
       const message = update.message;
       if (!message || !message.text) return ok();
 
@@ -1031,11 +1052,14 @@ async function runIntakeCardScan(env) {
   }
 }
 
-// ── TELEGRAM CALLBACK WEBHOOK (the card buttons) ──
-// Telegram calls POST /webhooks/telegram when Sidd taps a button on an
-// intake card. The database PATCH is the source of truth for every tap;
-// the Telegram calls around it (the little toast, the card edit) are
-// best-effort decoration and never change the outcome.
+// ── INTAKE CARD BUTTON TAPS (callback queries) ──
+// Button taps arrive as callback_query updates on the bot's ONE
+// Telegram webhook - the same root POST that chat messages already
+// use - and the root handler routes them here. No webhook re-pointing
+// is needed for the buttons to work. The database PATCH is the source
+// of truth for every tap; the Telegram calls around it (the little
+// toast, the card edit) are best-effort decoration and never change
+// the outcome.
 
 // Best-effort toast shown on the phone after a button tap.
 async function answerCallback(env, callbackQueryId, text) {
@@ -1129,20 +1153,12 @@ async function sendFullIntakeEmail(env, chatId, intakeId) {
   }
 }
 
-async function handleTelegramCallbackWebhook(request, env) {
-  // Telegram echoes the secret we registered with setWebhook on every
-  // delivery, in this header. Anyone else POSTing here gets a 401 and
-  // no data. If the secret is not configured, reject everything.
-  const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
-  if (!env.TG_WEBHOOK_SECRET || got !== env.TG_WEBHOOK_SECRET) {
-    return new Response('unauthorized', { status: 401 });
-  }
-
+// Handle one callback_query (a button tap). The root handler already
+// parsed the update and, when a webhook secret is configured, already
+// verified Telegram's secret header - messages and taps share the same
+// webhook delivery, so the check lives up there, once.
+async function handleIntakeCallback(cb, env) {
   try {
-    const update = await request.json();
-    const cb = update.callback_query;
-    if (!cb) return ok(); // not a button tap; nothing for this route
-
     // Only chats on the allowlist may drive the buttons.
     const chatId = cb.message && cb.message.chat ? String(cb.message.chat.id).trim() : '';
     const allowed = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -1179,16 +1195,21 @@ async function handleTelegramCallbackWebhook(request, env) {
     }
     return ok();
   } catch (e) {
-    console.error('telegram callback webhook error:', e);
+    console.error('intake callback error:', e);
     return ok();
   }
 }
 
-// One-time setup: point this bot's Telegram webhook at
-// /webhooks/telegram with the secret token attached. Visit
+// One-time OPTIONAL hardening: re-register this bot's Telegram webhook
+// at the worker ROOT url (its current target, so chat delivery does
+// not move) with a secret token attached. After this runs, Telegram
+// stamps X-Telegram-Bot-Api-Secret-Token on every delivery and the
+// root handler starts rejecting posts without it. The buttons work
+// WITHOUT ever calling this - it only adds the secret check. Visit
 //   https://<worker-url>/setup-telegram-webhook?secret=<TG_WEBHOOK_SECRET>
-// in a browser (or curl it) once after deploying. The ?secret= check
-// means a stranger cannot re-point the bot's webhook.
+// in a browser (or curl it) once, right after a deploy that set the
+// secret. The ?secret= check means a stranger cannot re-point the
+// bot's webhook.
 async function handleSetupTelegramWebhook(request, env, url) {
   const given = url.searchParams.get('secret');
   if (!env.TG_WEBHOOK_SECRET || given !== env.TG_WEBHOOK_SECRET) {
@@ -1199,13 +1220,15 @@ async function handleSetupTelegramWebhook(request, env, url) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        url: url.origin + '/webhooks/telegram',
+        // The worker root - where Telegram already delivers everything.
+        url: url.origin + '/',
         secret_token: env.TG_WEBHOOK_SECRET,
-        // Only button taps are delivered. NOTE: Telegram allows exactly
-        // ONE webhook per bot, so after this runs, plain chat messages
-        // to this bot are no longer delivered anywhere (they were
-        // previously POSTed to the worker root). See the deploy notes.
-        allowed_updates: ['callback_query'],
+        // Deliberately NO allowed_updates field here, ever. Per the
+        // Telegram Bot API, omitting it preserves the bot's previous
+        // setting, while passing a list would FILTER deliveries: for
+        // example ["callback_query"] would silently stop every plain
+        // chat message from reaching Claudia. Both chat messages and
+        // button taps must keep flowing to this one root webhook.
       }),
     });
     const raw = await resp.text();
