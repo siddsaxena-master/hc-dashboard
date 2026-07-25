@@ -70,12 +70,26 @@
   drafts ONLY approved rows, through its normal confirm gates), Skip
   -> 'dismissed', Full email -> chunked raw text. Guarded PATCHes
   everywhere; a decided card loses its buttons.
-- Thread suppression lives HERE (not in Jarvis): a row whose
-  normalized subject (Re:/Fw: stacks stripped, 14-day window) matches
-  an invoiced/approved/drafting/final/carded row is set 'ignored' with
-  a note instead of carded — EXCEPT rows from @hamptonscoconuts.com,
-  which are the website's GoDaddy form notifications (same subject,
-  each a DIFFERENT lead; never suppress them).
+- Thread matching lives HERE (not in Jarvis) and it NEVER suppresses a
+  card. A row whose normalized subject (Re:/Fw: stacks stripped, 14-day
+  window) matches an invoiced/approved/drafting/final sibling still
+  gets its card, with one extra line naming the sibling ("I did not
+  start a draft for it"), and the row stays pending_review. A sibling
+  that was merely carded and is still undecided does NOT count as
+  handled — the follow-up email is usually the one carrying the real
+  order details. Rows from @hamptonscoconuts.com skip thread matching
+  entirely: those are the website's GoDaddy form notifications (same
+  subject, each a DIFFERENT lead; never suppress them).
+- A card also warns when the row carries an `external_invoice_id` while
+  back in pending_review: that means Jarvis created an invoice from this
+  email and then voided it at the PDF gate ("Heads up: invoice #N was
+  created from this email earlier and then voided"). Approving again is
+  allowed on purpose — under approval-first, Sidd's tap IS the
+  authorization.
+- Run the suppression tests before touching that logic:
+  `node worker/test-intake-suppression.mjs` (no framework, no network,
+  exits non-zero on failure). `normalizeSubject` and
+  `findHandledThreadSibling` are named exports for exactly this.
 - Telegram allows ONE webhook per bot. Buttons and chat messages share
   the root entry point ON PURPOSE; never re-point the webhook to a new
   path or pass `allowed_updates` to setWebhook (omitting it preserves
@@ -88,16 +102,36 @@
   dashboard page and the HC Field app never read this table. Do not
   add anon policies to it. Only service-role keys (this worker, Jarvis)
   and the n8n postgres role can reach it.
-- The worker is the backstop, in a separate failure domain from n8n:
+- The worker is the backstop, in a separate failure domain from n8n.
+  Both in-flight statuses are watched — pending_review is waiting on
+  Sidd, `approved` is waiting on Jarvis — because a tapped row that
+  Jarvis never picks up would otherwise be invisible forever:
   - The 8am digest appends "Intake: N awaiting review (oldest Xh)" when
-    anything is pending, plus a dead-man warning when no email intake
-    has been seen in 24h (means wf_16 / the Gmail trigger is down).
-  - The hourly cron sends one-shot plain-text nags when a pending row
-    crosses 4h of age, and again at 24h (stateless: each run only
-    alerts rows that crossed the threshold within the last hour).
-- Deploying this change = worker only (`cd worker; npx wrangler deploy`
-  with Sidd's "yes do it"). index.html is untouched, so NO sw.js cache
-  bump is needed.
+    anything is pending, a SEPARATE "Intake: N approved and still
+    waiting on Jarvis" line when any approved row exists, plus a
+    dead-man warning when no email intake has been seen in 24h (means
+    the outlook-poller is down).
+  - The hourly cron sends one-shot plain-text nags when a pending OR
+    approved row crosses 4h of age, and again at 24h (stateless: each
+    run only alerts rows that crossed the threshold within the last
+    hour). Approved rows are worded differently ("approved but Jarvis
+    has not drafted it yet") and add a line pointing at the jarvis-bot
+    service.
+- Deploying this change is CROSS-REPO and ORDER MATTERS (each step needs
+  Sidd's "yes do it"):
+  1. Run `migrations/005_intake_approvals.sql` in the Supabase SQL
+     editor.
+  2. Merge/deploy the Jarvis branch in hc-invoice-bot (autodeploy;
+     verify the DEPLOYED line lands) so Jarvis understands `approved`.
+  3. `cd worker && npx wrangler deploy`.
+  `JARVIS_INTAKE_AUTODRAFT` must be ON in the droplet's .env or a tap
+  moves the row to `approved` and nothing drafts it (the digest and nag
+  lines above are what surface that).
+  Rollback runs the other way: once THIS worker is live, reverting
+  Jarvis to a version that does not understand `approved` strands every
+  tapped row (old Jarvis's manual `invoice N` refuses them). So roll the
+  worker back too, or re-run Jarvis's deploy. index.html is untouched
+  either way, so NO sw.js cache bump is needed.
 - Other halves of the feature: wf_16 + runbook docs/13_order_intake.md
   in the cold-email repo; the `invoice / show / skip` commands in
   hc-invoice-bot.
