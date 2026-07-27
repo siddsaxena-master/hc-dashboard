@@ -528,7 +528,7 @@ async function handleParseBatch(request, env) {
 // Cron schedule (in wrangler.toml [triggers]):
 //   "0 12 * * *"   — daily 8am ET (12 UTC) — Weee box math digest
 //   "0 * * * *"    — hourly — reconfirmation scan + post-event debrief scan + intake nags
-//   "*/5 * * * *"  — every 5 minutes — intake approval cards (summary + buttons)
+//   "*/5 * * * *"  — every 5 minutes — intake approval cards + shift summaries
 async function runScheduled(event, env, alsoNotify = true) {
   const cron = event.cron;
   try {
@@ -539,6 +539,10 @@ async function runScheduled(event, env, alsoNotify = true) {
       await runDebriefScan(env);
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
+      // Shift summaries ride the same 5-minute tick. Runs AFTER intake
+      // and never throws (fully wrapped inside), so a payroll failure
+      // can never break intake cards.
+      await runShiftSummaryScan(env);
     }
   } catch (e) {
     console.error('runScheduled error:', e);
@@ -618,6 +622,14 @@ async function runDailyDigest(env) {
   if (intakeLines.length) {
     lines.push('');
     intakeLines.forEach(l => lines.push(l));
+  }
+
+  // Sunday payroll section (weekday checked in EASTERN time inside the
+  // helper; returns [] on any other day or on any read failure).
+  const payrollLines = await buildPayrollDigestLines(env);
+  if (payrollLines.length) {
+    lines.push('');
+    payrollLines.forEach(l => lines.push(l));
   }
 
   const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -1791,4 +1803,283 @@ async function handleParseFile(request, env) {
   } catch (e) {
     return jsonResponse({ error: e.message }, 500);
   }
+}
+
+// ── SHIFT PAYROLL + SUMMARIES (added 2026-07, feature F1/F4) ──
+// Both markets operate on Eastern time, so ALL "local day" logic here
+// anchors to America/New_York, never the worker's UTC clock.
+// The pay math in this section MUST stay rule-for-rule identical to the
+// Pay card in hc-field-app/App.js (payMins / payCents / fmtHm there):
+//   minutes = floor((clock_out - clock_in) / 60000), never negative
+//   pay cents = round-half-up(minutes * hourly_rate_cents / 60)
+
+const ET_ZONE = 'America/New_York';
+// The one knob for the payroll digest cadence. 'Sun' = Sundays only
+// (Sidd initiates payment every Sunday). Change to another short
+// weekday name ('Mon'..'Sun') to move it.
+const PAYROLL_DIGEST_WEEKDAY = 'Sun';
+// A shift still open after this many hours is a forgotten clock-out.
+// Keep in sync with OPEN_SHIFT_FLAG_HOURS in hc-field-app/App.js.
+const OPEN_SHIFT_FLAG_HOURS = 14;
+
+function etDateStr(iso) {  // YYYY-MM-DD in Eastern time
+  return new Intl.DateTimeFormat('en-CA', { timeZone: ET_ZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
+}
+function etTimeStr(iso) {  // e.g. "3:47 PM" in Eastern time
+  return new Date(iso).toLocaleTimeString('en-US', { timeZone: ET_ZONE, hour: 'numeric', minute: '2-digit' });
+}
+function etDayStr(iso) {   // e.g. "Thu, Jul 23" in Eastern time
+  return new Date(iso).toLocaleDateString('en-US', { timeZone: ET_ZONE, weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+function shiftMinutes(row) {
+  return Math.max(0, Math.floor((new Date(row.clock_out_at) - new Date(row.clock_in_at)) / 60000));
+}
+function payCents(mins, rateCents) {
+  return Math.round(mins * rateCents / 60);  // half-up on positive values
+}
+function fmtHm(mins) {
+  return Math.floor(mins / 60) + ':' + String(mins % 60).padStart(2, '0');
+}
+function usd(cents) {
+  return '$' + (cents / 100).toFixed(2);
+}
+// 9 coconuts per box, same constant as the app and dashboard. Whole
+// number when divisible, one decimal when not (e.g. "3.3 boxes").
+function fmtBoxes(coconuts) {
+  return coconuts % 9 === 0 ? String(coconuts / 9) : (coconuts / 9).toFixed(1);
+}
+// Strip characters Telegram Markdown chokes on; digest lines only
+// (the shift summary itself is sent in plain mode and needs nothing).
+function tgSafe(t) {
+  return String(t == null ? '' : t).replace(/[_*`\[]/g, ' ');
+}
+
+// Generic guarded Supabase read, mirroring fetchIntake: array or null,
+// never throws, so callers can no-op gracefully.
+async function fetchSb(env, pathQuery) {
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + pathQuery, { headers: sbHeaders(env) });
+    if (!resp.ok) {
+      console.error('supabase read error:', pathQuery.split('?')[0], resp.status);
+      return null;
+    }
+    const rows = await resp.json();
+    return Array.isArray(rows) ? rows : null;
+  } catch (e) {
+    console.error('supabase read exception:', e);
+    return null;
+  }
+}
+
+// Rate lookup: by email first, by exact name as a fallback (old shift
+// rows can have a null worker_email). Null = rate not set.
+function workerRateFor(workers, row) {
+  const email = (row.worker_email || '').toLowerCase();
+  let w = email ? workers.find(x => (x.email || '').toLowerCase() === email) : null;
+  if (!w) w = workers.find(x => x.name === row.worker_name) || null;
+  return (w && w.hourly_rate_cents != null) ? w.hourly_rate_cents : null;
+}
+
+// Every 5 minutes, after the intake scan: one Telegram summary per
+// freshly closed shift. NEVER throws (own try/catch top to bottom).
+// The 48h window is deliberate: on migration day every historical
+// closed shift has summary_sent_at null, and the window stops a flood.
+async function runShiftSummaryScan(env) {
+  try {
+    const since = new Date(Date.now() - 48 * 3600000).toISOString();
+    const shifts = await fetchSb(env, 'shifts?select=*' +
+      '&clock_out_at=not.is.null' +
+      '&summary_sent_at=is.null' +
+      '&clock_out_at=gte.' + since +
+      '&order=clock_out_at.asc&limit=10');
+    if (!shifts || !shifts.length) return;
+
+    const workers = await fetchSb(env, 'field_workers?select=email,name,hourly_rate_cents') || [];
+    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+
+    for (const row of shifts) {
+      // Each shift wrapped on its own so one bad row never kills the batch.
+      try {
+        // CLAIM FIRST, same guarded-PATCH idea the intake scan uses:
+        // stamp summary_sent_at only where it is STILL null, ask for the
+        // row back, and proceed only if we got it. A concurrent
+        // invocation loses this race cleanly and skips the row.
+        const claim = await fetch(env.SUPABASE_URL + '/rest/v1/shifts' +
+          '?id=eq.' + row.id + '&summary_sent_at=is.null', {
+          method: 'PATCH',
+          headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+          body: JSON.stringify({ summary_sent_at: new Date().toISOString() }),
+        });
+        const claimed = claim.ok ? await claim.json() : null;
+        if (!Array.isArray(claimed) || !claimed.length) continue;
+
+        const text = await buildShiftSummaryText(env, row, workers);
+        // Plain mode on purpose: worker/client/venue text must never be
+        // able to break Telegram Markdown.
+        for (const cid of chatIds) {
+          await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
+        }
+      } catch (e) {
+        console.error('shift summary failed on ' + (row && row.id) + ':', e);
+      }
+    }
+  } catch (e) {
+    console.error('runShiftSummaryScan error:', e);
+  }
+}
+
+async function buildShiftSummaryText(env, row, workers) {
+  const mins = shiftMinutes(row);
+  const rate = workerRateFor(workers, row);
+  const day = etDateStr(row.clock_in_at);   // the shift's ET calendar day (anchored on clock-IN)
+  const market = row.market || 'ny';
+  const lines = [];
+
+  lines.push('Shift summary - ' + row.worker_name + ' (' + market.toUpperCase() + ')');
+  lines.push(etDayStr(row.clock_in_at) + ' · ' + etTimeStr(row.clock_in_at) + ' - ' + etTimeStr(row.clock_out_at) + ' ET · ' + fmtHm(mins));
+
+  // GPS point count + THE SAME Google Maps link the app's Team tab
+  // builds (App.js openRoute, copied exactly: sample down to 10 points
+  // because Maps directions URLs cap at 10 waypoints).
+  const pts = await fetchSb(env, 'shift_locations?select=lat,lng&shift_id=eq.' + row.id + '&order=at.asc') || [];
+  if (pts.length >= 2) {
+    const step = Math.max(1, Math.floor(pts.length / 9));
+    const sampled = pts.filter((_, i) => i % step === 0).slice(0, 10);
+    lines.push('Route: ' + pts.length + ' GPS points');
+    lines.push('https://www.google.com/maps/dir/' + sampled.map((p) => p.lat + ',' + p.lng).join('/'));
+  } else {
+    lines.push('Route: ' + pts.length + ' GPS point' + (pts.length === 1 ? '' : 's') + ' (no route link)');
+  }
+
+  // That ET day's orders in this worker's market. The gte/lte UTC-day
+  // window is CORRECT here, not a bug: order dates are stored as the
+  // local calendar date with a fake T12:00:00Z (dashboard convention),
+  // and this mirrors App.js loadOrders exactly.
+  const orders = await fetchSb(env, 'orders?select=client_name,venue,coconuts_qty,stage,market' +
+    '&market=eq.' + encodeURIComponent(market) +
+    '&stage=in.(invoiced,deposit_paid,paid_full,fulfilled,complete)' +
+    '&delivery_at_utc=gte.' + day + 'T00:00:00Z' +
+    '&delivery_at_utc=lte.' + day + 'T23:59:59Z') || [];
+  const coco = orders.reduce((s, o) => s + (o.coconuts_qty || 0), 0);
+
+  if (!orders.length) {
+    lines.push('No invoiced orders in ' + market.toUpperCase() + ' on ' + day + '.');
+  } else {
+    lines.push('Orders (' + day + ', ' + market.toUpperCase() + '):');
+    orders.forEach(o => {
+      lines.push('· ' + (o.client_name || '?') + (o.venue ? ' @ ' + o.venue : '') +
+        ' - ' + fmtBoxes(o.coconuts_qty || 0) + ' boxes (' + (o.coconuts_qty || 0) + ' coconuts)');
+    });
+    lines.push('Total: ' + fmtBoxes(coco) + ' boxes (' + coco + ' coconuts)');
+  }
+
+  if (rate == null) {
+    lines.push('Labor: ' + fmtHm(mins) + ' - hourly rate not set for ' + row.worker_name +
+      '. Payroll will not count this shift until hourly_rate_cents is set in field_workers.');
+  } else {
+    const cents = payCents(mins, rate);
+    lines.push('Labor: ' + fmtHm(mins) + ' at ' + usd(rate) + '/hr = ' + usd(cents));
+    if (coco > 0) {
+      lines.push('Cost per box: ' + usd(Math.round(cents / (coco / 9))));
+    }
+  }
+
+  // Combined day-labor-per-box when OTHER workers also closed shifts
+  // this same ET day + market. The 36h clock_in window is just a cheap
+  // pre-filter; the exact match is etDateStr === day.
+  const nearby = await fetchSb(env, 'shifts?select=id,worker_name,worker_email,clock_in_at,clock_out_at' +
+    '&market=eq.' + encodeURIComponent(market) +
+    '&clock_out_at=not.is.null' +
+    '&clock_in_at=gte.' + new Date(new Date(row.clock_in_at).getTime() - 36 * 3600000).toISOString()) || [];
+  const sameDay = nearby.filter(x => etDateStr(x.clock_in_at) === day);
+  const distinct = new Set(sameDay.map(x => (x.worker_email || x.worker_name || '').toLowerCase()));
+  if (distinct.size > 1 && coco > 0) {
+    let teamCents = 0;
+    const unrated = [];
+    sameDay.forEach(x => {
+      const r2 = workerRateFor(workers, x);
+      if (r2 == null) { unrated.push(x.worker_name); return; }
+      teamCents += payCents(shiftMinutes(x), r2);
+    });
+    lines.push('Day labor per box, all workers: ' + usd(Math.round(teamCents / (coco / 9))) +
+      (unrated.length ? ' (excludes ' + [...new Set(unrated)].join(', ') + ', rate not set)' : ''));
+  }
+
+  // Running unpaid total: ALL closed shifts with paid_at null for this
+  // worker, including the one this summary is about.
+  const who = row.worker_email
+    ? 'worker_email=eq.' + encodeURIComponent(row.worker_email)
+    : 'worker_name=eq.' + encodeURIComponent(row.worker_name || '');
+  const unpaid = await fetchSb(env, 'shifts?select=clock_in_at,clock_out_at&' + who +
+    '&clock_out_at=not.is.null&paid_at=is.null') || [];
+  const unpaidMins = unpaid.reduce((s, x) => s + shiftMinutes(x), 0);
+  if (rate == null) {
+    lines.push('Unpaid closed shifts for ' + row.worker_name + ': ' + unpaid.length +
+      ' (' + fmtHm(unpaidMins) + ') - no rate set');
+  } else {
+    const unpaidCents = unpaid.reduce((s, x) => s + payCents(shiftMinutes(x), rate), 0);
+    lines.push('Unpaid total for ' + row.worker_name + ': ' + usd(unpaidCents) +
+      ' across ' + unpaid.length + ' shift' + (unpaid.length === 1 ? '' : 's'));
+  }
+
+  return lines.join('\n');
+}
+
+// Sunday-only payroll section for the 8am digest. Returns [] on any
+// other ET weekday or on any read failure, so the digest never breaks.
+// Math must match the app's Pay card rule for rule (see comment at the
+// top of this section).
+async function buildPayrollDigestLines(env) {
+  const lines = [];
+  try {
+    const todayEt = new Intl.DateTimeFormat('en-US', { timeZone: ET_ZONE, weekday: 'short' }).format(new Date());
+    if (todayEt !== PAYROLL_DIGEST_WEEKDAY) return lines;
+
+    const rows = await fetchSb(env, 'shifts?select=id,worker_name,worker_email,clock_in_at,clock_out_at' +
+      '&paid_at=is.null&order=clock_in_at.asc&limit=200');
+    if (rows === null) return lines;  // read failed: drop only this section
+    const workers = await fetchSb(env, 'field_workers?select=email,name,hourly_rate_cents') || [];
+
+    const groups = {};
+    const flags = [];
+    let grand = 0;
+    rows.forEach(row => {
+      if (!row.clock_out_at) {
+        // Open shift: flag it once it looks forgotten; never count it.
+        if ((Date.now() - new Date(row.clock_in_at)) / 3600000 >= OPEN_SHIFT_FLAG_HOURS) {
+          flags.push('⚠️ ' + tgSafe(row.worker_name) + ' has a shift open since ' +
+            etDayStr(row.clock_in_at) + ' ' + etTimeStr(row.clock_in_at) +
+            ' ET - missing clock-out, not counted.');
+        }
+        return;
+      }
+      const key = (row.worker_email || row.worker_name || '?').toLowerCase();
+      if (!groups[key]) {
+        groups[key] = { name: row.worker_name, rate: workerRateFor(workers, row), count: 0, mins: 0, cents: 0 };
+      }
+      const g = groups[key];
+      g.count += 1;
+      const mins = shiftMinutes(row);
+      g.mins += mins;
+      if (g.rate != null) {
+        const c = payCents(mins, g.rate);
+        g.cents += c;
+        grand += c;
+      }
+    });
+
+    const list = Object.values(groups);
+    if (!list.length && !flags.length) return lines;
+    lines.push('💵 Payroll - unpaid shifts');
+    list.forEach(g => {
+      lines.push('  • ' + tgSafe(g.name) + ' - ' + g.count + ' shift' + (g.count === 1 ? '' : 's') +
+        ' · ' + fmtHm(g.mins) + (g.rate != null ? ' · ' + usd(g.cents) : ' · rate not set'));
+    });
+    if (list.length) lines.push('  Total owed: ' + usd(grand));
+    flags.forEach(f => lines.push(f));
+  } catch (e) {
+    console.error('payroll digest lines error:', e);
+  }
+  return lines;
 }
