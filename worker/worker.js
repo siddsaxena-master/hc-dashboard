@@ -528,7 +528,7 @@ async function handleParseBatch(request, env) {
 // Cron schedule (in wrangler.toml [triggers]):
 //   "0 12 * * *"   — daily 8am ET (12 UTC) — Weee box math digest
 //   "0 * * * *"    — hourly — reconfirmation scan + post-event debrief scan + intake nags
-//   "*/5 * * * *"  — every 5 minutes — intake approval cards + shift summaries
+//   "*/5 * * * *"  — every 5 minutes — intake approval cards + shift summaries + clock-in pings
 async function runScheduled(event, env, alsoNotify = true) {
   const cron = event.cron;
   try {
@@ -543,6 +543,10 @@ async function runScheduled(event, env, alsoNotify = true) {
       // and never throws (fully wrapped inside), so a payroll failure
       // can never break intake cards.
       await runShiftSummaryScan(env);
+      // Clock-in pings ride the same tick, AFTER summaries, and are
+      // also fully wrapped inside, so they can never break intake or
+      // summaries either.
+      await runClockInAlertScan(env);
     }
   } catch (e) {
     console.error('runScheduled error:', e);
@@ -1831,6 +1835,9 @@ function etTimeStr(iso) {  // e.g. "3:47 PM" in Eastern time
 function etDayStr(iso) {   // e.g. "Thu, Jul 23" in Eastern time
   return new Date(iso).toLocaleDateString('en-US', { timeZone: ET_ZONE, weekday: 'short', month: 'short', day: 'numeric' });
 }
+function nextEtDay(dayStr) { // 'YYYY-MM-DD' -> the next calendar day (noon-anchored, DST-safe)
+  return new Date(new Date(dayStr + 'T12:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
+}
 
 function shiftMinutes(row) {
   return Math.max(0, Math.floor((new Date(row.clock_out_at) - new Date(row.clock_in_at)) / 60000));
@@ -1929,6 +1936,57 @@ async function runShiftSummaryScan(env) {
   }
 }
 
+// Every 5 minutes, after the summary scan: one Telegram ping the first
+// time each shift is seen. No open/closed filter on purpose: a short
+// shift can clock out before the tick and still deserves its ping.
+// NEVER throws (own try/catch top to bottom). The 48h window mirrors
+// runShiftSummaryScan: on migration day every historical shift has
+// clockin_notified_at null and the window stops a flood.
+async function runClockInAlertScan(env) {
+  try {
+    const since = new Date(Date.now() - 48 * 3600000).toISOString();
+    const shifts = await fetchSb(env, 'shifts?select=id,worker_name,market,clock_in_at,clock_in_lat,clock_in_lng' +
+      '&clockin_notified_at=is.null' +
+      '&clock_in_at=gte.' + since +
+      '&order=clock_in_at.asc&limit=10');
+    if (!shifts || !shifts.length) return;
+
+    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+
+    for (const row of shifts) {
+      // Each shift wrapped on its own so one bad row never kills the batch.
+      try {
+        // CLAIM FIRST, same guarded PATCH as the summary scan: stamp
+        // clockin_notified_at only where it is STILL null and proceed
+        // only if the row comes back. A concurrent invocation loses
+        // the race cleanly and skips the row.
+        const claim = await fetch(env.SUPABASE_URL + '/rest/v1/shifts' +
+          '?id=eq.' + row.id + '&clockin_notified_at=is.null', {
+          method: 'PATCH',
+          headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+          body: JSON.stringify({ clockin_notified_at: new Date().toISOString() }),
+        });
+        const claimed = claim.ok ? await claim.json() : null;
+        if (!Array.isArray(claimed) || !claimed.length) continue;
+
+        let text = '🟢 ' + row.worker_name + ' clocked in - ' +
+          etTimeStr(row.clock_in_at) + ' ET (' + (row.market || 'ny').toUpperCase() + ')';
+        if (row.clock_in_lat != null && row.clock_in_lng != null) {
+          text += '\nhttps://www.google.com/maps/search/?api=1&query=' + row.clock_in_lat + ',' + row.clock_in_lng;
+        }
+        // Plain mode: worker names must never break Telegram Markdown.
+        for (const cid of chatIds) {
+          await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
+        }
+      } catch (e) {
+        console.error('clock-in alert failed on ' + (row && row.id) + ':', e);
+      }
+    }
+  } catch (e) {
+    console.error('runClockInAlertScan error:', e);
+  }
+}
+
 async function buildShiftSummaryText(env, row, workers) {
   const mins = shiftMinutes(row);
   const rate = workerRateFor(workers, row);
@@ -1974,14 +2032,39 @@ async function buildShiftSummaryText(env, row, workers) {
     lines.push('Total: ' + fmtBoxes(coco) + ' boxes (' + coco + ' coconuts)');
   }
 
+  // PREP: coconuts are processed and branded the day BEFORE delivery,
+  // so this shift also worked on TOMORROW's confirmed orders. The
+  // stage list is deliberately shorter than the ship list: an order
+  // delivering tomorrow cannot be fulfilled or complete yet. Same
+  // fake-noon UTC-day window convention as the ship query above.
+  const prepDay = nextEtDay(day);
+  const prep = await fetchSb(env, 'orders?select=client_name,venue,coconuts_qty,stage,market' +
+    '&market=eq.' + encodeURIComponent(market) +
+    '&stage=in.(invoiced,deposit_paid,paid_full)' +
+    '&delivery_at_utc=gte.' + prepDay + 'T00:00:00Z' +
+    '&delivery_at_utc=lte.' + prepDay + 'T23:59:59Z') || [];
+  const prepCoco = prep.reduce((s, o) => s + (o.coconuts_qty || 0), 0);
+  if (prep.length) {
+    lines.push('Prepping for tomorrow (' + prepDay + '):');
+    prep.forEach(o => {
+      lines.push('· ' + (o.client_name || '?') + (o.venue ? ' @ ' + o.venue : '') +
+        ' - ' + fmtBoxes(o.coconuts_qty || 0) + ' boxes (' + (o.coconuts_qty || 0) + ' coconuts)');
+    });
+    lines.push('Prep total: ' + fmtBoxes(prepCoco) + ' boxes (' + prepCoco + ' coconuts)');
+  }
+
+  // Boxes this shift TOUCHED = shipped today + prepped for tomorrow.
+  // This is the denominator for every per-box labor number below.
+  const touched = coco + prepCoco;
+
   if (rate == null) {
     lines.push('Labor: ' + fmtHm(mins) + ' - hourly rate not set for ' + row.worker_name +
       '. Payroll will not count this shift until hourly_rate_cents is set in field_workers.');
   } else {
     const cents = payCents(mins, rate);
     lines.push('Labor: ' + fmtHm(mins) + ' at ' + usd(rate) + '/hr = ' + usd(cents));
-    if (coco > 0) {
-      lines.push('Cost per box: ' + usd(Math.round(cents / (coco / 9))));
+    if (touched > 0) {
+      lines.push('Cost per box touched: ' + usd(Math.round(cents / (touched / 9))));
     }
   }
 
@@ -1994,7 +2077,7 @@ async function buildShiftSummaryText(env, row, workers) {
     '&clock_in_at=gte.' + new Date(new Date(row.clock_in_at).getTime() - 36 * 3600000).toISOString()) || [];
   const sameDay = nearby.filter(x => etDateStr(x.clock_in_at) === day);
   const distinct = new Set(sameDay.map(x => (x.worker_email || x.worker_name || '').toLowerCase()));
-  if (distinct.size > 1 && coco > 0) {
+  if (distinct.size > 1 && touched > 0) {
     let teamCents = 0;
     const unrated = [];
     sameDay.forEach(x => {
@@ -2002,7 +2085,7 @@ async function buildShiftSummaryText(env, row, workers) {
       if (r2 == null) { unrated.push(x.worker_name); return; }
       teamCents += payCents(shiftMinutes(x), r2);
     });
-    lines.push('Day labor per box, all workers: ' + usd(Math.round(teamCents / (coco / 9))) +
+    lines.push('Day labor per box, all workers: ' + usd(Math.round(teamCents / (touched / 9))) +
       (unrated.length ? ' (excludes ' + [...new Set(unrated)].join(', ') + ', rate not set)' : ''));
   }
 
