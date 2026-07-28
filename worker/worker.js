@@ -1927,6 +1927,22 @@ async function runShiftSummaryScan(env) {
         for (const cid of chatIds) {
           await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
         }
+        // ADDITIONALLY a short lock-screen banner (the long summary
+        // stays on Telegram). Belt and suspenders around a helper that
+        // already never throws: a push failure must never break the
+        // summary that just went out.
+        try {
+          if (hasApns(env)) {
+            const mins = shiftMinutes(row);
+            const rate = workerRateFor(workers, row);
+            const pushBody = rate == null
+              ? fmtHm(mins) + ' on shift'
+              : fmtHm(mins) + ' on shift - ' + usd(payCents(mins, rate));
+            await sendPushToOwners(env, row.worker_name + ' clocked out', pushBody);
+          }
+        } catch (e) {
+          console.error('clock-out push failed on ' + (row && row.id) + ':', e);
+        }
       } catch (e) {
         console.error('shift summary failed on ' + (row && row.id) + ':', e);
       }
@@ -1969,14 +1985,26 @@ async function runClockInAlertScan(env) {
         const claimed = claim.ok ? await claim.json() : null;
         if (!Array.isArray(claimed) || !claimed.length) continue;
 
-        let text = '🟢 ' + row.worker_name + ' clocked in - ' +
-          etTimeStr(row.clock_in_at) + ' ET (' + (row.market || 'ny').toUpperCase() + ')';
-        if (row.clock_in_lat != null && row.clock_in_lng != null) {
-          text += '\nhttps://www.google.com/maps/search/?api=1&query=' + row.clock_in_lat + ',' + row.clock_in_lng;
+        // Native push first when APNs is configured; the Telegram ping
+        // only fires when NO device got the banner (secrets missing,
+        // no registered owner phone, or Apple rejected everything).
+        // sendPushToOwners never throws and returns the delivered count.
+        let pushed = 0;
+        if (hasApns(env)) {
+          pushed = await sendPushToOwners(env,
+            '🟢 ' + row.worker_name + ' clocked in',
+            etTimeStr(row.clock_in_at) + ' ET - ' + (row.market || 'ny').toUpperCase());
         }
-        // Plain mode: worker names must never break Telegram Markdown.
-        for (const cid of chatIds) {
-          await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
+        if (pushed === 0) {
+          let text = '🟢 ' + row.worker_name + ' clocked in - ' +
+            etTimeStr(row.clock_in_at) + ' ET (' + (row.market || 'ny').toUpperCase() + ')';
+          if (row.clock_in_lat != null && row.clock_in_lng != null) {
+            text += '\nhttps://www.google.com/maps/search/?api=1&query=' + row.clock_in_lat + ',' + row.clock_in_lng;
+          }
+          // Plain mode: worker names must never break Telegram Markdown.
+          for (const cid of chatIds) {
+            await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
+          }
         }
       } catch (e) {
         console.error('clock-in alert failed on ' + (row && row.id) + ':', e);
@@ -2165,4 +2193,106 @@ async function buildPayrollDigestLines(env) {
     console.error('payroll digest lines error:', e);
   }
   return lines;
+}
+
+// ── APNs push to owner phones ────────────────────────────────────────
+// Native lock-screen banners for the HC Field app, sent straight to
+// Apple (no Expo push service). Three Cloudflare secrets gate the whole
+// feature: APNS_AUTH_KEY (the .p8 file's full text), APNS_KEY_ID, and
+// APPLE_TEAM_ID. Until all three exist, hasApns() is false and every
+// caller silently keeps its Telegram behavior. NOTHING in here throws.
+
+function hasApns(env) {
+  return Boolean(env.APNS_AUTH_KEY && env.APNS_KEY_ID && env.APPLE_TEAM_ID);
+}
+
+// base64url = base64 with +/ swapped for -_ and the trailing = padding
+// stripped. JWTs require it; plain btoa output is NOT valid.
+function b64url(bytes) {
+  const arr = new Uint8Array(bytes);
+  let s = '';
+  for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// One JWT reused for up to 45 minutes (module-global cache, best effort
+// across cron ticks - a fresh isolate just signs a new one). Apple
+// accepts tokens up to 60 minutes old and throttles keys that mint new
+// tokens too often (TooManyProviderTokenUpdates), so do not sign per
+// push and do not shorten this window.
+let apnsJwtCache = null;
+
+async function apnsJwt(env) {
+  const now = Date.now();
+  if (apnsJwtCache && now - apnsJwtCache.at < 45 * 60000) return apnsJwtCache.jwt;
+  // The secret holds the .p8 file verbatim. Strip the PEM armor lines
+  // and ALL whitespace (including Windows \r) to get pure base64 DER.
+  const pem = env.APNS_AUTH_KEY
+    .replace(/-----BEGIN PRIVATE KEY-----/g, '')
+    .replace(/-----END PRIVATE KEY-----/g, '')
+    .replace(/\s/g, '');
+  const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey(
+    'pkcs8', der.buffer, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const enc = new TextEncoder();
+  const head = b64url(enc.encode(JSON.stringify({ alg: 'ES256', kid: env.APNS_KEY_ID })));
+  const claims = b64url(enc.encode(JSON.stringify({ iss: env.APPLE_TEAM_ID, iat: Math.floor(now / 1000) })));
+  // WebCrypto ECDSA already returns the raw 64-byte r||s signature JWTs
+  // want (JOSE format). Do NOT convert to DER.
+  const sig = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(head + '.' + claims));
+  const jwt = head + '.' + claims + '.' + b64url(sig);
+  apnsJwtCache = { jwt, at: now };
+  return jwt;
+}
+
+// Push one banner to every registered OWNER phone. Returns how many
+// devices got a 200 from Apple; 0 on any failure or when APNs is not
+// configured, so callers can fall back to Telegram.
+async function sendPushToOwners(env, title, body) {
+  try {
+    if (!hasApns(env)) return 0;
+    const owners = await fetchSb(env, 'field_workers?role=eq.owner&select=email') || [];
+    const emails = owners.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
+    if (!emails.length) return 0;
+    const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
+    const tokens = await fetchSb(env, 'push_tokens?select=email,apns_token&email=in.(' + inList + ')') || [];
+    if (!tokens.length) return 0;
+
+    const jwt = await apnsJwt(env);
+    let sent = 0;
+    for (const t of tokens) {
+      // Per-device try/catch: one dead token never blocks the rest.
+      try {
+        const resp = await fetch('https://api.push.apple.com/3/device/' + t.apns_token, {
+          method: 'POST',
+          headers: {
+            'authorization': 'bearer ' + jwt,
+            'apns-topic': 'com.hamptonscoconuts.field',
+            'apns-push-type': 'alert',
+            'apns-priority': '10',
+          },
+          body: JSON.stringify({ aps: { alert: { title: title, body: body }, sound: 'default' } }),
+        });
+        if (resp.ok) { sent += 1; continue; }
+        let reason = '';
+        try { reason = ((await resp.json()) || {}).reason || ''; } catch {}
+        console.error('apns send failed:', resp.status, reason, 'for', t.email);
+        // 410 / BadDeviceToken / Unregistered = this phone is gone
+        // (app deleted, token rotated). Drop the row; the app re-upserts
+        // a fresh token on next login.
+        if (resp.status === 410 || reason === 'BadDeviceToken' || reason === 'Unregistered') {
+          await fetch(env.SUPABASE_URL + '/rest/v1/push_tokens?apns_token=eq.' + encodeURIComponent(t.apns_token), {
+            method: 'DELETE', headers: sbHeaders(env),
+          });
+        }
+      } catch (e) {
+        console.error('apns send exception:', e);
+      }
+    }
+    return sent;
+  } catch (e) {
+    console.error('sendPushToOwners error:', e);
+    return 0;
+  }
 }
