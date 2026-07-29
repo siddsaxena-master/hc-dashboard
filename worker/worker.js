@@ -2042,7 +2042,7 @@ async function buildShiftSummaryText(env, row, workers) {
   // window is CORRECT here, not a bug: order dates are stored as the
   // local calendar date with a fake T12:00:00Z (dashboard convention),
   // and this mirrors App.js loadOrders exactly.
-  const orders = await fetchSb(env, 'orders?select=client_name,venue,coconuts_qty,stage,market' +
+  const orders = await fetchSb(env, 'orders?select=client_name,venue,coconuts_qty,stage,market,total_cents' +
     '&market=eq.' + encodeURIComponent(market) +
     '&stage=in.(invoiced,deposit_paid,paid_full,fulfilled,complete)' +
     '&delivery_at_utc=gte.' + day + 'T00:00:00Z' +
@@ -2132,6 +2132,55 @@ async function buildShiftSummaryText(env, row, workers) {
     const unpaidCents = unpaid.reduce((s, x) => s + payCents(shiftMinutes(x), rate), 0);
     lines.push('Unpaid total for ' + row.worker_name + ': ' + usd(unpaidCents) +
       ' across ' + unpaid.length + ' shift' + (unpaid.length === 1 ? '' : 's'));
+  }
+
+  // ── Day P&L for this shift's ET day + market ──────────────────────
+  // SHARED DEFINITION with the app's owner Home card (App.js
+  // buildDayPnl) - the two MUST stay rule-for-rule identical:
+  //   revenue  = sum of total_cents over the confirmed ship list above
+  //              (stage in invoiced/deposit_paid/paid_full/fulfilled/
+  //              complete; cancelled excluded - a kept deposit belongs
+  //              to lifetime "Revenue collected", never to a day P&L)
+  //   labor    = payCents over ALL closed shifts this ET day + market
+  //              (sameDay, fetched above), every worker including this
+  //              one; unrated workers excluded and named. Open shifts
+  //              are never counted here (no clock-out, no pay yet);
+  //              the app card shows them "so far" for display only.
+  //   coconuts = ship-day coconuts x app_config.coconut_cost_cents
+  //              (no row / bad value = not set)
+  //   profit   = revenue - labor - coconuts
+  // Built in its own buffer inside its own try/catch: any failure
+  // drops ONLY this block, never the summary above it.
+  try {
+    const p = [];
+    const revenue = orders.reduce((s, o) => s + (o.total_cents || 0), 0);
+    p.push('Day P&L (' + day + ', ' + market.toUpperCase() + '):');
+    p.push('Revenue: ' + usd(revenue) + ' across ' + orders.length +
+      ' order' + (orders.length === 1 ? '' : 's'));
+
+    let laborCents = 0;
+    const noRate = [];
+    sameDay.forEach(x => {
+      const r2 = workerRateFor(workers, x);
+      if (r2 == null) { noRate.push(x.worker_name); return; }
+      laborCents += payCents(shiftMinutes(x), r2);
+    });
+    p.push('Labor: ' + usd(laborCents) +
+      (noRate.length ? ' (excludes ' + [...new Set(noRate)].join(', ') + ', rate not set)' : ''));
+
+    const cfg = await fetchSb(env, 'app_config?select=value&key=eq.coconut_cost_cents&limit=1');
+    const unit = (cfg && cfg.length) ? parseInt(cfg[0].value, 10) : NaN;
+    if (Number.isFinite(unit) && unit >= 0) {
+      const cogs = coco * unit;
+      p.push('Coconuts: ' + usd(cogs) + ' (' + coco + ' at ' + usd(unit) + ')');
+      p.push('Profit: ' + usd(revenue - laborCents - cogs));
+    } else {
+      p.push('Coconuts: cost not set');
+      p.push('Profit before coconut cost: ' + usd(revenue - laborCents));
+    }
+    lines.push(...p);
+  } catch (e) {
+    console.error('day p&l block failed on ' + (row && row.id) + ':', e);
   }
 
   return lines.join('\n');
