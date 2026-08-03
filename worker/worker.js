@@ -528,7 +528,7 @@ async function handleParseBatch(request, env) {
 // Cron schedule (in wrangler.toml [triggers]):
 //   "0 12 * * *"   — daily 8am ET (12 UTC) — Weee box math digest
 //   "0 * * * *"    — hourly — reconfirmation scan + post-event debrief scan + intake nags
-//   "*/5 * * * *"  — every 5 minutes — intake approval cards + shift summaries + clock-in pings
+//   "*/5 * * * *"  — every 5 minutes — intake approval cards + shift summaries + clock-in pings + stillness watch
 async function runScheduled(event, env, alsoNotify = true) {
   const cron = event.cron;
   try {
@@ -547,6 +547,9 @@ async function runScheduled(event, env, alsoNotify = true) {
       // also fully wrapped inside, so they can never break intake or
       // summaries either.
       await runClockInAlertScan(env);
+      // Stillness watch rides the same tick, LAST, and is also fully
+      // wrapped inside, so it can never break the three scans above it.
+      await runShiftStatusScan(env);
     }
   } catch (e) {
     console.error('runScheduled error:', e);
@@ -2012,6 +2015,106 @@ async function runClockInAlertScan(env) {
     }
   } catch (e) {
     console.error('runClockInAlertScan error:', e);
+  }
+}
+
+// ── stillness watch ──────────────────────────────────────────────────
+// PARITY: these constants and the classification rules are duplicated
+// in hc-field-app/App.js (shiftStatusOf + StatusChip). Change both or
+// the app's chip and the owner alert will disagree.
+const GARAGE_LAT = 40.586659;   // 'NJ Garage', 55 Cambridge Dr, Colonia NJ (census-geocoded)
+const GARAGE_LNG = -74.323824;
+const GARAGE_RADIUS_M = 150;    // within this = at the garage, never alert
+const STOP_ALERT_MIN = 15;      // still this long while enroute = STOPPED
+
+// Straight-line meters between two lat/lng points (haversine).
+function distMeters(lat1, lng1, lat2, lng2) {
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return 12742000 * Math.asin(Math.sqrt(a)); // 2 x Earth radius in meters
+}
+
+// Every 5 minutes, after the clock-in scan: warn the owner when an
+// on-shift worker has been still 15+ minutes while enroute.
+// Stillness age = minutes since the NEWEST shift_locations point: iOS
+// only emits a point on ~150m of movement, so a fresh point means
+// moving and a stale one means parked (or the phone died — the alert
+// text owns up to that). Zero-point shifts fall back to the clock-in
+// stamp. AT_GARAGE (within GARAGE_RADIUS_M) and MOVING never alert.
+// Stateless one-shot windows, the intake-nag idea scaled to the 5-min
+// tick: alert only when the age sits in [15,21) or [45,51) minutes.
+// Each window is one tick wide plus a minute of cron-jitter slack, so
+// a stop alerts once at ~15 and once at ~45 with nothing stored, and a
+// long-stale shift discovered after a deploy (age already 90+) never
+// storms. NEVER throws (own try/catch top to bottom).
+async function runShiftStatusScan(env) {
+  try {
+    const since = new Date(Date.now() - 24 * 3600000).toISOString();
+    const shifts = await fetchSb(env, 'shifts?select=id,worker_name,market,clock_in_at,clock_in_lat,clock_in_lng' +
+      '&clock_out_at=is.null' +
+      '&clock_in_at=gte.' + since +
+      '&order=clock_in_at.asc&limit=10');
+    if (!shifts || !shifts.length) return;
+
+    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+
+    for (const row of shifts) {
+      // Each shift wrapped on its own so one bad row never kills the batch.
+      try {
+        const pts = await fetchSb(env, 'shift_locations?select=at,lat,lng' +
+          '&shift_id=eq.' + row.id + '&order=at.desc&limit=1');
+        if (!pts) continue; // read failed — retry next tick, never classify from a stale stamp
+        const p = pts.length ? pts[0]
+          : { at: row.clock_in_at, lat: row.clock_in_lat, lng: row.clock_in_lng };
+        const atMs = new Date(p.at).getTime();
+        if (!Number.isFinite(atMs)) continue;
+        const ageMin = (Date.now() - atMs) / 60000;
+
+        // AT_GARAGE: parked at base is normal. (Miami has no garage, so
+        // Miami shifts only ever classify MOVING or STOPPED.)
+        if (p.lat != null && p.lng != null &&
+            distMeters(p.lat, p.lng, GARAGE_LAT, GARAGE_LNG) <= GARAGE_RADIUS_M) continue;
+        // MOVING: the point is fresh.
+        if (ageMin < STOP_ALERT_MIN) continue;
+
+        // STOPPED: alert only inside a window.
+        const inWindow =
+          (ageMin >= STOP_ALERT_MIN && ageMin < STOP_ALERT_MIN + 6) ||
+          (ageMin >= 45 && ageMin < 51);
+        if (!inWindow) continue;
+
+        const mins = Math.floor(ageMin);
+        const mkt = (row.market || 'ny').toUpperCase();
+        let text = '⚠️ ' + row.worker_name + ' has not moved for ' + mins +
+          ' min while enroute (' + mkt + ').';
+        if (p.lat != null && p.lng != null) {
+          text += '\nLast seen: https://www.google.com/maps/search/?api=1&query=' + p.lat + ',' + p.lng;
+        }
+        text += '\n(or their phone stopped reporting GPS)';
+
+        // Native push first when APNs is configured; Telegram only when
+        // NO device got the banner. Mirrors runClockInAlertScan exactly
+        // so push + Telegram can never double-send.
+        let pushed = 0;
+        if (hasApns(env)) {
+          pushed = await sendPushToOwners(env,
+            '⚠️ ' + row.worker_name + ' stopped ' + mins + ' min',
+            'Not moving while enroute (' + mkt + '). Open the live map.');
+        }
+        if (pushed === 0) {
+          // Plain mode: worker names must never break Telegram Markdown.
+          for (const cid of chatIds) {
+            await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
+          }
+        }
+      } catch (e) {
+        console.error('shift status alert failed on ' + (row && row.id) + ':', e);
+      }
+    }
+  } catch (e) {
+    console.error('runShiftStatusScan error:', e);
   }
 }
 
