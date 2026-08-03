@@ -2105,6 +2105,24 @@ async function buildShiftSummaryText(env, row, workers) {
     '&clock_in_at=gte.' + new Date(new Date(row.clock_in_at).getTime() - 36 * 3600000).toISOString()) || [];
   const sameDay = nearby.filter(x => etDateStr(x.clock_in_at) === day);
   const distinct = new Set(sameDay.map(x => (x.worker_email || x.worker_name || '').toLowerCase()));
+  // Pace: boxes per hour. SHARED DEFINITION with the app (App.js paceInfoFor)
+  // - the two MUST stay rule-for-rule identical: boxes = touched / 9 exact,
+  // hours = CLOSED-shift minutes / 60, day anchored on clock-in. Solo day uses
+  // this shift's own minutes; a team day (2+ distinct closed-shift workers,
+  // same ET day + market) uses ALL their summed minutes. Omitted when the day
+  // had no boxes or no minutes.
+  if (touched > 0) {
+    if (distinct.size > 1) {
+      const teamMins = sameDay.reduce((s, x) => s + shiftMinutes(x), 0);
+      if (teamMins > 0) {
+        lines.push('Team pace: ' + (touched / 9 / (teamMins / 60)).toFixed(1) +
+          ' boxes/hr across ' + distinct.size + ' workers');
+      }
+    } else if (mins > 0) {
+      lines.push('Pace: ' + (touched / 9 / (mins / 60)).toFixed(1) +
+        ' boxes/hr (' + fmtHm(mins) + ' for ' + fmtBoxes(touched) + ' boxes)');
+    }
+  }
   if (distinct.size > 1 && touched > 0) {
     let teamCents = 0;
     const unrated = [];
