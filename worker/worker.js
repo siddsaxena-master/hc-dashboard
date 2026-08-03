@@ -2576,7 +2576,8 @@ async function sendLiveActivityPush(env, token, event, contentState, opts = {}) 
 }
 
 async function laOwnerEmails(env) {
-  const owners = await fetchSb(env, 'field_workers?role=eq.owner&select=email') || [];
+  const owners = await fetchSb(env, 'field_workers?role=eq.owner&select=email');
+  if (owners === null) return null; // read FAILED — callers must not treat this as "no owners"
   return owners.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
 }
 
@@ -2585,11 +2586,13 @@ async function laOwnerEmails(env) {
 // sendPushToOwners' role=owner filter).
 async function laTokensForShift(env, shiftId) {
   const emails = await laOwnerEmails(env);
+  if (emails === null) return null; // propagate the failed read
   if (!emails.length) return [];
   const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
+  // null = read FAILED (distinct from [] = a successful read found no tokens)
   return await fetchSb(env,
     'live_activity_tokens?select=email,token&token_type=eq.activity_update&shift_id=eq.' +
-    encodeURIComponent(shiftId) + '&email=in.(' + inList + ')') || [];
+    encodeURIComponent(shiftId) + '&email=in.(' + inList + ')');
 }
 
 // event:start to every owner push_to_start token; exactly-once is inherited
@@ -2598,7 +2601,7 @@ async function startShiftLiveActivities(env, row) {
   try {
     if (!hasApns(env)) return;
     const emails = await laOwnerEmails(env);
-    if (!emails.length) return;
+    if (!emails || !emails.length) return;
     const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
     const tokens = await fetchSb(env,
       'live_activity_tokens?select=email,token&token_type=eq.push_to_start&email=in.(' + inList + ')') || [];
@@ -2634,7 +2637,7 @@ async function updateShiftLiveActivity(env, shiftId, status, minutes) {
     const key = status + ':' + minutes;
     if (laLastSent.get(shiftId) === key) return;
     const tokens = await laTokensForShift(env, shiftId);
-    if (!tokens.length) return;
+    if (!tokens || !tokens.length) return; // null (read failed) or none: do not mark sent, retry next tick
     let sentAny = false;
     for (const t of tokens) {
       const r = await sendLiveActivityPush(env, t.token, 'update',
@@ -2658,6 +2661,10 @@ async function endShiftLiveActivity(env, row, boxesLine, totalMins) {
   try {
     if (!hasApns(env)) return;
     const tokens = await laTokensForShift(env, row.id);
+    // null means the Supabase READ failed, not "no tokens". Deleting on that
+    // would strand the owner's card forever (the summary claim is spent, so
+    // nothing retries). Keep the rows and laLastSent; bail out entirely.
+    if (tokens === null) return;
     let sentAny = false;
     for (const t of tokens) {
       const r = await sendLiveActivityPush(env, t.token, 'end',
