@@ -426,15 +426,24 @@ async function sendTelegram(token, chatId, text) {
 // Same as sendTelegram but with NO parse mode. Use for anything that
 // includes customer-controlled text (like intake from-addresses), where
 // a stray _ or * would make Telegram reject the message as bad Markdown.
+// Returns true only when Telegram accepted the message, so callers that
+// claim-then-send (the shift scans) can un-claim on total delivery
+// failure instead of losing the notification forever. Still never throws.
 async function sendTelegramPlain(token, chatId, text) {
   try {
-    await fetch(`${TG_API}${token}/sendMessage`, {
+    const resp = await fetch(`${TG_API}${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text: text }),
     });
+    if (!resp.ok) {
+      console.error('Telegram send error:', resp.status, await resp.text());
+      return false;
+    }
+    return true;
   } catch (e) {
     console.error('Telegram send error:', e);
+    return false;
   }
 }
 
@@ -535,8 +544,18 @@ async function runScheduled(event, env, alsoNotify = true) {
     if (cron === '0 12 * * *') {
       await runDailyDigest(env);
     } else if (cron === '0 * * * *') {
-      await runReconfirmationScan(env);
-      await runDebriefScan(env);
+      // Each hourly scan is throw-isolated, mirroring the */5 chain
+      // below: runReconfirmationScan's unwrapped fetches can throw, and
+      // without this a single failure skips runDebriefScan, whose
+      // one-hour lookback window means a skipped tick is a debrief
+      // permanently lost. The first error is rethrown AFTER both scans
+      // have run so the outer catch still alerts Sidd over Telegram.
+      let hourlyErr = null;
+      try { await runReconfirmationScan(env); }
+      catch (e) { hourlyErr = e; console.error('runReconfirmationScan error:', e); }
+      try { await runDebriefScan(env); }
+      catch (e) { if (!hourlyErr) hourlyErr = e; console.error('runDebriefScan error:', e); }
+      if (hourlyErr) throw hourlyErr;
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
       // Shift summaries ride the same 5-minute tick. Runs AFTER intake
@@ -1891,6 +1910,23 @@ function workerRateFor(workers, row) {
   return (w && w.hourly_rate_cents != null) ? w.hourly_rate_cents : null;
 }
 
+// Give a claimed-but-undelivered shift row back to the next tick
+// (2026-08-03 audit): PATCH the claim column back to null, guarded on
+// OUR exact stamp value so a claim some other invocation has since
+// taken is never cleared. Never throws.
+async function unclaimShiftStamp(env, shiftId, column, stamp) {
+  try {
+    await fetch(env.SUPABASE_URL + '/rest/v1/shifts' +
+      '?id=eq.' + shiftId + '&' + column + '=eq.' + encodeURIComponent(stamp), {
+      method: 'PATCH',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ [column]: null }),
+    });
+  } catch (e) {
+    console.error('un-claim ' + column + ' failed on shift ' + shiftId + ':', e);
+  }
+}
+
 // Every 5 minutes, after the intake scan: one Telegram summary per
 // freshly closed shift. NEVER throws (own try/catch top to bottom).
 // The 48h window is deliberate: on migration day every historical
@@ -1905,7 +1941,12 @@ async function runShiftSummaryScan(env) {
       '&order=clock_out_at.asc&limit=10');
     if (!shifts || !shifts.length) return;
 
-    const workers = await fetchSb(env, 'field_workers?select=email,name,hourly_rate_cents') || [];
+    const workers = await fetchSb(env, 'field_workers?select=email,name,hourly_rate_cents');
+    // null means the read FAILED (an empty table would be []). Bail out
+    // for this tick instead of coercing to "no rates set": that would
+    // claim the rows and send wrong dollar figures that are never
+    // corrected. The rows simply retry next tick inside the 48h window.
+    if (!workers) return;
     const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
     for (const row of shifts) {
@@ -1915,40 +1956,64 @@ async function runShiftSummaryScan(env) {
         // stamp summary_sent_at only where it is STILL null, ask for the
         // row back, and proceed only if we got it. A concurrent
         // invocation loses this race cleanly and skips the row.
+        const claimStamp = new Date().toISOString();
         const claim = await fetch(env.SUPABASE_URL + '/rest/v1/shifts' +
           '?id=eq.' + row.id + '&summary_sent_at=is.null', {
           method: 'PATCH',
           headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
-          body: JSON.stringify({ summary_sent_at: new Date().toISOString() }),
+          body: JSON.stringify({ summary_sent_at: claimStamp }),
         });
         const claimed = claim.ok ? await claim.json() : null;
         if (!Array.isArray(claimed) || !claimed.length) continue;
 
-        const text = await buildShiftSummaryText(env, row, workers);
-        // Plain mode on purpose: worker/client/venue text must never be
-        // able to break Telegram Markdown.
-        for (const cid of chatIds) {
-          await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
-        }
-        // ADDITIONALLY a short lock-screen banner (the long summary
-        // stays on Telegram). Belt and suspenders around a helper that
-        // already never throws: a push failure must never break the
-        // summary that just went out.
+        // The claim alone must never lose the summary (2026-08-03
+        // audit): count what actually reaches Sidd, and if NOTHING does
+        // (every Telegram send failed, no push banner landed, or a throw
+        // got here first), the finally block un-claims the row so the
+        // next tick retries. Partial delivery keeps the claim: one
+        // delivered copy is enough, and a rare duplicate beats a lost
+        // payroll summary.
+        let delivered = 0;
         try {
-          if (hasApns(env)) {
-            const mins = shiftMinutes(row);
-            const rate = workerRateFor(workers, row);
-            const pushBody = rate == null
-              ? fmtHm(mins) + ' on shift'
-              : fmtHm(mins) + ' on shift - ' + usd(payCents(mins, rate));
-            await sendPushToOwners(env, row.worker_name + ' clocked out', pushBody);
-            // live activity: freeze the card with summary numbers, then
-            // clean up tokens (exactly-once via the summary claim above)
-            const laLine = String(pushBody || '').split('\n')[0]; // one-line stat string
-            await endShiftLiveActivity(env, row, laLine, Math.max(0, Math.round(mins)));
+          const text = await buildShiftSummaryText(env, row, workers);
+          // Plain mode on purpose: worker/client/venue text must never be
+          // able to break Telegram Markdown.
+          for (const cid of chatIds) {
+            if (await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text)) delivered++;
           }
-        } catch (e) {
-          console.error('clock-out push failed on ' + (row && row.id) + ':', e);
+          // ADDITIONALLY a short lock-screen banner (the long summary
+          // stays on Telegram). Belt and suspenders around a helper that
+          // already never throws: a push failure must never break the
+          // summary that just went out.
+          try {
+            if (hasApns(env)) {
+              const mins = shiftMinutes(row);
+              const rate = workerRateFor(workers, row);
+              const pushBody = rate == null
+                ? fmtHm(mins) + ' on shift'
+                : fmtHm(mins) + ' on shift - ' + usd(payCents(mins, rate));
+              // A landed banner counts as delivered: it carries the hours
+              // and pay, and it must stop the un-claim below from
+              // re-sending every tick of a long Telegram outage.
+              delivered += await sendPushToOwners(env, row.worker_name + ' clocked out', pushBody);
+              // live activity: freeze the card with summary numbers, then
+              // clean up tokens. A total-delivery retry re-runs this,
+              // which is safe: it deletes token rows only after a
+              // delivered end, and a second run just finds them gone.
+              const laLine = String(pushBody || '').split('\n')[0]; // one-line stat string
+              await endShiftLiveActivity(env, row, laLine, Math.max(0, Math.round(mins)));
+            }
+          } catch (e) {
+            console.error('clock-out push failed on ' + (row && row.id) + ':', e);
+          }
+        } finally {
+          // Total delivery failure with at least one channel configured:
+          // give the row back so the next tick retries. With NO channel
+          // configured the claim stands, same as before this fix, so a
+          // bare install does not retry-loop forever.
+          if (!delivered && (chatIds.length || hasApns(env))) {
+            await unclaimShiftStamp(env, row.id, 'summary_sent_at', claimStamp);
+          }
         }
       } catch (e) {
         console.error('shift summary failed on ' + (row && row.id) + ':', e);
@@ -1983,45 +2048,63 @@ async function runClockInAlertScan(env) {
         // clockin_notified_at only where it is STILL null and proceed
         // only if the row comes back. A concurrent invocation loses
         // the race cleanly and skips the row.
+        const claimStamp = new Date().toISOString();
         const claim = await fetch(env.SUPABASE_URL + '/rest/v1/shifts' +
           '?id=eq.' + row.id + '&clockin_notified_at=is.null', {
           method: 'PATCH',
           headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
-          body: JSON.stringify({ clockin_notified_at: new Date().toISOString() }),
+          body: JSON.stringify({ clockin_notified_at: claimStamp }),
         });
         const claimed = claim.ok ? await claim.json() : null;
         if (!Array.isArray(claimed) || !claimed.length) continue;
 
-        // live activity: pin the shift card on owner lock screens
-        // (exactly-once via the claim above). claimed[0] is the FULL
-        // row (return=representation): skip the start when the shift
-        // already clocked out. The cron runs the summary (end) scan
-        // BEFORE this scan, so a shift that clocked in AND out inside
-        // one 5-minute gap has already spent its end claim; starting a
-        // card now would pin one that nothing can ever end.
-        if (!claimed[0].clock_out_at) {
-          await startShiftLiveActivities(env, row);
-        }
-
-        // Native push first when APNs is configured; the Telegram ping
-        // only fires when NO device got the banner (secrets missing,
-        // no registered owner phone, or Apple rejected everything).
-        // sendPushToOwners never throws and returns the delivered count.
-        let pushed = 0;
-        if (hasApns(env)) {
-          pushed = await sendPushToOwners(env,
-            '🟢 ' + row.worker_name + ' clocked in',
-            etTimeStr(row.clock_in_at) + ' ET - ' + (row.market || 'ny').toUpperCase());
-        }
-        if (pushed === 0) {
-          let text = '🟢 ' + row.worker_name + ' clocked in - ' +
-            etTimeStr(row.clock_in_at) + ' ET (' + (row.market || 'ny').toUpperCase() + ')';
-          if (row.clock_in_lat != null && row.clock_in_lng != null) {
-            text += '\nhttps://www.google.com/maps/search/?api=1&query=' + row.clock_in_lat + ',' + row.clock_in_lng;
+        // Same un-claim rule as the summary scan (2026-08-03 audit): if
+        // neither a push banner nor a Telegram ping lands, the finally
+        // block gives the row back so the next tick retries. A retry
+        // re-runs the live-activity start too - accepted: when every
+        // alert channel failed, the start push almost certainly failed
+        // with them, and a duplicate card beats a silent clock-in.
+        let delivered = 0;
+        try {
+          // live activity: pin the shift card on owner lock screens.
+          // claimed[0] is the FULL row (return=representation): skip the
+          // start when the shift already clocked out. The cron runs the
+          // summary (end) scan BEFORE this scan, so a shift that clocked
+          // in AND out inside one 5-minute gap has already spent its end
+          // claim; starting a card now would pin one that nothing can
+          // ever end.
+          if (!claimed[0].clock_out_at) {
+            await startShiftLiveActivities(env, row);
           }
-          // Plain mode: worker names must never break Telegram Markdown.
-          for (const cid of chatIds) {
-            await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
+
+          // Native push first when APNs is configured; the Telegram ping
+          // only fires when NO device got the banner (secrets missing,
+          // no registered owner phone, or Apple rejected everything).
+          // sendPushToOwners never throws and returns the delivered count.
+          let pushed = 0;
+          if (hasApns(env)) {
+            pushed = await sendPushToOwners(env,
+              '🟢 ' + row.worker_name + ' clocked in',
+              etTimeStr(row.clock_in_at) + ' ET - ' + (row.market || 'ny').toUpperCase());
+          }
+          delivered += pushed;
+          if (pushed === 0) {
+            let text = '🟢 ' + row.worker_name + ' clocked in - ' +
+              etTimeStr(row.clock_in_at) + ' ET (' + (row.market || 'ny').toUpperCase() + ')';
+            if (row.clock_in_lat != null && row.clock_in_lng != null) {
+              text += '\nhttps://www.google.com/maps/search/?api=1&query=' + row.clock_in_lat + ',' + row.clock_in_lng;
+            }
+            // Plain mode: worker names must never break Telegram Markdown.
+            for (const cid of chatIds) {
+              if (await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text)) delivered++;
+            }
+          }
+        } finally {
+          // Total delivery failure with at least one channel configured:
+          // give the row back so the next tick retries. With NO channel
+          // configured the claim stands, same as before this fix.
+          if (!delivered && (chatIds.length || hasApns(env))) {
+            await unclaimShiftStamp(env, row.id, 'clockin_notified_at', claimStamp);
           }
         }
       } catch (e) {
