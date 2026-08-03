@@ -1942,6 +1942,10 @@ async function runShiftSummaryScan(env) {
               ? fmtHm(mins) + ' on shift'
               : fmtHm(mins) + ' on shift - ' + usd(payCents(mins, rate));
             await sendPushToOwners(env, row.worker_name + ' clocked out', pushBody);
+            // live activity: freeze the card with summary numbers, then
+            // clean up tokens (exactly-once via the summary claim above)
+            const laLine = String(pushBody || '').split('\n')[0]; // one-line stat string
+            await endShiftLiveActivity(env, row, laLine, Math.max(0, Math.round(mins)));
           }
         } catch (e) {
           console.error('clock-out push failed on ' + (row && row.id) + ':', e);
@@ -1987,6 +1991,17 @@ async function runClockInAlertScan(env) {
         });
         const claimed = claim.ok ? await claim.json() : null;
         if (!Array.isArray(claimed) || !claimed.length) continue;
+
+        // live activity: pin the shift card on owner lock screens
+        // (exactly-once via the claim above). claimed[0] is the FULL
+        // row (return=representation): skip the start when the shift
+        // already clocked out. The cron runs the summary (end) scan
+        // BEFORE this scan, so a shift that clocked in AND out inside
+        // one 5-minute gap has already spent its end claim; starting a
+        // card now would pin one that nothing can ever end.
+        if (!claimed[0].clock_out_at) {
+          await startShiftLiveActivities(env, row);
+        }
 
         // Native push first when APNs is configured; the Telegram ping
         // only fires when NO device got the banner (secrets missing,
@@ -2071,11 +2086,30 @@ async function runShiftStatusScan(env) {
         const atMs = new Date(p.at).getTime();
         if (!Number.isFinite(atMs)) continue;
         const ageMin = (Date.now() - atMs) / 60000;
+        const atGarage = p.lat != null && p.lng != null &&
+          distMeters(p.lat, p.lng, GARAGE_LAT, GARAGE_LNG) <= GARAGE_RADIUS_M;
+
+        // live activity status line: runs for every classification; the
+        // continue guards below only gate ALERTS. Dedupe inside
+        // updateShiftLiveActivity means this pushes only when status or
+        // the 5-min stopped bucket changes.
+        try {
+          if (hasApns(env)) {
+            let laStatus = 'Enroute';
+            let laMins = 0;
+            if (atGarage) {
+              laStatus = 'At NJ Garage';
+            } else if (ageMin >= STOP_ALERT_MIN) {
+              laStatus = 'Stopped';
+              laMins = Math.floor(ageMin / 5) * 5; // bucket = what we render, "Stopped 15m", "Stopped 20m"...
+            }
+            await updateShiftLiveActivity(env, row.id, laStatus, laMins);
+          }
+        } catch (e) { console.error('la status hook:', e); }
 
         // AT_GARAGE: parked at base is normal. (Miami has no garage, so
         // Miami shifts only ever classify MOVING or STOPPED.)
-        if (p.lat != null && p.lng != null &&
-            distMeters(p.lat, p.lng, GARAGE_LAT, GARAGE_LNG) <= GARAGE_RADIUS_M) continue;
+        if (atGarage) continue;
         // MOVING: the point is fresh.
         if (ageMin < STOP_ALERT_MIN) continue;
 
@@ -2465,4 +2499,176 @@ async function sendPushToOwners(env, title, body) {
     console.error('sendPushToOwners error:', e);
     return 0;
   }
+}
+
+// ================= LIVE ACTIVITY (owner lock-screen shift card) =================
+// Topic per the Apple ActivityKit doc: MAIN app bundle id +
+// ".push-type.liveactivity" (NOT the widget's bundle id), with header
+// apns-push-type: liveactivity. Priority 5 does not count against the
+// update budget; 10 is immediate. TOPIC-KEY RISK: our .p8 is topic
+// restricted to com.hamptonscoconuts.field, and the doc says NOTHING
+// about whether a topic-restricted key covers the liveactivity
+// subtopic. First live send is the probe; on rejection we block LA
+// sends for 6h, tell the operator once over Telegram, and alert pushes
+// (separate topic string, same JWT) keep working untouched.
+const LA_TOPIC = 'com.hamptonscoconuts.field.push-type.liveactivity';
+let laLastSent = new Map();   // shiftId -> last pushed "status:minutes" (isolate memory; a recycle just re-sends one priority-5 update)
+let laBlockedUntil = 0;       // Apple rejected the liveactivity topic; skip until this time
+let laBlockedNotified = false;
+
+async function sendLiveActivityPush(env, token, event, contentState, opts = {}) {
+  try {
+    if (!hasApns(env)) return { ok: false, reason: 'no-apns' };
+    if (Date.now() < laBlockedUntil) return { ok: false, reason: 'topic-blocked' };
+    const jwt = await apnsJwt(env);
+    const aps = {
+      timestamp: Math.floor(Date.now() / 1000),
+      event: event,
+      'content-state': contentState,
+    };
+    if (event === 'start') {
+      // start requires attributes-type + attributes + alert (Apple doc)
+      aps['attributes-type'] = opts.attributesType || 'ShiftAttributes';
+      aps.attributes = opts.attributes || {};
+      aps.alert = opts.alert || { title: 'Shift started', body: '' };
+    }
+    if (event === 'end' && opts.dismissalDate) aps['dismissal-date'] = opts.dismissalDate;
+    if (opts.staleDate) aps['stale-date'] = opts.staleDate;
+    const resp = await fetch('https://api.push.apple.com/3/device/' + token, {
+      method: 'POST',
+      headers: {
+        'authorization': 'bearer ' + jwt,
+        'apns-topic': LA_TOPIC,
+        'apns-push-type': 'liveactivity',
+        'apns-priority': String(opts.priority || (event === 'update' ? 5 : 10)),
+      },
+      body: JSON.stringify({ aps: aps }),
+    });
+    if (resp.ok) return { ok: true, reason: '' };
+    let reason = '';
+    try { reason = ((await resp.json()) || {}).reason || ''; } catch {}
+    console.error('live activity send failed:', resp.status, reason, event);
+    if (reason === 'TopicDisallowed' || reason === 'InvalidProviderToken' || resp.status === 403) {
+      // topic-restricted key likely does not cover the liveactivity subtopic
+      laBlockedUntil = Date.now() + 6 * 3600000;
+      if (!laBlockedNotified) {
+        laBlockedNotified = true;
+        const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
+        for (const cid of chatIds) {
+          try {
+            await sendTelegramPlain(env.TG_BOT_TOKEN, cid,
+              'Live Activity pushes rejected by Apple (' + (reason || resp.status) + '). Alert pushes still work. The APNs key probably needs the liveactivity topic added, see the ops checklist.');
+          } catch {}
+        }
+      }
+    }
+    if (resp.status === 410 || reason === 'BadDeviceToken' || reason === 'Unregistered') {
+      // dead token: remove the row, the app rewrites on next launch
+      await fetch(env.SUPABASE_URL + '/rest/v1/live_activity_tokens?token=eq.' + encodeURIComponent(token), {
+        method: 'DELETE', headers: sbHeaders(env),
+      });
+    }
+    return { ok: false, status: resp.status, reason: reason };
+  } catch (e) {
+    console.error('live activity send exception:', e);
+    return { ok: false, reason: 'exception' };
+  }
+}
+
+async function laOwnerEmails(env) {
+  const owners = await fetchSb(env, 'field_workers?role=eq.owner&select=email') || [];
+  return owners.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
+}
+
+// Update tokens for one shift, filtered to owner emails so a rogue anon
+// insert with a random shift_id never receives pushes (same defense as
+// sendPushToOwners' role=owner filter).
+async function laTokensForShift(env, shiftId) {
+  const emails = await laOwnerEmails(env);
+  if (!emails.length) return [];
+  const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
+  return await fetchSb(env,
+    'live_activity_tokens?select=email,token&token_type=eq.activity_update&shift_id=eq.' +
+    encodeURIComponent(shiftId) + '&email=in.(' + inList + ')') || [];
+}
+
+// event:start to every owner push_to_start token; exactly-once is inherited
+// from the caller's claim-first PATCH, so this can never storm.
+async function startShiftLiveActivities(env, row) {
+  try {
+    if (!hasApns(env)) return;
+    const emails = await laOwnerEmails(env);
+    if (!emails.length) return;
+    const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
+    const tokens = await fetchSb(env,
+      'live_activity_tokens?select=email,token&token_type=eq.push_to_start&email=in.(' + inList + ')') || [];
+    if (!tokens.length) return;
+    // initial status from clock-in coords vs garage (distMeters + the
+    // stillness-watch constants above); the 5-min scan corrects it.
+    let status = 'At NJ Garage';
+    if (row.clock_in_lat != null && row.clock_in_lng != null &&
+        distMeters(row.clock_in_lat, row.clock_in_lng, GARAGE_LAT, GARAGE_LNG) > GARAGE_RADIUS_M) {
+      status = 'Enroute';
+    }
+    // normalize to millis+Z so the widget's ISO8601 parse always succeeds
+    const clockInISO = new Date(row.clock_in_at).toISOString();
+    const name = row.worker_name || 'Team';
+    for (const t of tokens) {
+      await sendLiveActivityPush(env, t.token, 'start',
+        { status: status, statusMinutes: 0 },
+        {
+          attributes: { workerName: name, clockInISO: clockInISO, shiftId: row.id },
+          alert: { title: name + ' is on shift', body: 'Shift card is live' },
+        });
+    }
+    laLastSent.set(row.id, status + ':0'); // seed dedupe so tick 1 does not re-push identical content
+  } catch (e) { console.error('startShiftLiveActivities error:', e); }
+}
+
+// event:update only when the RENDERED content changed (status or 5-min
+// stopped bucket). No tokens yet = do not mark sent, retry next tick.
+async function updateShiftLiveActivity(env, shiftId, status, minutes) {
+  try {
+    if (!hasApns(env)) return;
+    if (laLastSent.size > 200) laLastSent.clear(); // bound isolate memory
+    const key = status + ':' + minutes;
+    if (laLastSent.get(shiftId) === key) return;
+    const tokens = await laTokensForShift(env, shiftId);
+    if (!tokens.length) return;
+    let sentAny = false;
+    for (const t of tokens) {
+      const r = await sendLiveActivityPush(env, t.token, 'update',
+        { status: status, statusMinutes: minutes });
+      if (r.ok) sentAny = true;
+    }
+    if (sentAny) laLastSent.set(shiftId, key);
+  } catch (e) { console.error('updateShiftLiveActivity error:', e); }
+}
+
+// event:end with the summary line, then delete this shift's update-token
+// rows (service role; anon has no DELETE). Dismissal uses Apple's default
+// (card lingers up to 4h); pass opts.dismissalDate later if that annoys.
+// DELETE ONLY AFTER A DELIVERED END (or when there was nothing to send):
+// during a topic-blocked window, an Apple 5xx, or a network blip every
+// send fails, and deleting the rows then would leave the card unendable
+// forever (the summary claim is already spent, so nothing retries).
+// Keeping the rows lets the dead-token cleanup or the next isolate's
+// sends still reach the card.
+async function endShiftLiveActivity(env, row, boxesLine, totalMins) {
+  try {
+    if (!hasApns(env)) return;
+    const tokens = await laTokensForShift(env, row.id);
+    let sentAny = false;
+    for (const t of tokens) {
+      const r = await sendLiveActivityPush(env, t.token, 'end',
+        { status: 'Clocked out', statusMinutes: totalMins, boxesLine: boxesLine });
+      if (r.ok) sentAny = true;
+    }
+    if (sentAny || tokens.length === 0) {
+      await fetch(env.SUPABASE_URL +
+        '/rest/v1/live_activity_tokens?token_type=eq.activity_update&shift_id=eq.' +
+        encodeURIComponent(row.id), { method: 'DELETE', headers: sbHeaders(env) });
+    }
+    laLastSent.delete(row.id);
+  } catch (e) { console.error('endShiftLiveActivity error:', e); }
 }
