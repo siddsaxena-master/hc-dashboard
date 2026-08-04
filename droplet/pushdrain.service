@@ -1,0 +1,16 @@
+[Unit]
+Description=Hamptons Coconuts Push Queue Drainer (APNs + Telegram fallback)
+After=network.target
+
+[Service]
+Type=simple
+User=jarvis
+WorkingDirectory=/opt/jarvis-invoice-bot
+ExecStart=/opt/jarvis-invoice-bot/.venv/bin/python /opt/jarvis-invoice-bot/pushdrain.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

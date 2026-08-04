@@ -1927,6 +1927,20 @@ async function unclaimShiftStamp(env, shiftId, column, stamp) {
   }
 }
 
+// Apple App Review works the HC Field app with the appreview@ test
+// login (Cupertino, once Beijing), creating REAL shift rows that are
+// pure noise. Skip them in every owner-facing scan BEFORE the claim
+// PATCH, so their stamp columns stay null and the rows age out of each
+// scan's window untouched: no ping, no summary, no card, no stop
+// alert, nothing retries.
+// OPERATOR: before shipping, verify this address matches the demo
+// login in the App Store Connect review notes AND exists as a
+// field_workers row; a mismatch makes this exclusion a silent no-op.
+const APPREVIEW_EMAIL = 'appreview@hamptonscoconuts.com';
+function isAppReviewShift(row) {
+  return ((row && row.worker_email) || '').toLowerCase() === APPREVIEW_EMAIL;
+}
+
 // Every 5 minutes, after the intake scan: one Telegram summary per
 // freshly closed shift. NEVER throws (own try/catch top to bottom).
 // The 48h window is deliberate: on migration day every historical
@@ -1950,6 +1964,8 @@ async function runShiftSummaryScan(env) {
     const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
     for (const row of shifts) {
+      // Apple App Review noise: skip BEFORE the claim (see isAppReviewShift).
+      if (isAppReviewShift(row)) continue;
       // Each shift wrapped on its own so one bad row never kills the batch.
       try {
         // CLAIM FIRST, same guarded-PATCH idea the intake scan uses:
@@ -1982,36 +1998,36 @@ async function runShiftSummaryScan(env) {
             if (await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text)) delivered++;
           }
           // ADDITIONALLY a short lock-screen banner (the long summary
-          // stays on Telegram). Belt and suspenders around a helper that
-          // already never throws: a push failure must never break the
-          // summary that just went out.
+          // stays on Telegram). The banner is QUEUED for the droplet
+          // drainer with NO Telegram fallback (telegram_text null): the
+          // full summary already went out over Telegram above, so a
+          // failed banner must not echo a second Telegram copy. A
+          // queued banner counts as delivered: the drainer owns it from
+          // here, and it must stop the un-claim below from re-sending
+          // every tick of a long Telegram outage.
           try {
-            if (hasApns(env)) {
-              const mins = shiftMinutes(row);
-              const rate = workerRateFor(workers, row);
-              const pushBody = rate == null
-                ? fmtHm(mins) + ' on shift'
-                : fmtHm(mins) + ' on shift - ' + usd(payCents(mins, rate));
-              // A landed banner counts as delivered: it carries the hours
-              // and pay, and it must stop the un-claim below from
-              // re-sending every tick of a long Telegram outage.
-              delivered += await sendPushToOwners(env, row.worker_name + ' clocked out', pushBody);
-              // live activity: freeze the card with summary numbers, then
-              // clean up tokens. A total-delivery retry re-runs this,
-              // which is safe: it deletes token rows only after a
-              // delivered end, and a second run just finds them gone.
-              const laLine = String(pushBody || '').split('\n')[0]; // one-line stat string
-              await endShiftLiveActivity(env, row, laLine, Math.max(0, Math.round(mins)));
-            }
+            const mins = shiftMinutes(row);
+            const rate = workerRateFor(workers, row);
+            const pushBody = rate == null
+              ? fmtHm(mins) + ' on shift'
+              : fmtHm(mins) + ' on shift - ' + usd(payCents(mins, rate));
+            if (await sendPushToOwners(env, row.worker_name + ' clocked out', pushBody, null, [])) delivered++;
+            // live activity: freeze the card with summary numbers, then
+            // clean up tokens. A total-delivery retry re-runs this,
+            // which is safe: it deletes token rows only after a queued
+            // end, and a second run just finds them gone.
+            const laLine = String(pushBody || '').split('\n')[0]; // one-line stat string
+            await endShiftLiveActivity(env, row, laLine, Math.max(0, Math.round(mins)));
           } catch (e) {
             console.error('clock-out push failed on ' + (row && row.id) + ':', e);
           }
         } finally {
-          // Total delivery failure with at least one channel configured:
-          // give the row back so the next tick retries. With NO channel
-          // configured the claim stands, same as before this fix, so a
-          // bare install does not retry-loop forever.
-          if (!delivered && (chatIds.length || hasApns(env))) {
+          // Total delivery failure: give the row back so the next tick
+          // retries. The queue needs no config check (the droplet
+          // drainer owns push delivery now); chatIds.length is the
+          // bare-install guard so an empty install does not retry-loop
+          // forever.
+          if (!delivered && chatIds.length) {
             await unclaimShiftStamp(env, row.id, 'summary_sent_at', claimStamp);
           }
         }
@@ -2033,7 +2049,7 @@ async function runShiftSummaryScan(env) {
 async function runClockInAlertScan(env) {
   try {
     const since = new Date(Date.now() - 48 * 3600000).toISOString();
-    const shifts = await fetchSb(env, 'shifts?select=id,worker_name,market,clock_in_at,clock_in_lat,clock_in_lng' +
+    const shifts = await fetchSb(env, 'shifts?select=id,worker_name,worker_email,market,clock_in_at,clock_in_lat,clock_in_lng' +
       '&clockin_notified_at=is.null' +
       '&clock_in_at=gte.' + since +
       '&order=clock_in_at.asc&limit=10');
@@ -2042,6 +2058,8 @@ async function runClockInAlertScan(env) {
     const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
     for (const row of shifts) {
+      // Apple App Review noise: skip BEFORE the claim (see isAppReviewShift).
+      if (isAppReviewShift(row)) continue;
       // Each shift wrapped on its own so one bad row never kills the batch.
       try {
         // CLAIM FIRST, same guarded PATCH as the summary scan: stamp
@@ -2077,33 +2095,38 @@ async function runClockInAlertScan(env) {
             await startShiftLiveActivities(env, row);
           }
 
-          // Native push first when APNs is configured; the Telegram ping
-          // only fires when NO device got the banner (secrets missing,
-          // no registered owner phone, or Apple rejected everything).
-          // sendPushToOwners never throws and returns the delivered count.
-          let pushed = 0;
-          if (hasApns(env)) {
-            pushed = await sendPushToOwners(env,
-              '🟢 ' + row.worker_name + ' clocked in',
-              etTimeStr(row.clock_in_at) + ' ET - ' + (row.market || 'ny').toUpperCase());
+          // ONE queue row carries both the banner and its Telegram
+          // fallback: the droplet drainer pushes to owner phones and
+          // sends this text over Telegram ONLY if no device gets the
+          // banner (no tokens, dead tokens, or Apple down past the
+          // retry budget), so push + Telegram can never double-send.
+          // A queued row counts as delivered for the un-claim
+          // accounting: the drainer owns delivery-or-fallback from
+          // here. If the INSERT itself fails, the worker sends the
+          // Telegram text directly - the queue row exists in exactly
+          // the complementary case, so this can never double-send.
+          let text = '🟢 ' + row.worker_name + ' clocked in - ' +
+            etTimeStr(row.clock_in_at) + ' ET (' + (row.market || 'ny').toUpperCase() + ')';
+          if (row.clock_in_lat != null && row.clock_in_lng != null) {
+            text += '\nhttps://www.google.com/maps/search/?api=1&query=' + row.clock_in_lat + ',' + row.clock_in_lng;
           }
-          delivered += pushed;
-          if (pushed === 0) {
-            let text = '🟢 ' + row.worker_name + ' clocked in - ' +
-              etTimeStr(row.clock_in_at) + ' ET (' + (row.market || 'ny').toUpperCase() + ')';
-            if (row.clock_in_lat != null && row.clock_in_lng != null) {
-              text += '\nhttps://www.google.com/maps/search/?api=1&query=' + row.clock_in_lat + ',' + row.clock_in_lng;
-            }
+          const queued = await sendPushToOwners(env,
+            '🟢 ' + row.worker_name + ' clocked in',
+            etTimeStr(row.clock_in_at) + ' ET - ' + (row.market || 'ny').toUpperCase(),
+            text, chatIds);
+          if (queued) {
+            delivered++;
+          } else {
             // Plain mode: worker names must never break Telegram Markdown.
             for (const cid of chatIds) {
               if (await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text)) delivered++;
             }
           }
         } finally {
-          // Total delivery failure with at least one channel configured:
-          // give the row back so the next tick retries. With NO channel
-          // configured the claim stands, same as before this fix.
-          if (!delivered && (chatIds.length || hasApns(env))) {
+          // Total enqueue failure: give the row back so the next tick
+          // retries. chatIds.length is the bare-install guard so an
+          // empty install does not retry-loop forever.
+          if (!delivered && chatIds.length) {
             await unclaimShiftStamp(env, row.id, 'clockin_notified_at', claimStamp);
           }
         }
@@ -2150,7 +2173,7 @@ function distMeters(lat1, lng1, lat2, lng2) {
 async function runShiftStatusScan(env) {
   try {
     const since = new Date(Date.now() - 24 * 3600000).toISOString();
-    const shifts = await fetchSb(env, 'shifts?select=id,worker_name,market,clock_in_at,clock_in_lat,clock_in_lng' +
+    const shifts = await fetchSb(env, 'shifts?select=id,worker_name,worker_email,market,clock_in_at,clock_in_lat,clock_in_lng' +
       '&clock_out_at=is.null' +
       '&clock_in_at=gte.' + since +
       '&order=clock_in_at.asc&limit=10');
@@ -2159,6 +2182,8 @@ async function runShiftStatusScan(env) {
     const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
     for (const row of shifts) {
+      // Apple App Review noise: skip entirely (see isAppReviewShift).
+      if (isAppReviewShift(row)) continue;
       // Each shift wrapped on its own so one bad row never kills the batch.
       try {
         const pts = await fetchSb(env, 'shift_locations?select=at,lat,lng' +
@@ -2177,17 +2202,15 @@ async function runShiftStatusScan(env) {
         // updateShiftLiveActivity means this pushes only when status or
         // the 5-min stopped bucket changes.
         try {
-          if (hasApns(env)) {
-            let laStatus = 'Enroute';
-            let laMins = 0;
-            if (atGarage) {
-              laStatus = 'At NJ Garage';
-            } else if (ageMin >= STOP_ALERT_MIN) {
-              laStatus = 'Stopped';
-              laMins = Math.floor(ageMin / 5) * 5; // bucket = what we render, "Stopped 15m", "Stopped 20m"...
-            }
-            await updateShiftLiveActivity(env, row.id, laStatus, laMins);
+          let laStatus = 'Enroute';
+          let laMins = 0;
+          if (atGarage) {
+            laStatus = 'At NJ Garage';
+          } else if (ageMin >= STOP_ALERT_MIN) {
+            laStatus = 'Stopped';
+            laMins = Math.floor(ageMin / 5) * 5; // bucket = what we render, "Stopped 15m", "Stopped 20m"...
           }
+          await updateShiftLiveActivity(env, row.id, laStatus, laMins);
         } catch (e) { console.error('la status hook:', e); }
 
         // AT_GARAGE: parked at base is normal. (Miami has no garage, so
@@ -2211,16 +2234,17 @@ async function runShiftStatusScan(env) {
         }
         text += '\n(or their phone stopped reporting GPS)';
 
-        // Native push first when APNs is configured; Telegram only when
-        // NO device got the banner. Mirrors runClockInAlertScan exactly
-        // so push + Telegram can never double-send.
-        let pushed = 0;
-        if (hasApns(env)) {
-          pushed = await sendPushToOwners(env,
-            '⚠️ ' + row.worker_name + ' stopped ' + mins + ' min',
-            'Not moving while enroute (' + mkt + '). Open the live map.');
-        }
-        if (pushed === 0) {
+        // ONE queue row: the droplet drainer pushes the banner and
+        // sends this Telegram text ONLY if no device gets it, so push +
+        // Telegram can never double-send. If the INSERT itself fails,
+        // the worker sends the Telegram text directly - the queue row
+        // exists in exactly the complementary case, so no double-send.
+        // The stateless windows above stay the once-only mechanism.
+        const queued = await sendPushToOwners(env,
+          '⚠️ ' + row.worker_name + ' stopped ' + mins + ' min',
+          'Not moving while enroute (' + mkt + '). Open the live map.',
+          text, chatIds);
+        if (!queued) {
           // Plain mode: worker names must never break Telegram Markdown.
           for (const cid of chatIds) {
             await sendTelegramPlain(env.TG_BOT_TOKEN, cid, text);
@@ -2482,105 +2506,70 @@ async function buildPayrollDigestLines(env) {
   return lines;
 }
 
-// ── APNs push to owner phones ────────────────────────────────────────
-// Native lock-screen banners for the HC Field app, sent straight to
-// Apple (no Expo push service). Three Cloudflare secrets gate the whole
-// feature: APNS_AUTH_KEY (the .p8 file's full text), APNS_KEY_ID, and
-// APPLE_TEAM_ID. Until all three exist, hasApns() is false and every
-// caller silently keeps its Telegram behavior. NOTHING in here throws.
+// ── APNs push -> droplet queue ───────────────────────────────────────
+// (2026-08-03 redesign) Cloudflare cannot deliver APNs: Workers fetch
+// speaks HTTP/1.1 to Apple and every send 500s, while curl --http2
+// from the droplet works. So this worker no longer talks to Apple at
+// all. Every push becomes one INSERT into push_queue (migration 011)
+// and the droplet daemon pushdrain (hc-dashboard/droplet/pushdrain.py,
+// systemd unit "pushdrain") drains it every ~20 seconds. The daemon
+// ALSO owns the Telegram fallback: a row that cannot be pushed inside
+// its retry budget or 15-minute life gets its telegram_text sent to
+// fallback_chat_ids, so the old "push first, Telegram only when no
+// device got it" rule still holds, just downstream. Worst-case added
+// latency: the 20s drain interval on top of the 5-minute cron tick.
+// The old Cloudflare secrets (APNS_AUTH_KEY, APNS_KEY_ID,
+// APPLE_TEAM_ID) are UNUSED here now; the droplet holds the key.
+// NOTHING in here throws.
 
-function hasApns(env) {
-  return Boolean(env.APNS_AUTH_KEY && env.APNS_KEY_ID && env.APPLE_TEAM_ID);
-}
-
-// base64url = base64 with +/ swapped for -_ and the trailing = padding
-// stripped. JWTs require it; plain btoa output is NOT valid.
-function b64url(bytes) {
-  const arr = new Uint8Array(bytes);
-  let s = '';
-  for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
-  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-// One JWT reused for up to 45 minutes (module-global cache, best effort
-// across cron ticks - a fresh isolate just signs a new one). Apple
-// accepts tokens up to 60 minutes old and throttles keys that mint new
-// tokens too often (TooManyProviderTokenUpdates), so do not sign per
-// push and do not shorten this window.
-let apnsJwtCache = null;
-
-async function apnsJwt(env) {
-  const now = Date.now();
-  if (apnsJwtCache && now - apnsJwtCache.at < 45 * 60000) return apnsJwtCache.jwt;
-  // The secret holds the .p8 file verbatim. Strip the PEM armor lines
-  // and ALL whitespace (including Windows \r) to get pure base64 DER.
-  const pem = env.APNS_AUTH_KEY
-    .replace(/-----BEGIN PRIVATE KEY-----/g, '')
-    .replace(/-----END PRIVATE KEY-----/g, '')
-    .replace(/\s/g, '');
-  const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
-  const key = await crypto.subtle.importKey(
-    'pkcs8', der.buffer, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
-  const enc = new TextEncoder();
-  const head = b64url(enc.encode(JSON.stringify({ alg: 'ES256', kid: env.APNS_KEY_ID })));
-  const claims = b64url(enc.encode(JSON.stringify({ iss: env.APPLE_TEAM_ID, iat: Math.floor(now / 1000) })));
-  // WebCrypto ECDSA already returns the raw 64-byte r||s signature JWTs
-  // want (JOSE format). Do NOT convert to DER.
-  const sig = await crypto.subtle.sign(
-    { name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(head + '.' + claims));
-  const jwt = head + '.' + claims + '.' + b64url(sig);
-  apnsJwtCache = { jwt, at: now };
-  return jwt;
-}
-
-// Push one banner to every registered OWNER phone. Returns how many
-// devices got a 200 from Apple; 0 on any failure or when APNs is not
-// configured, so callers can fall back to Telegram.
-async function sendPushToOwners(env, title, body) {
+// One queue row. Returns true only when Supabase accepted the INSERT,
+// so callers can count "queued" as "will be delivered or fallen back"
+// in their claim/un-claim accounting. Never throws.
+async function enqueuePush(env, kind, payload) {
   try {
-    if (!hasApns(env)) return 0;
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/push_queue', {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }),
+      body: JSON.stringify({ kind: kind, payload: payload }),
+    });
+    if (!resp.ok) {
+      console.error('push enqueue failed:', kind, resp.status, await resp.text());
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error('push enqueue exception:', e);
+    return false;
+  }
+}
+
+// Queue one banner for every registered OWNER phone (same role=owner
+// email filter as before: a rogue anon token insert never gets pushed).
+// telegramText is the drainer's fallback copy (null = no fallback
+// wanted, e.g. the clock-out banner whose full summary already went
+// over Telegram). Returns true when the row was queued; false when
+// there was nothing to queue or the INSERT failed. Never throws.
+async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds) {
+  try {
     const owners = await fetchSb(env, 'field_workers?role=eq.owner&select=email') || [];
     const emails = owners.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
-    if (!emails.length) return 0;
     const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
-    const tokens = await fetchSb(env, 'push_tokens?select=email,apns_token&email=in.(' + inList + ')') || [];
-    if (!tokens.length) return 0;
-
-    const jwt = await apnsJwt(env);
-    let sent = 0;
-    for (const t of tokens) {
-      // Per-device try/catch: one dead token never blocks the rest.
-      try {
-        const resp = await fetch('https://api.push.apple.com/3/device/' + t.apns_token, {
-          method: 'POST',
-          headers: {
-            'authorization': 'bearer ' + jwt,
-            'apns-topic': 'com.hamptonscoconuts.field',
-            'apns-push-type': 'alert',
-            'apns-priority': '10',
-          },
-          body: JSON.stringify({ aps: { alert: { title: title, body: body }, sound: 'default' } }),
-        });
-        if (resp.ok) { sent += 1; continue; }
-        let reason = '';
-        try { reason = ((await resp.json()) || {}).reason || ''; } catch {}
-        console.error('apns send failed:', resp.status, reason, 'for', t.email);
-        // 410 / BadDeviceToken / Unregistered = this phone is gone
-        // (app deleted, token rotated). Drop the row; the app re-upserts
-        // a fresh token on next login.
-        if (resp.status === 410 || reason === 'BadDeviceToken' || reason === 'Unregistered') {
-          await fetch(env.SUPABASE_URL + '/rest/v1/push_tokens?apns_token=eq.' + encodeURIComponent(t.apns_token), {
-            method: 'DELETE', headers: sbHeaders(env),
-          });
-        }
-      } catch (e) {
-        console.error('apns send exception:', e);
-      }
-    }
-    return sent;
+    const tokens = emails.length
+      ? (await fetchSb(env, 'push_tokens?select=email,apns_token&email=in.(' + inList + ')') || [])
+      : [];
+    const deviceTokens = tokens.map((t) => t.apns_token).filter(Boolean);
+    // No devices AND no fallback text = nothing the drainer could do.
+    if (!deviceTokens.length && !telegramText) return false;
+    return await enqueuePush(env, 'alert', {
+      tokens: deviceTokens,
+      headers: { topic: 'com.hamptonscoconuts.field', push_type: 'alert', priority: 10 },
+      aps: { alert: { title: title, body: body }, sound: 'default' },
+      telegram_text: telegramText || null,
+      fallback_chat_ids: fallbackChatIds || [],
+    });
   } catch (e) {
     console.error('sendPushToOwners error:', e);
-    return 0;
+    return false;
   }
 }
 
@@ -2591,19 +2580,21 @@ async function sendPushToOwners(env, title, body) {
 // update budget; 10 is immediate. TOPIC-KEY RISK: our .p8 is topic
 // restricted to com.hamptonscoconuts.field, and the doc says NOTHING
 // about whether a topic-restricted key covers the liveactivity
-// subtopic. First live send is the probe; on rejection we block LA
-// sends for 6h, tell the operator once over Telegram, and alert pushes
-// (separate topic string, same JWT) keep working untouched.
+// subtopic. The first live send from the droplet is the probe; on
+// rejection PUSHDRAIN (not this worker) blocks LA sends for 6h and
+// tells the operator once over Telegram, and alert pushes (separate
+// topic string, same key) keep working untouched.
 const LA_TOPIC = 'com.hamptonscoconuts.field.push-type.liveactivity';
 let laLastSent = new Map();   // shiftId -> last pushed "status:minutes" (isolate memory; a recycle just re-sends one priority-5 update)
-let laBlockedUntil = 0;       // Apple rejected the liveactivity topic; skip until this time
-let laBlockedNotified = false;
 
-async function sendLiveActivityPush(env, token, event, contentState, opts = {}) {
+// Compose the full aps dictionary here (the drainer is deliberately
+// dumb: it sends whatever aps it is handed) and queue ONE row carrying
+// every device token for this event. kind becomes la_start / la_update
+// / la_end. Live activities are cosmetic, so telegram_text is null:
+// they never fall back, they just expire. Never throws.
+async function enqueueLiveActivityPush(env, tokens, event, contentState, opts = {}) {
   try {
-    if (!hasApns(env)) return { ok: false, reason: 'no-apns' };
-    if (Date.now() < laBlockedUntil) return { ok: false, reason: 'topic-blocked' };
-    const jwt = await apnsJwt(env);
+    if (!tokens || !tokens.length) return false;
     const aps = {
       timestamp: Math.floor(Date.now() / 1000),
       event: event,
@@ -2617,44 +2608,20 @@ async function sendLiveActivityPush(env, token, event, contentState, opts = {}) 
     }
     if (event === 'end' && opts.dismissalDate) aps['dismissal-date'] = opts.dismissalDate;
     if (opts.staleDate) aps['stale-date'] = opts.staleDate;
-    const resp = await fetch('https://api.push.apple.com/3/device/' + token, {
-      method: 'POST',
+    return await enqueuePush(env, 'la_' + event, {
+      tokens: tokens,
       headers: {
-        'authorization': 'bearer ' + jwt,
-        'apns-topic': LA_TOPIC,
-        'apns-push-type': 'liveactivity',
-        'apns-priority': String(opts.priority || (event === 'update' ? 5 : 10)),
+        topic: LA_TOPIC,
+        push_type: 'liveactivity',
+        priority: opts.priority || (event === 'update' ? 5 : 10),
       },
-      body: JSON.stringify({ aps: aps }),
+      aps: aps,
+      telegram_text: null,
+      fallback_chat_ids: [],
     });
-    if (resp.ok) return { ok: true, reason: '' };
-    let reason = '';
-    try { reason = ((await resp.json()) || {}).reason || ''; } catch {}
-    console.error('live activity send failed:', resp.status, reason, event);
-    if (reason === 'TopicDisallowed' || reason === 'InvalidProviderToken' || resp.status === 403) {
-      // topic-restricted key likely does not cover the liveactivity subtopic
-      laBlockedUntil = Date.now() + 6 * 3600000;
-      if (!laBlockedNotified) {
-        laBlockedNotified = true;
-        const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
-        for (const cid of chatIds) {
-          try {
-            await sendTelegramPlain(env.TG_BOT_TOKEN, cid,
-              'Live Activity pushes rejected by Apple (' + (reason || resp.status) + '). Alert pushes still work. The APNs key probably needs the liveactivity topic added, see the ops checklist.');
-          } catch {}
-        }
-      }
-    }
-    if (resp.status === 410 || reason === 'BadDeviceToken' || reason === 'Unregistered') {
-      // dead token: remove the row, the app rewrites on next launch
-      await fetch(env.SUPABASE_URL + '/rest/v1/live_activity_tokens?token=eq.' + encodeURIComponent(token), {
-        method: 'DELETE', headers: sbHeaders(env),
-      });
-    }
-    return { ok: false, status: resp.status, reason: reason };
   } catch (e) {
-    console.error('live activity send exception:', e);
-    return { ok: false, reason: 'exception' };
+    console.error('live activity enqueue exception:', e);
+    return false;
   }
 }
 
@@ -2682,7 +2649,6 @@ async function laTokensForShift(env, shiftId) {
 // from the caller's claim-first PATCH, so this can never storm.
 async function startShiftLiveActivities(env, row) {
   try {
-    if (!hasApns(env)) return;
     const emails = await laOwnerEmails(env);
     if (!emails || !emails.length) return;
     const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
@@ -2699,15 +2665,15 @@ async function startShiftLiveActivities(env, row) {
     // normalize to millis+Z so the widget's ISO8601 parse always succeeds
     const clockInISO = new Date(row.clock_in_at).toISOString();
     const name = row.worker_name || 'Team';
-    for (const t of tokens) {
-      await sendLiveActivityPush(env, t.token, 'start',
-        { status: status, statusMinutes: 0 },
-        {
-          attributes: { workerName: name, clockInISO: clockInISO, shiftId: row.id },
-          alert: { title: name + ' is on shift', body: 'Shift card is live' },
-        });
-    }
-    laLastSent.set(row.id, status + ':0'); // seed dedupe so tick 1 does not re-push identical content
+    const queued = await enqueueLiveActivityPush(env, tokens.map((t) => t.token), 'start',
+      { status: status, statusMinutes: 0 },
+      {
+        attributes: { workerName: name, clockInISO: clockInISO, shiftId: row.id },
+        alert: { title: name + ' is on shift', body: 'Shift card is live' },
+      });
+    // seed dedupe so tick 1 does not re-queue identical content; only
+    // on a queued row, so a failed INSERT can try again via updates.
+    if (queued) laLastSent.set(row.id, status + ':0');
   } catch (e) { console.error('startShiftLiveActivities error:', e); }
 }
 
@@ -2715,46 +2681,38 @@ async function startShiftLiveActivities(env, row) {
 // stopped bucket). No tokens yet = do not mark sent, retry next tick.
 async function updateShiftLiveActivity(env, shiftId, status, minutes) {
   try {
-    if (!hasApns(env)) return;
     if (laLastSent.size > 200) laLastSent.clear(); // bound isolate memory
     const key = status + ':' + minutes;
     if (laLastSent.get(shiftId) === key) return;
     const tokens = await laTokensForShift(env, shiftId);
     if (!tokens || !tokens.length) return; // null (read failed) or none: do not mark sent, retry next tick
-    let sentAny = false;
-    for (const t of tokens) {
-      const r = await sendLiveActivityPush(env, t.token, 'update',
-        { status: status, statusMinutes: minutes });
-      if (r.ok) sentAny = true;
-    }
-    if (sentAny) laLastSent.set(shiftId, key);
+    const queued = await enqueueLiveActivityPush(env, tokens.map((t) => t.token), 'update',
+      { status: status, statusMinutes: minutes });
+    if (queued) laLastSent.set(shiftId, key);
   } catch (e) { console.error('updateShiftLiveActivity error:', e); }
 }
 
 // event:end with the summary line, then delete this shift's update-token
 // rows (service role; anon has no DELETE). Dismissal uses Apple's default
 // (card lingers up to 4h); pass opts.dismissalDate later if that annoys.
-// DELETE ONLY AFTER A DELIVERED END (or when there was nothing to send):
-// during a topic-blocked window, an Apple 5xx, or a network blip every
-// send fails, and deleting the rows then would leave the card unendable
-// forever (the summary claim is already spent, so nothing retries).
-// Keeping the rows lets the dead-token cleanup or the next isolate's
-// sends still reach the card.
+// DELETE ONLY AFTER A QUEUED END (or when there was nothing to send):
+// once the row is in push_queue the drainer's retries own delivery, so
+// "queued" is the new "delivered" here. If the INSERT itself fails the
+// token rows stay, and the next isolate's sends or the drainer's
+// dead-token cleanup can still reach the card.
 async function endShiftLiveActivity(env, row, boxesLine, totalMins) {
   try {
-    if (!hasApns(env)) return;
     const tokens = await laTokensForShift(env, row.id);
     // null means the Supabase READ failed, not "no tokens". Deleting on that
     // would strand the owner's card forever (the summary claim is spent, so
     // nothing retries). Keep the rows and laLastSent; bail out entirely.
     if (tokens === null) return;
-    let sentAny = false;
-    for (const t of tokens) {
-      const r = await sendLiveActivityPush(env, t.token, 'end',
+    let queued = false;
+    if (tokens.length) {
+      queued = await enqueueLiveActivityPush(env, tokens.map((t) => t.token), 'end',
         { status: 'Clocked out', statusMinutes: totalMins, boxesLine: boxesLine });
-      if (r.ok) sentAny = true;
     }
-    if (sentAny || tokens.length === 0) {
+    if (queued || tokens.length === 0) {
       await fetch(env.SUPABASE_URL +
         '/rest/v1/live_activity_tokens?token_type=eq.activity_update&shift_id=eq.' +
         encodeURIComponent(row.id), { method: 'DELETE', headers: sbHeaders(env) });
