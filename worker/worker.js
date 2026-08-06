@@ -1991,7 +1991,8 @@ async function runShiftSummaryScan(env) {
         // payroll summary.
         let delivered = 0;
         try {
-          const text = await buildShiftSummaryText(env, row, workers);
+          const built = await buildShiftSummaryText(env, row, workers);
+          const text = built.text;
           // Plain mode on purpose: worker/client/venue text must never be
           // able to break Telegram Markdown.
           for (const cid of chatIds) {
@@ -2008,16 +2009,20 @@ async function runShiftSummaryScan(env) {
           try {
             const mins = shiftMinutes(row);
             const rate = workerRateFor(workers, row);
-            const pushBody = rate == null
-              ? fmtHm(mins) + ' on shift'
-              : fmtHm(mins) + ' on shift - ' + usd(payCents(mins, rate));
-            if (await sendPushToOwners(env, row.worker_name + ' clocked out', pushBody, null, [])) delivered++;
+            // Owners see pay; managers see boxes; the worker themselves
+            // sees nothing (excludeEmail suppresses the self-echo).
+            const bodies = clockOutBodies(mins, rate, built.touched);
+            if (await sendPushToOwners(env, row.worker_name + ' clocked out', bodies.owner, null, [],
+                { managerBody: bodies.manager, excludeEmail: row.worker_email })) delivered++;
             // live activity: freeze the card with summary numbers, then
-            // clean up tokens. A total-delivery retry re-runs this,
-            // which is safe: it deletes token rows only after a queued
-            // end, and a second run just finds them gone.
-            const laLine = String(pushBody || '').split('\n')[0]; // one-line stat string
-            await endShiftLiveActivity(env, row, laLine, Math.max(0, Math.round(mins)));
+            // clean up tokens. The frozen line is PAY-FREE for everyone
+            // (2026-08-06): the card is glanceable status, and owners
+            // already get the dollars in the banner + Telegram summary.
+            await endShiftLiveActivity(env, row, bodies.manager, Math.max(0, Math.round(mins)));
+            // 40-hour week watch (2026-08-06): owners only, once per
+            // crossing — fires on the shift that pushes the Mon-Sun ET
+            // week total past 40h, so Sidd can rebalance schedules.
+            await watch40Hours(env, row, mins);
           } catch (e) {
             console.error('clock-out push failed on ' + (row && row.id) + ':', e);
           }
@@ -2113,7 +2118,7 @@ async function runClockInAlertScan(env) {
           const queued = await sendPushToOwners(env,
             '🟢 ' + row.worker_name + ' clocked in',
             etTimeStr(row.clock_in_at) + ' ET - ' + (row.market || 'ny').toUpperCase(),
-            text, chatIds);
+            text, chatIds, { excludeEmail: row.worker_email });
           if (queued) {
             delivered++;
           } else {
@@ -2243,7 +2248,7 @@ async function runShiftStatusScan(env) {
         const queued = await sendPushToOwners(env,
           '⚠️ ' + row.worker_name + ' stopped ' + mins + ' min',
           'Not moving while enroute (' + mkt + '). Open the live map.',
-          text, chatIds);
+          text, chatIds, { excludeEmail: row.worker_email });
         if (!queued) {
           // Plain mode: worker names must never break Telegram Markdown.
           for (const cid of chatIds) {
@@ -2286,8 +2291,10 @@ async function buildShiftSummaryText(env, row, workers) {
   // window is CORRECT here, not a bug: order dates are stored as the
   // local calendar date with a fake T12:00:00Z (dashboard convention),
   // and this mirrors App.js loadOrders exactly.
+  // or= includes null-market rows, matching the app which counts blank-market
+  // orders toward every market (2026-08-03 audit parity fix, applied 08-06).
   const orders = await fetchSb(env, 'orders?select=client_name,venue,coconuts_qty,stage,market,total_cents' +
-    '&market=eq.' + encodeURIComponent(market) +
+    '&or=(market.eq.' + encodeURIComponent(market) + ',market.is.null)' +
     '&stage=in.(invoiced,deposit_paid,paid_full,fulfilled,complete)' +
     '&delivery_at_utc=gte.' + day + 'T00:00:00Z' +
     '&delivery_at_utc=lte.' + day + 'T23:59:59Z') || [];
@@ -2311,7 +2318,7 @@ async function buildShiftSummaryText(env, row, workers) {
   // fake-noon UTC-day window convention as the ship query above.
   const prepDay = nextEtDay(day);
   const prep = await fetchSb(env, 'orders?select=client_name,venue,coconuts_qty,stage,market' +
-    '&market=eq.' + encodeURIComponent(market) +
+    '&or=(market.eq.' + encodeURIComponent(market) + ',market.is.null)' +
     '&stage=in.(invoiced,deposit_paid,paid_full)' +
     '&delivery_at_utc=gte.' + prepDay + 'T00:00:00Z' +
     '&delivery_at_utc=lte.' + prepDay + 'T23:59:59Z') || [];
@@ -2445,7 +2452,9 @@ async function buildShiftSummaryText(env, row, workers) {
     console.error('day p&l block failed on ' + (row && row.id) + ':', e);
   }
 
-  return lines.join('\n');
+  // touched rides along so the clock-out banner can show a pay-free
+  // boxes variant to manager phones (2026-08-06 manager tier).
+  return { text: lines.join('\n'), touched: touched };
 }
 
 // Sunday-only payroll section for the 8am digest. Returns [] on any
@@ -2484,6 +2493,11 @@ async function buildPayrollDigestLines(env) {
       g.count += 1;
       const mins = shiftMinutes(row);
       g.mins += mins;
+      // Over-40 flag input: minutes from UNPAID rows whose clock-in falls in
+      // the current Mon-Sun ET week. An approximation on purpose (paid rows
+      // from earlier this week are not re-fetched) - the once-per-crossing
+      // banner is the precise mechanism; this is the Sunday reminder.
+      if (etDateStr(row.clock_in_at) >= etWeekStart(new Date().toISOString())) g.weekMins = (g.weekMins || 0) + mins;
       if (g.rate != null) {
         const c = payCents(mins, g.rate);
         g.cents += c;
@@ -2496,7 +2510,8 @@ async function buildPayrollDigestLines(env) {
     lines.push('💵 Payroll - unpaid shifts');
     list.forEach(g => {
       lines.push('  • ' + tgSafe(g.name) + ' - ' + g.count + ' shift' + (g.count === 1 ? '' : 's') +
-        ' · ' + fmtHm(g.mins) + (g.rate != null ? ' · ' + usd(g.cents) : ' · rate not set'));
+        ' · ' + fmtHm(g.mins) + (g.rate != null ? ' · ' + usd(g.cents) : ' · rate not set') +
+        ((g.weekMins || 0) >= 2400 ? ' · over 40h this week' : ''));
     });
     if (list.length) lines.push('  Total owed: ' + usd(grand));
     flags.forEach(f => lines.push(f));
@@ -2549,24 +2564,130 @@ async function enqueuePush(env, kind, payload) {
 // wanted, e.g. the clock-out banner whose full summary already went
 // over Telegram). Returns true when the row was queued; false when
 // there was nothing to queue or the INSERT failed. Never throws.
-async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds) {
+// Pure: split a field_workers list into owner/manager email sets, minus the
+// excluded (the shift's own worker — nobody needs a banner about themselves).
+// Exported for worker/test-manage-push.mjs.
+export function partitionRecipients(rows, excludeEmail) {
+  const ex = (excludeEmail || '').toLowerCase();
+  const owners = [], managers = [];
+  for (const r of rows || []) {
+    const e = (r.email || '').toLowerCase();
+    if (!e || e === ex) continue;
+    if (r.role === 'owner') owners.push(e);
+    else if (r.role === 'manager') managers.push(e);
+  }
+  return { owners, managers };
+}
+
+// Pure: the two clock-out banner bodies. Owners may see pay; managers see
+// boxes instead — dollars never travel to a manager phone.
+// Exported for worker/test-manage-push.mjs.
+export function clockOutBodies(mins, rate, touchedCoconuts) {
+  const dur = fmtHm(mins) + ' on shift';
+  return {
+    owner: rate == null ? dur : dur + ' - ' + usd(payCents(mins, rate)),
+    manager: touchedCoconuts > 0 ? dur + ' - ' + fmtBoxes(touchedCoconuts) + ' boxes' : dur,
+  };
+}
+
+// The Monday 00:00 ET start of the week containing the given instant,
+// as a 'YYYY-MM-DD' ET date string. Weeks run Monday through Sunday
+// (matches how Sidd schedules; the Sunday payroll digest closes them).
+function etWeekStart(iso) {
+  const day = etDateStr(iso); // ET calendar day of the instant
+  const wd = new Date(day + 'T12:00:00Z').getUTCDay(); // fake-noon: weekday of that DATE
+  const back = (wd + 6) % 7; // Mon=1 -> 0 back, Sun=0 -> 6 back
+  const d = new Date(new Date(day + 'T12:00:00Z').getTime() - back * 86400000);
+  return d.toISOString().slice(0, 10);
+}
+
+// Owners-only heads-up the first time a worker's Mon-Sun ET week crosses
+// 40 hours (2026-08-06, Sidd: "no overtime for now, just let me know").
+// Crossing detection is inherently once-per-week: only the shift that
+// carries the total past 2400 minutes fires. Never throws.
+async function watch40Hours(env, row, minsJustClosed) {
   try {
-    const owners = await fetchSb(env, 'field_workers?role=eq.owner&select=email') || [];
-    const emails = owners.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
-    const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
-    const tokens = emails.length
+    const weekStart = etWeekStart(row.clock_out_at || row.clock_in_at);
+    const who = row.worker_email
+      ? 'worker_email=eq.' + encodeURIComponent(row.worker_email)
+      : 'worker_name=eq.' + encodeURIComponent(row.worker_name || '');
+    const rows = await fetchSb(env, 'shifts?select=id,clock_in_at,clock_out_at&' + who +
+      '&clock_out_at=not.is.null&clock_in_at=gte.' + weekStart + 'T00:00:00Z');
+    if (rows === null) return; // failed read: skip quietly, next clock-out re-checks
+    const inWeek = rows.filter((x) => etDateStr(x.clock_in_at) >= weekStart);
+    const total = inWeek.reduce((s, x) => s + shiftMinutes(x), 0);
+    const before = total - minsJustClosed;
+    if (before < 2400 && total >= 2400) {
+      await sendPushToOwners(env,
+        '⏰ ' + (row.worker_name || 'A worker') + ' passed 40 hours',
+        fmtHm(total) + ' this week (Mon-Sun). Worth a look at next week\'s schedule.',
+        (row.worker_name || 'A worker') + ' just passed 40 hours this week (' + fmtHm(total) + ').',
+        (env.ALLOWED_CHAT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
+        { ownersOnly: true });
+    }
+  } catch (e) {
+    console.error('watch40Hours error:', e);
+  }
+}
+
+// Banners to owner AND manager phones (2026-08-06 manager tier). Same-content
+// sends stay ONE queue row (union of tokens); pay-bearing sends split into an
+// owner row (with telegram fallback) and a pay-free manager row (no fallback:
+// Telegram is Sidd's channel). opts.excludeEmail suppresses the self-echo;
+// opts.ownersOnly keeps scheduling/pay matters off manager phones entirely.
+async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds, opts = {}) {
+  try {
+    const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&select=email,role') || [];
+    const rec = partitionRecipients(staff, opts.excludeEmail);
+    if (opts.ownersOnly) rec.managers = [];
+    const all = rec.owners.concat(rec.managers);
+    const inList = all.map((e) => encodeURIComponent('"' + e + '"')).join(',');
+    const tokens = all.length
       ? (await fetchSb(env, 'push_tokens?select=email,apns_token&email=in.(' + inList + ')') || [])
       : [];
-    const deviceTokens = tokens.map((t) => t.apns_token).filter(Boolean);
-    // No devices AND no fallback text = nothing the drainer could do.
-    if (!deviceTokens.length && !telegramText) return false;
-    return await enqueuePush(env, 'alert', {
-      tokens: deviceTokens,
-      headers: { topic: 'com.hamptonscoconuts.field', push_type: 'alert', priority: 10 },
-      aps: { alert: { title: title, body: body }, sound: 'default' },
-      telegram_text: telegramText || null,
-      fallback_chat_ids: fallbackChatIds || [],
-    });
+    const ownerSet = new Set(rec.owners);
+    let ownerTokens = [], managerTokens = [];
+    for (const t of tokens) {
+      if (!t.apns_token) continue;
+      if (ownerSet.has((t.email || '').toLowerCase())) ownerTokens.push(t.apns_token);
+      else managerTokens.push(t.apns_token);
+    }
+    // Tie rule: a device registered under BOTH roles gets the pay-free copy.
+    const mgrSet = new Set(managerTokens);
+    ownerTokens = [...new Set(ownerTokens)].filter((t) => !mgrSet.has(t));
+    managerTokens = [...mgrSet];
+    const managerBody = opts.managerBody || body;
+    const headers = { topic: 'com.hamptonscoconuts.field', push_type: 'alert', priority: 10 };
+
+    if (managerBody === body) {
+      // Same words for everyone: one row, no double-send possible.
+      const union = [...new Set(ownerTokens.concat(managerTokens))];
+      if (!union.length && !telegramText) return false;
+      return await enqueuePush(env, 'alert', {
+        tokens: union, headers: headers,
+        aps: { alert: { title: title, body: body }, sound: 'default' },
+        telegram_text: telegramText || null,
+        fallback_chat_ids: fallbackChatIds || [],
+      });
+    }
+    let queued = false;
+    if (ownerTokens.length || telegramText) {
+      queued = await enqueuePush(env, 'alert', {
+        tokens: ownerTokens, headers: headers,
+        aps: { alert: { title: title, body: body }, sound: 'default' },
+        telegram_text: telegramText || null,
+        fallback_chat_ids: fallbackChatIds || [],
+      }) || queued;
+    }
+    if (managerTokens.length) {
+      queued = await enqueuePush(env, 'alert', {
+        tokens: managerTokens, headers: headers,
+        aps: { alert: { title: title, body: managerBody }, sound: 'default' },
+        telegram_text: null,
+        fallback_chat_ids: [],
+      }) || queued;
+    }
+    return queued;
   } catch (e) {
     console.error('sendPushToOwners error:', e);
     return false;
@@ -2625,17 +2746,18 @@ async function enqueueLiveActivityPush(env, tokens, event, contentState, opts = 
   }
 }
 
-async function laOwnerEmails(env) {
-  const owners = await fetchSb(env, 'field_workers?role=eq.owner&select=email');
-  if (owners === null) return null; // read FAILED — callers must not treat this as "no owners"
-  return owners.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
+// Owner + manager phones both carry the shift card (2026-08-06).
+async function laManageEmails(env) {
+  const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&select=email');
+  if (staff === null) return null; // read FAILED — callers must not treat this as "nobody"
+  return staff.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
 }
 
-// Update tokens for one shift, filtered to owner emails so a rogue anon
-// insert with a random shift_id never receives pushes (same defense as
-// sendPushToOwners' role=owner filter).
+// Update tokens for one shift, filtered to owner/manager emails so a rogue
+// anon insert with a random shift_id never receives pushes (same defense as
+// sendPushToOwners' role filter).
 async function laTokensForShift(env, shiftId) {
-  const emails = await laOwnerEmails(env);
+  const emails = await laManageEmails(env);
   if (emails === null) return null; // propagate the failed read
   if (!emails.length) return [];
   const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
@@ -2649,9 +2771,15 @@ async function laTokensForShift(env, shiftId) {
 // from the caller's claim-first PATCH, so this can never storm.
 async function startShiftLiveActivities(env, row) {
   try {
-    const emails = await laOwnerEmails(env);
+    const emails = await laManageEmails(env);
     if (!emails || !emails.length) return;
-    const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
+    // Self-echo: never start a card about someone's shift on their own
+    // phone. Because the self device never gets the start, it never emits
+    // an update token for this shift, so downstream needs no self filter.
+    const ex = (row.worker_email || '').toLowerCase();
+    const targets = emails.filter((e) => e !== ex);
+    if (!targets.length) return;
+    const inList = targets.map((e) => encodeURIComponent('"' + e + '"')).join(',');
     const tokens = await fetchSb(env,
       'live_activity_tokens?select=email,token&token_type=eq.push_to_start&email=in.(' + inList + ')') || [];
     if (!tokens.length) return;
