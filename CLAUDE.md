@@ -53,6 +53,12 @@
   classes; do not leak owner numbers into team view.
 - The anon Supabase key in this file is public by design (row-level
   security limits what it can do).
+- Every Supabase read silently caps at 1000 rows. Reads of growable
+  tables (orders is past 1100, shift_locations passes 1000 points on
+  long shifts) must paginate — see worker.js readEvents and the shift
+  summary route fetch for the offset-loop idiom. On a failed page
+  return null/failure, never a partial list (a partial list is the
+  same silent-miss bug in disguise).
 
 ## Order intake: Claudia's half (approval-first redesign, 2026-07-24)
 
