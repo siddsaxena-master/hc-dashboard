@@ -2277,7 +2277,18 @@ async function buildShiftSummaryText(env, row, workers) {
   // GPS point count + THE SAME Google Maps link the app's Team tab
   // builds (App.js openRoute, copied exactly: sample down to 10 points
   // because Maps directions URLs cap at 10 waypoints).
-  const pts = await fetchSb(env, 'shift_locations?select=lat,lng&shift_id=eq.' + row.id + '&order=at.asc') || [];
+  // Paged: Supabase caps one read at 1000 rows, so an uncapped fetch of
+  // a long driving shift ends mid-route — the link and the point count
+  // would silently cover only the first stretch of the day (Jayden's
+  // 15-hour 2026-08-07 shift passed 1000 points before lunch).
+  const pts = [];
+  for (let from = 0; ; from += 1000) {
+    const page = await fetchSb(env, 'shift_locations?select=lat,lng&shift_id=eq.' + row.id +
+      '&order=at.asc,id.asc&offset=' + from + '&limit=1000');
+    if (!Array.isArray(page)) break; // read failed — sample what we have
+    pts.push(...page);
+    if (page.length < 1000) break;   // short page = trail exhausted
+  }
   if (pts.length >= 2) {
     const step = Math.max(1, Math.floor(pts.length / 9));
     const sampled = pts.filter((_, i) => i % step === 0).slice(0, 10);
