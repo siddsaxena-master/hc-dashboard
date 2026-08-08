@@ -324,15 +324,28 @@ function eventToSupabaseRow(e) {
 
 async function readEvents(env) {
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?select=*', {
-      headers: sbHeaders(env),
-    });
-    if (!resp.ok) {
-      console.error('Supabase read error:', resp.status, await resp.text());
-      return null;
+    // Paged: PostgREST caps one response at 1000 rows and the orders
+    // table is past 1100, so the old single fetch fed Claudia's chat an
+    // arbitrary 1000-row subset — she could miss the exact order Sidd
+    // asked about and reply as if all was well. Any failed page returns
+    // null (a partial list is the same silent-miss bug in disguise);
+    // id.asc keeps page boundaries deterministic.
+    const all = [];
+    for (let from = 0; ; from += 1000) {
+      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?select=*' +
+        '&order=id.asc&offset=' + from + '&limit=1000', {
+        headers: sbHeaders(env),
+      });
+      if (!resp.ok) {
+        console.error('Supabase read error:', resp.status, await resp.text());
+        return null;
+      }
+      const rows = await resp.json();
+      if (!Array.isArray(rows)) return null;
+      all.push(...rows);
+      if (rows.length < 1000) break; // short page = table exhausted
     }
-    const rows = await resp.json();
-    return Array.isArray(rows) ? rows.map(supabaseRowToEvent) : [];
+    return all.map(supabaseRowToEvent);
   } catch (e) {
     console.error('Supabase read exception:', e);
     return null;
