@@ -2360,6 +2360,23 @@ async function buildShiftSummaryText(env, row, workers) {
   // This is the denominator for every per-box labor number below.
   const touched = coco + prepCoco;
 
+  // v2.1 attribution, phase A (capture-only): what the worker MARKED at
+  // clock-out. Own try/catch buffer like the Day P&L block — a failure or a
+  // missing table drops only these lines. The heuristic pace/labor math
+  // below is deliberately untouched (App.js parity; phase B is fenced).
+  try {
+    const marked = await fetchSb(env, 'shift_orders?select=order_id,work_type,coconuts_qty,client_name' +
+      '&shift_id=eq.' + row.id + '&order=marked_at.asc');
+    if (Array.isArray(marked) && marked.length) {
+      const mCoco = marked.reduce((s2, m) => s2 + (m.coconuts_qty || 0), 0);
+      lines.push('Marked at clock-out (' + marked.length + ' order' + (marked.length === 1 ? '' : 's') + '):');
+      marked.forEach(m => lines.push('· ' + (m.client_name || '?') +
+        (m.work_type === 'prep' ? ' (prep)' : '') +
+        ' - ' + fmtBoxes(m.coconuts_qty || 0) + ' boxes'));
+      lines.push('Marked total: ' + fmtBoxes(mCoco) + ' boxes (' + mCoco + ' coconuts)');
+    }
+  } catch (e) { console.error('marked-orders block failed', e); }
+
   if (rate == null) {
     lines.push('Labor: ' + fmtHm(mins) + ' - hourly rate not set for ' + row.worker_name +
       '. Payroll will not count this shift until hourly_rate_cents is set in field_workers.');
