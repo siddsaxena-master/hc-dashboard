@@ -91,6 +91,34 @@ begin
       message = 'cutover blocked: shifts.field_worker_id from 015 is missing';
   end if;
 
+  if not exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'push_tokens'
+      and column_name = 'device_id'
+      and data_type = 'uuid'
+      and is_nullable = 'YES'
+  ) then
+    raise exception using
+      errcode = '55000',
+      message = 'cutover blocked: push_tokens.device_id from 015 is missing or incompatible';
+  end if;
+
+  if not exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'live_activity_tokens'
+      and column_name = 'device_id'
+      and data_type = 'uuid'
+      and is_nullable = 'YES'
+  ) then
+    raise exception using
+      errcode = '55000',
+      message = 'cutover blocked: live_activity_tokens.device_id from 015 is missing or incompatible';
+  end if;
+
   foreach v_signature in array array[
     'public.hc_claim_field_worker()',
     'public.hc_current_worker_id()',
@@ -107,14 +135,28 @@ begin
     'public.hc_edit_shift_times(uuid,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text)',
     'public.hc_mark_shifts_paid(jsonb)',
     'public.hc_record_shift_orders(uuid,jsonb)',
-    'public.hc_register_push_token(text,text)',
-    'public.hc_register_live_activity_token(text,uuid,text)',
-    'public.hc_unregister_device()'
+    'public.hc_sync_notification_device(uuid,text,boolean,boolean)',
+    'public.hc_register_live_activity_token(text,uuid,text,uuid,boolean)',
+    'public.hc_unregister_device(uuid)'
   ] loop
     if pg_catalog.to_regprocedure(v_signature) is null then
       raise exception using
         errcode = '55000',
         message = pg_catalog.format('cutover blocked: required RPC %s is missing', v_signature);
+    end if;
+  end loop;
+
+  -- The old overloads cannot prove which physical phone is acting. A stale
+  -- callable copy would bypass the device-scoped reconciliation model.
+  foreach v_signature in array array[
+    'public.hc_register_push_token(text,text)',
+    'public.hc_register_live_activity_token(text,uuid,text)',
+    'public.hc_unregister_device()'
+  ] loop
+    if pg_catalog.to_regprocedure(v_signature) is not null then
+      raise exception using
+        errcode = '55000',
+        message = pg_catalog.format('cutover blocked: obsolete RPC %s still exists', v_signature);
     end if;
   end loop;
 
@@ -248,6 +290,56 @@ begin
       message = 'cutover blocked: open-shift worker ID index is missing';
   end if;
 
+  if not exists (
+    select 1
+    from pg_catalog.pg_index as i
+    where i.indexrelid = pg_catalog.to_regclass('public.push_tokens_device_uidx')
+      and i.indrelid = 'public.push_tokens'::pg_catalog.regclass
+      and i.indisunique is true
+      and i.indpred is not null
+      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'device_id'
+      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%device_id is not null%'
+  ) then
+    raise exception using
+      errcode = '55000',
+      message = 'cutover blocked: unique push device index is missing';
+  end if;
+
+  if not exists (
+    select 1
+    from pg_catalog.pg_index as i
+    where i.indexrelid = pg_catalog.to_regclass('public.live_activity_tokens_device_p2s_uidx')
+      and i.indrelid = 'public.live_activity_tokens'::pg_catalog.regclass
+      and i.indisunique is true
+      and i.indpred is not null
+      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'device_id'
+      and pg_catalog.pg_get_indexdef(i.indexrelid, 2, true) = 'token_type'
+      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%shift_id is null%'
+      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%device_id is not null%'
+  ) then
+    raise exception using
+      errcode = '55000',
+      message = 'cutover blocked: unique push-to-start device index is missing';
+  end if;
+
+  if not exists (
+    select 1
+    from pg_catalog.pg_index as i
+    where i.indexrelid = pg_catalog.to_regclass('public.live_activity_tokens_device_update_uidx')
+      and i.indrelid = 'public.live_activity_tokens'::pg_catalog.regclass
+      and i.indisunique is true
+      and i.indpred is not null
+      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'device_id'
+      and pg_catalog.pg_get_indexdef(i.indexrelid, 2, true) = 'token_type'
+      and pg_catalog.pg_get_indexdef(i.indexrelid, 3, true) = 'shift_id'
+      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%shift_id is not null%'
+      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%device_id is not null%'
+  ) then
+    raise exception using
+      errcode = '55000',
+      message = 'cutover blocked: unique activity-update device index is missing';
+  end if;
+
   if exists (
     select 1
     from pg_catalog.pg_class as c
@@ -284,6 +376,33 @@ lock table
   public.shift_orders,
   public.shifts
 in share row exclusive mode;
+
+-- Legacy rows cannot be attributed to a physical phone. Rows for a missing,
+-- inactive, unlinked, or non-notification roster identity are categorically
+-- ineligible. Remove only those known-stale destinations after the locks are
+-- held. Malformed tokens, invalid shifts, and ambiguous duplicates still fail
+-- the strict data checks below instead of being silently discarded.
+delete from public.push_tokens as pt
+where pt.device_id is null
+   or not exists (
+     select 1
+     from public.field_workers as fw
+     where lower(fw.email) = lower(pt.email)
+       and fw.active is true
+       and fw.auth_user_id is not null
+       and fw.role in ('owner', 'manager')
+   );
+
+delete from public.live_activity_tokens as lat
+where lat.device_id is null
+   or not exists (
+     select 1
+     from public.field_workers as fw
+     where lower(fw.email) = lower(lat.email)
+       and fw.active is true
+       and fw.auth_user_id is not null
+       and fw.role in ('owner', 'manager')
+   );
 
 -- --------------------------------------------------------------------------
 -- 2. Data preflight, fail closed instead of transferring or orphaning access
@@ -397,6 +516,7 @@ begin
        or fw.active is not true
        or fw.auth_user_id is null
        or fw.role not in ('owner', 'manager')
+       or pt.device_id is null
        or lower(pt.platform) <> 'ios'
        or length(pt.apns_token) < 32
        or length(pt.apns_token) > 512
@@ -428,6 +548,7 @@ begin
        or fw.active is not true
        or fw.auth_user_id is null
        or fw.role not in ('owner', 'manager')
+       or lat.device_id is null
        or length(lat.token) < 32
        or length(lat.token) > 512
        or lower(lat.token) !~ '^[0-9a-f]+$'
@@ -451,6 +572,25 @@ begin
     raise exception using
       errcode = '23505',
       message = 'cutover blocked: one Live Activity token belongs to multiple emails';
+  end if;
+
+  -- A stable phone identity must resolve to the same roster email across push
+  -- and Live Activity rows, even when the row types or shift IDs differ.
+  if exists (
+    select 1
+    from (
+      select pt.device_id, lower(pt.email) as email
+      from public.push_tokens as pt
+      union all
+      select lat.device_id, lower(lat.email) as email
+      from public.live_activity_tokens as lat
+    ) as destinations
+    group by destinations.device_id
+    having count(distinct destinations.email) > 1
+  ) then
+    raise exception using
+      errcode = '23505',
+      message = 'cutover blocked: one device ID belongs to multiple notification identities';
   end if;
 end
 $preflight$;
@@ -662,9 +802,9 @@ alter function public.hc_manage_clock_out(uuid, timestamptz, double precision, d
 alter function public.hc_edit_shift_times(uuid, timestamptz, timestamptz, timestamptz, timestamptz, text) security definer set search_path = '';
 alter function public.hc_mark_shifts_paid(jsonb) security definer set search_path = '';
 alter function public.hc_record_shift_orders(uuid, jsonb) security definer set search_path = '';
-alter function public.hc_register_push_token(text, text) security definer set search_path = '';
-alter function public.hc_register_live_activity_token(text, uuid, text) security definer set search_path = '';
-alter function public.hc_unregister_device() security definer set search_path = '';
+alter function public.hc_sync_notification_device(uuid, text, boolean, boolean) security definer set search_path = '';
+alter function public.hc_register_live_activity_token(text, uuid, text, uuid, boolean) security definer set search_path = '';
+alter function public.hc_unregister_device(uuid) security definer set search_path = '';
 
 revoke all on function public.hc_claim_field_worker() from public, anon, authenticated;
 revoke all on function public.hc_current_worker_id() from public, anon, authenticated;
@@ -681,9 +821,9 @@ revoke all on function public.hc_manage_clock_out(uuid, timestamptz, double prec
 revoke all on function public.hc_edit_shift_times(uuid, timestamptz, timestamptz, timestamptz, timestamptz, text) from public, anon, authenticated;
 revoke all on function public.hc_mark_shifts_paid(jsonb) from public, anon, authenticated;
 revoke all on function public.hc_record_shift_orders(uuid, jsonb) from public, anon, authenticated;
-revoke all on function public.hc_register_push_token(text, text) from public, anon, authenticated;
-revoke all on function public.hc_register_live_activity_token(text, uuid, text) from public, anon, authenticated;
-revoke all on function public.hc_unregister_device() from public, anon, authenticated;
+revoke all on function public.hc_sync_notification_device(uuid, text, boolean, boolean) from public, anon, authenticated;
+revoke all on function public.hc_register_live_activity_token(text, uuid, text, uuid, boolean) from public, anon, authenticated;
+revoke all on function public.hc_unregister_device(uuid) from public, anon, authenticated;
 
 grant execute on function public.hc_claim_field_worker() to authenticated, service_role;
 grant execute on function public.hc_current_worker_id() to authenticated, service_role;
@@ -700,9 +840,9 @@ grant execute on function public.hc_manage_clock_out(uuid, timestamptz, double p
 grant execute on function public.hc_edit_shift_times(uuid, timestamptz, timestamptz, timestamptz, timestamptz, text) to authenticated, service_role;
 grant execute on function public.hc_mark_shifts_paid(jsonb) to authenticated, service_role;
 grant execute on function public.hc_record_shift_orders(uuid, jsonb) to authenticated, service_role;
-grant execute on function public.hc_register_push_token(text, text) to authenticated, service_role;
-grant execute on function public.hc_register_live_activity_token(text, uuid, text) to authenticated, service_role;
-grant execute on function public.hc_unregister_device() to authenticated, service_role;
+grant execute on function public.hc_sync_notification_device(uuid, text, boolean, boolean) to authenticated, service_role;
+grant execute on function public.hc_register_live_activity_token(text, uuid, text, uuid, boolean) to authenticated, service_role;
+grant execute on function public.hc_unregister_device(uuid) to authenticated, service_role;
 
 -- All phone writes now use authenticated RPCs except bounded GPS inserts. The
 -- email-resolving compatibility trigger is no longer needed and would let a
@@ -988,9 +1128,9 @@ begin
     'public.hc_edit_shift_times(uuid,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text)',
     'public.hc_mark_shifts_paid(jsonb)',
     'public.hc_record_shift_orders(uuid,jsonb)',
-    'public.hc_register_push_token(text,text)',
-    'public.hc_register_live_activity_token(text,uuid,text)',
-    'public.hc_unregister_device()'
+    'public.hc_sync_notification_device(uuid,text,boolean,boolean)',
+    'public.hc_register_live_activity_token(text,uuid,text,uuid,boolean)',
+    'public.hc_unregister_device(uuid)'
   ] loop
     if pg_catalog.has_function_privilege('anon', v_signature, 'EXECUTE')
        or not pg_catalog.has_function_privilege('authenticated', v_signature, 'EXECUTE')
@@ -1022,6 +1162,21 @@ begin
         );
     end if;
   end loop;
+
+  foreach v_signature in array array[
+    'public.hc_register_push_token(text,text)',
+    'public.hc_register_live_activity_token(text,uuid,text)',
+    'public.hc_unregister_device()'
+  ] loop
+    if pg_catalog.to_regprocedure(v_signature) is not null then
+      raise exception using
+        errcode = '42501',
+        message = pg_catalog.format(
+          'cutover assertion failed: obsolete RPC %s still exists',
+          v_signature
+        );
+    end if;
+  end loop;
 end
 $assertions$;
 
@@ -1033,7 +1188,8 @@ commit;
 --    attribute eligible orders, and read only their own base shifts.
 -- 3. manager can list safe team shifts with is_paid, see routes/attribution,
 --    edit only another worker's unpaid shift, and cannot read payroll columns.
--- 4. owner can edit, mark paid, and register notification tokens.
--- 5. a team login on a former owner phone removes that APNs mapping.
+-- 4. owner can edit, mark paid, and reconcile device-scoped notification tokens.
+-- 5. a team/inactive login on a former owner phone removes that phone's push
+--    and Live Activity mappings, while an older phone cannot unregister a newer one.
 -- 6. Claudia/Cloudflare, Jarvis, Mark, and pushdrain service-role reads/writes
 --    still work. Public dashboard orders and signatures remain unchanged.

@@ -2678,7 +2678,7 @@ async function watch40Hours(env, row, minsJustClosed) {
 // opts.ownersOnly keeps scheduling/pay matters off manager phones entirely.
 async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds, opts = {}) {
   try {
-    const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&select=email,role') || [];
+    const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&active=eq.true&select=email,role') || [];
     const rec = partitionRecipients(staff, opts.excludeEmail);
     if (opts.ownersOnly) rec.managers = [];
     const all = rec.owners.concat(rec.managers);
@@ -2789,7 +2789,7 @@ async function enqueueLiveActivityPush(env, tokens, event, contentState, opts = 
 
 // Owner + manager phones both carry the shift card (2026-08-06).
 async function laManageEmails(env) {
-  const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&select=email');
+  const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&active=eq.true&select=email');
   if (staff === null) return null; // read FAILED — callers must not treat this as "nobody"
   return staff.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
 }

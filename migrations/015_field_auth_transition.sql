@@ -1184,6 +1184,30 @@ $function$;
 -- 6. Secure attribution and notification token RPCs
 -- --------------------------------------------------------------------------
 
+-- A stable app-generated UUID lets a later login or sign-out prove which
+-- phone it is reconciling. Existing rows stay nullable during the canary so
+-- old installed builds keep working until the final cutover.
+alter table public.push_tokens
+  add column if not exists device_id uuid;
+
+alter table public.live_activity_tokens
+  add column if not exists device_id uuid;
+
+-- Keep the existing one-phone-per-email rules for this security transition.
+-- These additional indexes prevent one non-null device ID from being claimed
+-- by two identities for the same notification destination.
+create unique index if not exists push_tokens_device_uidx
+  on public.push_tokens (device_id)
+  where device_id is not null;
+
+create unique index if not exists live_activity_tokens_device_p2s_uidx
+  on public.live_activity_tokens (device_id, token_type)
+  where shift_id is null and device_id is not null;
+
+create unique index if not exists live_activity_tokens_device_update_uidx
+  on public.live_activity_tokens (device_id, token_type, shift_id)
+  where shift_id is not null and device_id is not null;
+
 create or replace function public.hc_record_shift_orders(
   p_shift_id uuid,
   p_links jsonb
@@ -1313,9 +1337,17 @@ begin
 end
 $function$;
 
-create or replace function public.hc_register_push_token(
+-- These pre-device overloads must not survive a partial re-run. They cannot
+-- distinguish an old phone signing out from a newer phone on the same account.
+drop function if exists public.hc_register_push_token(text, text);
+drop function if exists public.hc_register_live_activity_token(text, uuid, text);
+drop function if exists public.hc_unregister_device();
+
+create or replace function public.hc_sync_notification_device(
+  p_device_id uuid,
   p_apns_token text,
-  p_platform text default 'ios'
+  p_push_allowed boolean,
+  p_live_supported boolean
 )
 returns void
 language plpgsql
@@ -1323,59 +1355,121 @@ security definer
 set search_path = ''
 as $function$
 declare
-  v_email text := public.hc_current_worker_email();
-  v_role text := public.hc_current_worker_role();
-  v_token text := lower(trim(p_apns_token));
+  v_email text;
+  v_role text;
+  v_active boolean;
+  v_token text := nullif(lower(trim(p_apns_token)), '');
 begin
-  if v_email is null then
+  if auth.uid() is null then
     raise exception using
       errcode = '42501',
-      message = 'active field worker required';
+      message = 'authenticated Supabase user required';
   end if;
 
-  if v_token is null
-     or length(v_token) < 32
+  if p_device_id is null then
+    raise exception using
+      errcode = '22023',
+      message = 'device ID is required';
+  end if;
+
+  if p_push_allowed is null or p_live_supported is null then
+    raise exception using
+      errcode = '22023',
+      message = 'notification capability state is required';
+  end if;
+
+  if v_token is not null
+     and (length(v_token) < 32
      or length(v_token) > 512
-     or v_token !~ '^[0-9a-f]+$' then
+     or v_token !~ '^[0-9a-f]+$') then
     raise exception using
       errcode = '22023',
       message = 'invalid APNs token';
   end if;
 
-  if lower(trim(p_platform)) <> 'ios' then
+  -- Resolve the roster row even when it is inactive. That lets a deactivated
+  -- or downgraded account authenticate once and remove every stale destination.
+  select lower(fw.email), fw.role, fw.active
+  into v_email, v_role, v_active
+  from public.field_workers as fw
+  where fw.auth_user_id = auth.uid()
+  limit 1;
+
+  if v_email is null then
     raise exception using
-      errcode = '22023',
-      message = 'unsupported push platform';
+      errcode = '42501',
+      message = 'linked field worker identity required';
   end if;
 
-  -- An offline sign-out cannot clean the old account. The next authenticated
-  -- login proves possession of this exact device token and removes any stale
-  -- mapping for another email before deciding whether to store it again.
+  -- Possession of the stable device ID reclaims both notification channels
+  -- from a prior login. Possession of the exact APNs token also repairs a
+  -- legacy push row that predates device IDs.
   delete from public.push_tokens
-  where apns_token = v_token
+  where device_id = p_device_id
     and lower(email) <> v_email;
 
-  if v_role not in ('owner', 'manager') then
-    -- Also clean notification rows left behind by an owner/manager role
-    -- downgrade. Team members never become notification destinations.
+  delete from public.live_activity_tokens
+  where device_id = p_device_id
+    and lower(email) <> v_email;
+
+  if v_token is not null then
     delete from public.push_tokens
+    where lower(apns_token) = v_token
+      and lower(email) <> v_email;
+  end if;
+
+  if v_active is not true or v_role not in ('owner', 'manager') then
+    -- Eligibility is account-wide. A deactivation or role downgrade removes
+    -- every destination for that identity, including rows on another phone.
+    delete from public.push_tokens
+    where lower(email) = v_email;
+
+    delete from public.live_activity_tokens
     where lower(email) = v_email;
     return;
   end if;
 
-  insert into public.push_tokens (email, apns_token, platform, updated_at)
-  values (v_email, v_token, 'ios', clock_timestamp())
-  on conflict (email) do update
-  set apns_token = excluded.apns_token,
-      platform = excluded.platform,
-      updated_at = excluded.updated_at;
+  if p_push_allowed is true and v_token is not null then
+    insert into public.push_tokens (
+      email,
+      apns_token,
+      platform,
+      updated_at,
+      device_id
+    ) values (
+      v_email,
+      v_token,
+      'ios',
+      clock_timestamp(),
+      p_device_id
+    )
+    on conflict (email) do update
+    set apns_token = excluded.apns_token,
+        platform = excluded.platform,
+        updated_at = excluded.updated_at,
+        device_id = excluded.device_id;
+  elsif p_push_allowed is not true then
+    -- Preserve a newer phone for the same account. A null device ID is the
+    -- legacy one-phone row and is safe to remove under the retained model.
+    delete from public.push_tokens
+    where lower(email) = v_email
+      and (device_id = p_device_id or device_id is null);
+  end if;
+
+  if p_live_supported is not true then
+    delete from public.live_activity_tokens
+    where lower(email) = v_email
+      and (device_id = p_device_id or device_id is null);
+  end if;
 end
 $function$;
 
 create or replace function public.hc_register_live_activity_token(
   p_token_type text,
   p_shift_id uuid,
-  p_token text
+  p_token text,
+  p_device_id uuid,
+  p_supported boolean
 )
 returns void
 language plpgsql
@@ -1383,21 +1477,34 @@ security definer
 set search_path = ''
 as $function$
 declare
-  v_email text := public.hc_current_worker_email();
-  v_role text := public.hc_current_worker_role();
+  v_email text;
+  v_role text;
+  v_active boolean;
   v_type text := lower(trim(p_token_type));
-  v_token text := lower(trim(p_token));
+  v_token text := nullif(lower(trim(p_token)), '');
 begin
-  if v_email is null then
+  if auth.uid() is null then
     raise exception using
       errcode = '42501',
-      message = 'active field worker required';
+      message = 'authenticated Supabase user required';
   end if;
 
-  if v_token is null
-     or length(v_token) < 32
+  if p_device_id is null then
+    raise exception using
+      errcode = '22023',
+      message = 'device ID is required';
+  end if;
+
+  if p_supported is null then
+    raise exception using
+      errcode = '22023',
+      message = 'Live Activity support state is required';
+  end if;
+
+  if v_token is not null
+     and (length(v_token) < 32
      or length(v_token) > 512
-     or v_token !~ '^[0-9a-f]+$' then
+     or v_token !~ '^[0-9a-f]+$') then
     raise exception using
       errcode = '22023',
       message = 'invalid Live Activity token';
@@ -1409,15 +1516,50 @@ begin
       message = 'unsupported Live Activity token type';
   end if;
 
-  -- Exact-token cleanup lets a shared phone relinquish a stale owner's token
-  -- without granting a team member read or delete access to arbitrary rows.
+  if p_supported is true and v_token is null then
+    raise exception using
+      errcode = '22023',
+      message = 'Live Activity token is required when supported';
+  end if;
+
+  select lower(fw.email), fw.role, fw.active
+  into v_email, v_role, v_active
+  from public.field_workers as fw
+  where fw.auth_user_id = auth.uid()
+  limit 1;
+
+  if v_email is null then
+    raise exception using
+      errcode = '42501',
+      message = 'linked field worker identity required';
+  end if;
+
+  -- Reclaim this phone from a prior login before eligibility/support decides
+  -- whether a new destination may be stored. Exact-token cleanup also repairs
+  -- a legacy row whose device ID is still null.
   delete from public.live_activity_tokens
-  where token = v_token
+  where device_id = p_device_id
     and lower(email) <> v_email;
 
-  if v_role not in ('owner', 'manager') then
+  if v_token is not null then
+    delete from public.live_activity_tokens
+    where lower(token) = v_token
+      and lower(email) <> v_email;
+  end if;
+
+  if v_active is not true or v_role not in ('owner', 'manager') then
+    delete from public.push_tokens
+    where lower(email) = v_email;
+
     delete from public.live_activity_tokens
     where lower(email) = v_email;
+    return;
+  end if;
+
+  if p_supported is not true then
+    delete from public.live_activity_tokens
+    where lower(email) = v_email
+      and (device_id = p_device_id or device_id is null);
     return;
   end if;
 
@@ -1433,17 +1575,20 @@ begin
       token_type,
       shift_id,
       token,
-      updated_at
+      updated_at,
+      device_id
     ) values (
       v_email,
       'push_to_start',
       null,
       v_token,
-      clock_timestamp()
+      clock_timestamp(),
+      p_device_id
     )
     on conflict (email, token_type) where shift_id is null do update
     set token = excluded.token,
-        updated_at = excluded.updated_at;
+        updated_at = excluded.updated_at,
+        device_id = excluded.device_id;
 
   elsif v_type = 'activity_update' then
     if p_shift_id is null
@@ -1458,26 +1603,29 @@ begin
       token_type,
       shift_id,
       token,
-      updated_at
+      updated_at,
+      device_id
     ) values (
       v_email,
       'activity_update',
       p_shift_id,
       v_token,
-      clock_timestamp()
+      clock_timestamp(),
+      p_device_id
     )
     on conflict (email, token_type, shift_id) where shift_id is not null do update
     set token = excluded.token,
-        updated_at = excluded.updated_at;
+        updated_at = excluded.updated_at,
+        device_id = excluded.device_id;
 
   end if;
 end
 $function$;
 
--- Sign-out cleanup intentionally works even after a worker is deactivated.
--- The existing schema supports one push-to-start/device mapping per email, so
--- removing all rows for this email matches its current one-device behavior.
-create or replace function public.hc_unregister_device()
+-- Sign-out cleanup works even after deactivation and is scoped to the phone
+-- that signed out. Null-device rows are legacy one-phone records and are also
+-- removed for the current identity during the transition.
+create or replace function public.hc_unregister_device(p_device_id uuid)
 returns void
 language plpgsql
 security definer
@@ -1486,6 +1634,12 @@ as $function$
 declare
   v_email text;
 begin
+  if p_device_id is null then
+    raise exception using
+      errcode = '22023',
+      message = 'device ID is required';
+  end if;
+
   select lower(fw.email)
   into v_email
   from public.field_workers as fw
@@ -1497,10 +1651,12 @@ begin
   end if;
 
   delete from public.push_tokens
-  where lower(email) = v_email;
+  where lower(email) = v_email
+    and (device_id = p_device_id or device_id is null);
 
   delete from public.live_activity_tokens
-  where lower(email) = v_email;
+  where lower(email) = v_email
+    and (device_id = p_device_id or device_id is null);
 end
 $function$;
 
@@ -1522,12 +1678,12 @@ revoke all on function public.hc_mark_shifts_paid(jsonb)
   from public, anon;
 revoke all on function public.hc_record_shift_orders(uuid, jsonb)
   from public, anon;
-revoke all on function public.hc_register_push_token(text, text)
-  from public, anon;
-revoke all on function public.hc_register_live_activity_token(text, uuid, text)
-  from public, anon;
-revoke all on function public.hc_unregister_device()
-  from public, anon;
+revoke all on function public.hc_sync_notification_device(uuid, text, boolean, boolean)
+  from public, anon, authenticated;
+revoke all on function public.hc_register_live_activity_token(text, uuid, text, uuid, boolean)
+  from public, anon, authenticated;
+revoke all on function public.hc_unregister_device(uuid)
+  from public, anon, authenticated;
 
 grant execute on function public.hc_start_shift(double precision, double precision, text)
   to authenticated, service_role;
@@ -1543,11 +1699,11 @@ grant execute on function public.hc_mark_shifts_paid(jsonb)
   to authenticated, service_role;
 grant execute on function public.hc_record_shift_orders(uuid, jsonb)
   to authenticated, service_role;
-grant execute on function public.hc_register_push_token(text, text)
+grant execute on function public.hc_sync_notification_device(uuid, text, boolean, boolean)
   to authenticated, service_role;
-grant execute on function public.hc_register_live_activity_token(text, uuid, text)
+grant execute on function public.hc_register_live_activity_token(text, uuid, text, uuid, boolean)
   to authenticated, service_role;
-grant execute on function public.hc_unregister_device()
+grant execute on function public.hc_unregister_device(uuid)
   to authenticated, service_role;
 
 -- --------------------------------------------------------------------------
@@ -1566,11 +1722,10 @@ grant execute on function public.hc_unregister_device()
 --    They remain owner-visible but are intentionally not claimable by email.
 -- 5. Add a controlled owner-only roster email-change RPC so Auth and
 --    notification identity stay aligned.
--- 6. Live Activity cleanup can reclaim only a token the new login presents.
---    The current schema has no stable device ID, so an offline sign-out may
---    leave old activity_update rows whose tokens are no longer available on
---    that phone. Keep worker-side expiry/410 cleanup, and add a device ID in a
---    later migration before promising complete cross-account reclamation.
+-- 6. The stable device ID now scopes sign-out and reclaims stale push and Live
+--    Activity rows after an account switch. Migration 016 must remove legacy
+--    null-device rows before the final authenticated-only cutover. Supporting
+--    multiple phones for one email remains a separate future schema change.
 -- 7. Leave orders and delivery_signatures unchanged until the public-hosted
 --    dashboard has moved its database access behind an authenticated Worker.
 
