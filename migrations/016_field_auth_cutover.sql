@@ -47,6 +47,7 @@ declare
   v_arg_names text[];
   v_arg_types oid[];
   v_is_paid_position int;
+  v_index record;
 begin
   foreach v_table in array array[
     'field_workers',
@@ -230,115 +231,75 @@ begin
       message = 'cutover blocked: validated shift worker foreign key is missing';
   end if;
 
-  if not exists (
-    select 1
-    from pg_catalog.pg_index as i
-    where i.indexrelid = pg_catalog.to_regclass('public.field_workers_email_lower_uidx')
-      and i.indrelid = 'public.field_workers'::pg_catalog.regclass
-      and i.indisunique is true
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'lower(email)'
-  ) then
-    raise exception using
-      errcode = '55000',
-      message = 'cutover blocked: case-insensitive worker email index is missing';
-  end if;
-
-  if not exists (
-    select 1
-    from pg_catalog.pg_index as i
-    where i.indexrelid = pg_catalog.to_regclass('public.field_workers_auth_user_uidx')
-      and i.indrelid = 'public.field_workers'::pg_catalog.regclass
-      and i.indisunique is true
-      and i.indpred is not null
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'auth_user_id'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%auth_user_id is not null%'
-  ) then
-    raise exception using
-      errcode = '55000',
-      message = 'cutover blocked: unique worker Auth link index is missing';
-  end if;
-
-  if not exists (
-    select 1
-    from pg_catalog.pg_index as i
-    where i.indexrelid = pg_catalog.to_regclass('public.shifts_one_open_worker_email_uidx')
-      and i.indrelid = 'public.shifts'::pg_catalog.regclass
-      and i.indisunique is true
-      and i.indpred is not null
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'lower(worker_email)'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%clock_out_at is null%'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%worker_email is not null%'
-  ) then
-    raise exception using
-      errcode = '55000',
-      message = 'cutover blocked: open-shift email index is missing';
-  end if;
-
-  if not exists (
-    select 1
-    from pg_catalog.pg_index as i
-    where i.indexrelid = pg_catalog.to_regclass('public.shifts_one_open_worker_uidx')
-      and i.indrelid = 'public.shifts'::pg_catalog.regclass
-      and i.indisunique is true
-      and i.indpred is not null
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'field_worker_id'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%clock_out_at is null%'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%field_worker_id is not null%'
-  ) then
-    raise exception using
-      errcode = '55000',
-      message = 'cutover blocked: open-shift worker ID index is missing';
-  end if;
-
-  if not exists (
-    select 1
-    from pg_catalog.pg_index as i
-    where i.indexrelid = pg_catalog.to_regclass('public.push_tokens_device_uidx')
-      and i.indrelid = 'public.push_tokens'::pg_catalog.regclass
-      and i.indisunique is true
-      and i.indpred is not null
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'device_id'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%device_id is not null%'
-  ) then
-    raise exception using
-      errcode = '55000',
-      message = 'cutover blocked: unique push device index is missing';
-  end if;
-
-  if not exists (
-    select 1
-    from pg_catalog.pg_index as i
-    where i.indexrelid = pg_catalog.to_regclass('public.live_activity_tokens_device_p2s_uidx')
-      and i.indrelid = 'public.live_activity_tokens'::pg_catalog.regclass
-      and i.indisunique is true
-      and i.indpred is not null
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'device_id'
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 2, true) = 'token_type'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%shift_id is null%'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%device_id is not null%'
-  ) then
-    raise exception using
-      errcode = '55000',
-      message = 'cutover blocked: unique push-to-start device index is missing';
-  end if;
-
-  if not exists (
-    select 1
-    from pg_catalog.pg_index as i
-    where i.indexrelid = pg_catalog.to_regclass('public.live_activity_tokens_device_update_uidx')
-      and i.indrelid = 'public.live_activity_tokens'::pg_catalog.regclass
-      and i.indisunique is true
-      and i.indpred is not null
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = 'device_id'
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 2, true) = 'token_type'
-      and pg_catalog.pg_get_indexdef(i.indexrelid, 3, true) = 'shift_id'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%shift_id is not null%'
-      and pg_catalog.pg_get_expr(i.indpred, i.indrelid) ilike '%device_id is not null%'
-  ) then
-    raise exception using
-      errcode = '55000',
-      message = 'cutover blocked: unique activity-update device index is missing';
-  end if;
+  -- Compare the complete normalized predicate, not fragments. A weakened
+  -- predicate such as the canonical expression followed by AND false must fail.
+  for v_index in
+    select *
+    from (
+      values
+        ('field_workers_email_lower_uidx', 'field_workers', 1, 'lower(email)', null, null, null),
+        ('field_workers_auth_user_uidx', 'field_workers', 1, 'auth_user_id', null, null,
+          'auth_user_idisnotnull'),
+        ('shifts_one_open_worker_email_uidx', 'shifts', 1, 'lower(worker_email)', null, null,
+          'clock_out_atisnullandworker_emailisnotnull'),
+        ('shifts_one_open_worker_uidx', 'shifts', 1, 'field_worker_id', null, null,
+          'clock_out_atisnullandfield_worker_idisnotnull'),
+        ('push_tokens_device_uidx', 'push_tokens', 1, 'device_id', null, null,
+          'device_idisnotnull'),
+        ('live_activity_tokens_device_p2s_uidx', 'live_activity_tokens', 2, 'device_id', 'token_type', null,
+          'shift_idisnullanddevice_idisnotnull'),
+        ('live_activity_tokens_device_update_uidx', 'live_activity_tokens', 3, 'device_id', 'token_type', 'shift_id',
+          'shift_idisnotnullanddevice_idisnotnull')
+    ) as expected(index_name, table_name, key_count, key_one, key_two, key_three, predicate_tokens)
+  loop
+    if not exists (
+      select 1
+      from pg_catalog.pg_index as i
+      join pg_catalog.pg_class as idx on idx.oid = i.indexrelid
+      join pg_catalog.pg_class as tbl on tbl.oid = i.indrelid
+      join pg_catalog.pg_namespace as ns on ns.oid = idx.relnamespace
+      where ns.nspname = 'public'
+        and idx.relname::text = v_index.index_name
+        and idx.relkind = 'i'
+        and tbl.oid = pg_catalog.to_regclass(
+          pg_catalog.format('public.%I', v_index.table_name)
+        )
+        and idx.relowner = tbl.relowner
+        and i.indisunique is true
+        and i.indisvalid is true
+        and i.indisready is true
+        and i.indislive is true
+        and i.indnkeyatts = v_index.key_count
+        and i.indnatts = v_index.key_count
+        and pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) = v_index.key_one
+        and (
+          v_index.key_count < 2
+          or pg_catalog.pg_get_indexdef(i.indexrelid, 2, true) = v_index.key_two
+        )
+        and (
+          v_index.key_count < 3
+          or pg_catalog.pg_get_indexdef(i.indexrelid, 3, true) = v_index.key_three
+        )
+        and case
+          when v_index.predicate_tokens is null then i.indpred is null
+          else
+            i.indpred is not null
+            and pg_catalog.regexp_replace(
+              pg_catalog.lower(pg_catalog.pg_get_expr(i.indpred, i.indrelid)),
+              '[[:space:]()]',
+              '',
+              'g'
+            ) = v_index.predicate_tokens
+        end
+    ) then
+      raise exception using
+        errcode = '55000',
+        message = pg_catalog.format(
+          'cutover blocked: required index public.%I is missing or incompatible',
+          v_index.index_name
+        );
+    end if;
+  end loop;
 
   if exists (
     select 1

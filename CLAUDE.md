@@ -28,6 +28,22 @@
   `GET https://omdcfphbwuwsrffdszlg.supabase.co/rest/v1/<table>?limit=1`
   with the anon key from index.html — expect HTTP 200.
 
+## HC Field authentication rollout
+
+- Never run migration 014. Migration 015 supersedes it and removes 014's
+  unsafe anonymous attribution policies if they already exist.
+- Migration 015 is the temporary compatibility stage. Test it in a disposable
+  Supabase clone, back up production, and get Sidd's exact `yes do it` before
+  running it in production.
+- Migration 016 is the final cutoff. Run it only after every active phone has
+  the authenticated app, notification rows are reconciled, physical-phone and
+  service-role tests pass, and Sidd gives a separate exact approval.
+- `migrations/016_field_auth_cutover_rollback.sql` is an emergency undo file,
+  not a normal migration. It deliberately reopens the older anonymous phone
+  access and cannot reconstruct notification tokens deleted by 016. Test it in
+  a disposable clone before the cutover, and never run it without separate
+  production review and Sidd's exact approval.
+
 ## Data flow (who writes what)
 
 - Jarvis (hc-invoice-bot on the droplet) syncs QuickBooks invoices into
