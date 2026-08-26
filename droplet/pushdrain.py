@@ -10,14 +10,20 @@ The worker now INSERTs one row per push into public.push_queue
 
   every 20 seconds:
     1. expires rows older than 15 minutes (pushes are perishable):
-       Telegram fallback if the row carries telegram_text, then done.
-    2. claims a batch (max 20, attempts < 5, unclaimed or stale-claimed)
-       and for each row sends the payload's aps to every device token
-       via curl --http2.
-       - any 200                        -> done
+       Telegram fallback only when no phone already succeeded; an expired
+       la_end releases its phone lease for the later five-minute scan.
+    2. reads up to 20 candidates, then claims and processes each row just in
+       time (attempts < 5, unclaimed or stale-claimed), sending the payload's
+       aps to every remaining device token via curl --http2.
+       - each 200 removes only that phone from the queue retry payload
        - 410 / BadDeviceToken /
          Unregistered / ExpiredToken    -> delete that token row
          (push_tokens for kind=alert, live_activity_tokens otherwise)
+       - partial success                -> retry only failed phones; never
+                                          duplicate successful phones or send
+                                          the row's Telegram fallback
+       - la_end 200 or terminal dead    -> delete that exact activity token;
+                                          queue insertion alone never deletes
        - all tokens dead or none        -> Telegram fallback; done on
          success (or when no fallback is configured); a WANTED fallback
          that Telegram refuses leaves the row undone so the next loop
@@ -110,39 +116,53 @@ _ALERT_COOLDOWN_SECONDS = int(os.environ.get("PUSHDRAIN_ALERT_COOLDOWN", str(6 *
 def _alert_due(kind: str, now: float, state_path: Path) -> bool:
     """Cooldown check per alert kind, JSON state file. On ANY exception
     returns True: a possibly-duplicate alert beats a silently-dropped
-    one. Records the new timestamp when it returns True. Never raises."""
+    one. This check is read-only; delivery records the timestamp. Never
+    raises."""
     try:
-        state = {}
-        if state_path.exists():
-            state = json.loads(state_path.read_text() or "{}")
+        state = json.loads(state_path.read_text() or "{}") if state_path.exists() else {}
         last = float(state.get(kind, 0))
-        if now - last < _ALERT_COOLDOWN_SECONDS:
-            return False
-        state[kind] = now
-        state_path.write_text(json.dumps(state))
-        return True
+        return now - last >= _ALERT_COOLDOWN_SECONDS
     except Exception:
         return True
+
+
+def _mark_alert_sent(kind: str, now: float, state_path: Path) -> None:
+    """Record cooldown only after at least one Telegram send was accepted."""
+    try:
+        state = json.loads(state_path.read_text() or "{}") if state_path.exists() else {}
+        state[kind] = now
+        state_path.write_text(json.dumps(state))
+    except Exception:
+        log.exception("failed recording owner-alert cooldown for %s", kind)
 
 
 def _alert_owner(kind: str, text: str) -> None:
     """Best-effort Telegram alert to the bot owner(s). Never raises;
     failure to alert must not break the drain loop."""
     try:
-        if not _alert_due(kind, time.time(), _ALERT_STATE):
-            return
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_OWNER_ID:
             log.warning("alert wanted but TELEGRAM creds unset: %s", text)
             return
+        now = time.time()
+        if not _alert_due(kind, now, _ALERT_STATE):
+            return
+        accepted = False
         for chat_id in [o.strip() for o in TELEGRAM_OWNER_ID.split(",") if o.strip()]:
             try:
-                requests.post(
+                resp = requests.post(
                     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                     json={"chat_id": chat_id, "text": text},
                     timeout=10,
                 )
+                if resp.ok:
+                    accepted = True
+                else:
+                    log.error("owner alert to %s -> %s %s", chat_id,
+                              resp.status_code, resp.text[:200])
             except Exception:
                 log.exception("failed sending owner alert to %s", chat_id)
+        if accepted:
+            _mark_alert_sent(kind, now, _ALERT_STATE)
     except Exception:
         log.exception("_alert_owner failed (drain loop continues)")
 
@@ -263,7 +283,7 @@ def _apns_jwt() -> str:
     return _JWT["jwt"]
 
 
-def _apns_send(device_token, headers_cfg, aps):
+def _apns_send(device_token, headers_cfg, aps, request_id=None):
     """One push to one device via curl --http2 (the PROVEN road from
     this droplet; Workers fetch and plain HTTP/1.1 both fail against
     Apple). Returns (http_status, reason). status 0 = local/transport
@@ -278,6 +298,12 @@ def _apns_send(device_token, headers_cfg, aps):
                      "Fix then: systemctl restart pushdrain")
         return (0, "jwt-error: " + str(e)[:160])
     try:
+        stable_headers = []
+        if request_id:
+            stable_headers += ["-H", "apns-id: " + str(request_id)]
+        collapse_id = str(headers_cfg.get("collapse_id") or "").strip()
+        if collapse_id:
+            stable_headers += ["-H", "apns-collapse-id: " + collapse_id[:64]]
         cmd = [
             "curl", "-s", "--http2", "--max-time", "15",
             "-o", "-", "-w", "\n%{http_code}",
@@ -286,6 +312,7 @@ def _apns_send(device_token, headers_cfg, aps):
             "-H", "apns-push-type: " + str(headers_cfg.get("push_type", "alert")),
             "-H", "apns-priority: " + str(headers_cfg.get("priority", 10)),
             "-H", "content-type: application/json",
+        ] + stable_headers + [
             "--data-binary", json.dumps({"aps": aps}),
             APNS_HOST + "/3/device/" + str(device_token),
         ]
@@ -321,6 +348,47 @@ def _delete_dead_token(kind, token):
         _sb_delete("push_tokens", {"apns_token": "eq." + str(token)})
     else:
         _sb_delete("live_activity_tokens", {"token": "eq." + str(token)})
+
+
+def _live_activity_end_identity(row, token):
+    """Return exact durable identity for one la_end destination, or None.
+    The worker deliberately writes one la_end row per phone."""
+    payload = row.get("payload") or {}
+    token_id = str(payload.get("live_activity_token_id") or "").strip()
+    shift_id = str(payload.get("live_activity_shift_id") or "").strip()
+    queue_id = str(payload.get("live_activity_queue_id") or "").strip()
+    claim_stamp = str(payload.get("live_activity_end_requested_at") or "").strip()
+    if (not token_id or not shift_id or not queue_id or not claim_stamp
+            or queue_id != str(row.get("id") or "") or not token):
+        return None
+    return {
+        "id": "eq." + token_id,
+        "token": "eq." + str(token),
+        "token_type": "eq.activity_update",
+        "shift_id": "eq." + shift_id,
+        "end_queue_id": "eq." + queue_id,
+        "end_requested_at": "eq." + claim_stamp,
+    }
+
+
+def _delete_live_activity_end_token(row, token) -> bool:
+    """Delete only the exact phone token named by this one-token END row.
+    Called only after that token gets APNs 200 or a terminal dead result."""
+    identity = _live_activity_end_identity(row, token)
+    if not identity:
+        return False
+    return _sb_delete("live_activity_tokens", identity)
+
+
+def _release_live_activity_end(row, token) -> bool:
+    """Clear only this END's exact lease so the five-minute worker can
+    enqueue the phone again. A rotated token or newer lease never matches."""
+    identity = _live_activity_end_identity(row, token)
+    if not identity:
+        return False
+    return bool(_sb_patch("live_activity_tokens", identity,
+                          {"end_requested_at": None,
+                           "end_queue_id": None}))
 
 
 def _send_fallback(row) -> bool:
@@ -360,9 +428,174 @@ def _fallback_wanted(row) -> bool:
     return bool(payload.get("telegram_text") and payload.get("fallback_chat_ids"))
 
 
+def _queue_patch_was_applied(row, body):
+    """Verify an ambiguous queue PATCH without changing state. True means the
+    requested state is present, False means it is not, None means the read also
+    failed. Timestamp formatting is server-dependent, so done_at is verified as
+    present while the other durable fields are compared exactly."""
+    fields = set(body)
+    fields.update(("id", "claimed_at", "done_at"))
+    rows = _sb_select("push_queue", {
+        "select": ",".join(sorted(fields)),
+        "id": "eq." + str(row["id"]),
+        "limit": "1",
+    })
+    if rows is None:
+        return None
+    if len(rows) != 1:
+        return False
+    current = rows[0]
+    for key, expected in body.items():
+        actual = current.get(key)
+        if key == "done_at" and expected is not None:
+            if actual is None:
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
+def _same_instant(left, right) -> bool:
+    try:
+        a = datetime.fromisoformat(str(left).replace("Z", "+00:00"))
+        b = datetime.fromisoformat(str(right).replace("Z", "+00:00"))
+        return a == b
+    except (TypeError, ValueError):
+        return str(left) == str(right)
+
+
+def _refresh_queue_claim(row) -> bool:
+    """Rotate one exact queue lease before the next APNs destination. One curl
+    call is bounded well below STALE_CLAIM_MINUTES, so this keeps a long
+    multi-phone row fresh without letting an older drainer steal it."""
+    old_stamp = str(row.get("claimed_at") or "").strip()
+    if not old_stamp:
+        return False
+    new_stamp = _now_iso()
+    changed = _sb_patch(
+        "push_queue",
+        {"id": "eq." + str(row["id"]),
+         "done_at": "is.null",
+         "claimed_at": "eq." + old_stamp},
+        {"claimed_at": new_stamp},
+        want_rows=True,
+    )
+    if changed is True:  # lightweight offline-test success convention
+        row["claimed_at"] = new_stamp
+        return True
+    if isinstance(changed, list):
+        if not changed:
+            return False
+        row["claimed_at"] = changed[0].get("claimed_at") or new_stamp
+        return True
+    if changed is None:
+        rows = _sb_select("push_queue", {
+            "select": "id,claimed_at,done_at",
+            "id": "eq." + str(row["id"]),
+            "limit": "1",
+        })
+        if (rows and len(rows) == 1 and rows[0].get("done_at") is None
+                and _same_instant(rows[0].get("claimed_at"), new_stamp)):
+            row["claimed_at"] = rows[0].get("claimed_at")
+            return True
+    return False
+
+
+def _persist_queue_patch(row, body, attempts=3) -> bool:
+    """Retry a queue-state write a few times. On total failure the current
+    database claim remains in place. The stable collapse identity only reduces
+    visible-duplicate risk if the row eventually becomes stale and retries."""
+    claim_stamp = str(row.get("claimed_at") or "").strip()
+    if not claim_stamp:
+        log.error("queue row %s has no claim stamp; refusing state write", row.get("id"))
+        return False
+    params = {
+        "id": "eq." + str(row["id"]),
+        "done_at": "is.null",
+        "claimed_at": "eq." + claim_stamp,
+    }
+    for attempt in range(max(1, attempts)):
+        changed = _sb_patch("push_queue", params, body, want_rows=True)
+        # Lightweight offline tests historically use True for a successful
+        # PATCH. Production _sb_patch returns a row list when want_rows=True.
+        if changed is True:
+            return True
+        if isinstance(changed, list):
+            if changed:
+                return True
+            # A successful zero-row response proves this drainer no longer owns
+            # the lease. Do not retry and do not overwrite the winner.
+            log.warning("queue row %s claim changed before state save", row.get("id"))
+            return False
+        # None is ambiguous: the PATCH may have committed and lost its response.
+        # A read confirms success before any idempotent retry.
+        if changed is None and _queue_patch_was_applied(row, body) is True:
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(0.05 * (attempt + 1))
+    _alert_owner(
+        "queue_state_write",
+        "pushdrain: Apple delivery state could not be saved for queue row "
+        + str(row.get("id")) + ". Its claim remains in place and the stable "
+        "collapse ID reduces visible duplicates on a later retry. Check Supabase "
+        "and: journalctl -u pushdrain -n 80",
+    )
+    return False
+
+
 def _finish(row, error=None):
-    _sb_patch("push_queue", {"id": "eq." + str(row["id"])},
-              {"done_at": _now_iso(), "last_error": error})
+    return _persist_queue_patch(
+        row, {"done_at": _now_iso(), "last_error": error})
+
+
+def _row_had_delivery(row) -> bool:
+    payload = row.get("payload") or {}
+    return bool(payload.get("delivery_succeeded"))
+
+
+def _park_delivery_retry(row, retry_tokens, delivered_before, error):
+    """Persist only failed phones. delivery_succeeded suppresses Telegram
+    fallback forever once any phone accepted this notification."""
+    payload = dict(row.get("payload") or {})
+    payload["tokens"] = list(retry_tokens)
+    if delivered_before:
+        payload["delivery_succeeded"] = True
+    return _persist_queue_patch(
+        row,
+        {"claimed_at": None,
+         "attempts": int(row.get("attempts") or 0) + 1,
+         "last_error": error,
+         "payload": payload},
+    )
+
+
+def _exhaust_live_activity_end(row, token, attempts, error):
+    """Close this queue attempt, release its exact token lease, and alert
+    the operator once per cooldown. A later five-minute scan retries it."""
+    closed = _persist_queue_patch(
+        row,
+        {"done_at": _now_iso(), "attempts": attempts,
+         "last_error": error + ", retry budget exhausted"},
+    )
+    # Release only after the old queue row is durably closed. If that close
+    # failed, retaining the lease prevents a new row from overlapping it; the
+    # stale queue claim and stale token lease both have recovery paths.
+    released = closed and _release_live_activity_end(row, token)
+    if released:
+        recovery = "The phone token was released for the next five-minute scan."
+    elif closed:
+        recovery = "The exact phone lease release failed; 30-minute stale-lease recovery remains."
+    else:
+        recovery = "The queue close failed, so its lease was retained to prevent an overlapping send."
+    payload = row.get("payload") or {}
+    _alert_owner(
+        "la_end_exhausted",
+        "pushdrain: a Live Activity END exhausted its APNs retries (shift "
+        + str(payload.get("live_activity_shift_id") or "unknown")
+        + ", " + error[:120] + "). " + recovery
+        + " Alert pushes still work. Check: journalctl -u "
+        "pushdrain -n 80",
+    )
 
 
 def _park_for_retry(row, error):
@@ -371,10 +604,12 @@ def _park_for_retry(row, error):
     and, once attempts max out, the 15-minute expiry sweep gives it a
     final try. Closing here would permanently lose an owner alert after
     ONE failed Telegram attempt."""
-    _sb_patch("push_queue", {"id": "eq." + str(row["id"])},
-              {"claimed_at": None,
-               "attempts": int(row.get("attempts") or 0) + 1,
-               "last_error": error})
+    return _persist_queue_patch(
+        row,
+        {"claimed_at": None,
+         "attempts": int(row.get("attempts") or 0) + 1,
+         "last_error": error},
+    )
 
 
 def _process_row(row):
@@ -385,9 +620,23 @@ def _process_row(row):
     if not isinstance(payload, dict):
         _finish(row, "bad payload (not an object)")
         return (0, False)
-    tokens = payload.get("tokens") or []
+    raw_tokens = payload.get("tokens") or []
+    if not isinstance(raw_tokens, list):
+        _finish(row, "bad payload (tokens is not an array)")
+        return (0, False)
+    # Stable de-duplication: one accidental duplicate token in a payload must
+    # never produce two lock-screen notifications in the same drain pass.
+    tokens = list(dict.fromkeys(str(t) for t in raw_tokens if t))
     headers_cfg = payload.get("headers") or {}
     aps = payload.get("aps") or {}
+    delivered_before = _row_had_delivery(row)
+
+    if kind == "la_end" and (len(tokens) != 1 or not _live_activity_end_identity(row, tokens[0] if tokens else None)):
+        _alert_owner("la_end_bad_payload",
+                     "pushdrain: rejected a malformed Live Activity END queue row ("
+                     + str(row.get("id")) + "). No phone token was deleted.")
+        _finish(row, "bad la_end payload: exact one-token identity required")
+        return (0, False)
 
     # Live Activity topic is blocked: close la_* rows immediately
     # (cosmetic, perishable, no fallback). Alert rows are unaffected.
@@ -395,12 +644,33 @@ def _process_row(row):
         _finish(row, "topic-blocked")
         return (0, False)
 
-    # APNs not configured at all: alerts skip straight to Telegram,
-    # la_* rows just close. This is the old worker hasApns()=false
-    # behavior, relocated. A WANTED fallback that Telegram refused
-    # keeps the row alive for retries; closing on one failed Telegram
-    # attempt would lose the alert forever.
+    # APNs not configured at all: alerts skip straight to Telegram. A
+    # durable la_end retries and eventually releases its token lease so
+    # the next five-minute scan can try again; other cosmetic la_* rows
+    # keep their old close-without-fallback behavior. A WANTED fallback
+    # that Telegram refused stays alive for retries.
     if tokens and not _APNS_CONFIGURED:
+        if kind == "la_end":
+            new_attempts = int(row.get("attempts") or 0) + 1
+            if new_attempts >= MAX_ATTEMPTS:
+                _exhaust_live_activity_end(row, tokens[0], new_attempts,
+                                           "apns not configured")
+            else:
+                _park_delivery_retry(row, tokens, False, "apns not configured")
+            return (0, False)
+        if delivered_before:
+            new_attempts = int(row.get("attempts") or 0) + 1
+            if new_attempts >= MAX_ATTEMPTS:
+                _persist_queue_patch(
+                    row,
+                    {"done_at": _now_iso(), "attempts": new_attempts,
+                     "last_error": "apns not configured after partial delivery; "
+                                   "fallback suppressed"},
+                )
+            else:
+                _park_delivery_retry(row, tokens, True,
+                                     "apns not configured after partial delivery")
+            return (0, False)
         fb = _send_fallback(row)
         if fb or not _fallback_wanted(row):
             _finish(row, "apns not configured" + (", telegram fallback sent" if fb else ""))
@@ -411,18 +681,40 @@ def _process_row(row):
     delivered = 0
     dead = 0
     errors = []
-    for t in tokens:
-        status, reason = _apns_send(t, headers_cfg, aps)
+    retry_tokens = []
+    for token_index, t in enumerate(tokens):
+        if token_index > 0 and not _refresh_queue_claim(row):
+            log.warning("queue row %s lost its claim before token %d; stopping",
+                        row.get("id"), token_index + 1)
+            return (delivered, False)
+        status, reason = _apns_send(t, headers_cfg, aps, row.get("id"))
         if status == 200:
             delivered += 1
+            if kind == "la_end" and not _delete_live_activity_end_token(row, t):
+                _alert_owner("la_end_cleanup",
+                             "pushdrain: Apple accepted a Live Activity END, but its exact "
+                             "token row could not be cleaned up. The card is dismissed. Check "
+                             "Supabase and pushdrain logs.")
             continue
         errors.append(str(status) + " " + reason)
         if status == 410 or reason in _DEAD_TOKEN_REASONS:
-            _delete_dead_token(kind, t)
+            if kind == "la_end":
+                if not _delete_live_activity_end_token(row, t):
+                    _alert_owner("la_end_cleanup",
+                                 "pushdrain: Apple reported a dead Live Activity END token, "
+                                 "but its exact row could not be cleaned up. Check Supabase and "
+                                 "pushdrain logs.")
+            else:
+                _delete_dead_token(kind, t)
             dead += 1
             continue
         if reason == "ExpiredProviderToken":
             _JWT["jwt"] = None  # mint fresh on the next send
+            # This is an expired provider login token, not a rejected Live
+            # Activity topic. Keep the exact phone retryable and do not enter
+            # the six-hour topic block below.
+            retry_tokens.append(t)
+            continue
         if kind != "alert" and (reason in ("TopicDisallowed", "InvalidProviderToken") or status == 403):
             # topic-restricted key likely does not cover the
             # liveactivity subtopic: block la_* for 6h, tell the
@@ -442,10 +734,45 @@ def _process_row(row):
                          "APNS_P8_PATH / APNS_KEY_ID / APPLE_TEAM_ID in /opt/jarvis-invoice-bot/.env "
                          "then: systemctl restart pushdrain")
         # anything else (429, 5xx, network, curl error): retryable below
+        retry_tokens.append(t)
 
-    if delivered > 0:
-        # matches the old worker rule: ANY device getting the banner
-        # counts as delivered, no fallback, no retry for the rest.
+    any_delivery = delivered_before or delivered > 0
+
+    if retry_tokens:
+        new_attempts = int(row.get("attempts") or 0) + 1
+        err = ("; ".join(errors))[:300] or "unknown"
+        if new_attempts >= MAX_ATTEMPTS:
+            if kind == "la_end":
+                _exhaust_live_activity_end(row, retry_tokens[0], new_attempts, err)
+                return (delivered, False)
+            if any_delivery:
+                # At least one phone already received this notification. Close
+                # without Telegram and without retrying successful phones.
+                _persist_queue_patch(
+                    row,
+                    {"done_at": _now_iso(), "attempts": new_attempts,
+                     "last_error": err + ", partial delivery; fallback suppressed"},
+                )
+                return (delivered, False)
+            fb = _send_fallback(row)
+            if fb or not _fallback_wanted(row):
+                _persist_queue_patch(
+                    row,
+                    {"done_at": _now_iso(), "attempts": new_attempts,
+                     "last_error": err + (", telegram fallback sent" if fb else ", no fallback configured")},
+                )
+            else:
+                _persist_queue_patch(
+                    row,
+                    {"attempts": new_attempts,
+                     "last_error": err + ", telegram fallback FAILED"},
+                )
+            return (delivered, fb)
+
+        _park_delivery_retry(row, retry_tokens, any_delivery, err)
+        return (delivered, False)
+
+    if any_delivery:
         _finish(row, None)
         return (delivered, False)
 
@@ -461,26 +788,37 @@ def _process_row(row):
             _park_for_retry(row, "no live devices, telegram fallback FAILED")
         return (0, fb)
 
-    new_attempts = int(row.get("attempts") or 0) + 1
-    err = ("; ".join(errors))[:300] or "unknown"
-    if new_attempts >= MAX_ATTEMPTS:
-        fb = _send_fallback(row)
-        if fb or not _fallback_wanted(row):
-            _sb_patch("push_queue", {"id": "eq." + str(row["id"])},
-                      {"done_at": _now_iso(), "attempts": new_attempts,
-                       "last_error": err + (", telegram fallback sent" if fb else ", no fallback configured")})
-        else:
-            # fallback WANTED but Telegram refused it: leave the row
-            # undone (attempts maxed, so the claim query skips it) and
-            # let the 15-minute expiry sweep give Telegram one more try.
-            _sb_patch("push_queue", {"id": "eq." + str(row["id"])},
-                      {"attempts": new_attempts, "last_error": err + ", telegram fallback FAILED"})
-        return (0, fb)
-
-    # retryable: bump attempts, record why, un-claim for the next loop
-    _sb_patch("push_queue", {"id": "eq." + str(row["id"])},
-              {"claimed_at": None, "attempts": new_attempts, "last_error": err})
+    # No successful or retryable tokens remain. They were all terminally dead
+    # and have already been cleaned up above.
     return (0, False)
+
+
+def _expire_claimed_row(row) -> bool:
+    """Expire one row whose exact queue lease was just claimed. Returns whether
+    Telegram fallback was accepted."""
+    if row.get("kind") == "la_end":
+        payload = row.get("payload") or {}
+        tokens = payload.get("tokens") or []
+        token = tokens[0] if isinstance(tokens, list) and len(tokens) == 1 else None
+        if token and _live_activity_end_identity(row, token):
+            _exhaust_live_activity_end(
+                row, token,
+                max(MAX_ATTEMPTS, int(row.get("attempts") or 0)),
+                "expired before Live Activity END delivery",
+            )
+        else:
+            _alert_owner("la_end_bad_payload",
+                         "pushdrain: an expired Live Activity END row had no exact "
+                         "phone identity (" + str(row.get("id")) + "). No token was deleted.")
+            _finish(row, "expired malformed la_end payload")
+        return False
+    if _row_had_delivery(row):
+        _finish(row, "expired after partial delivery; fallback suppressed")
+        return False
+    fell_back = _send_fallback(row)
+    _finish(row, "expired before delivery" +
+            (", telegram fallback sent" if fell_back else ""))
+    return fell_back
 
 
 _read_fail_streak = 0
@@ -492,23 +830,34 @@ def work_once():
     now = datetime.now(timezone.utc)
     depth = _queue_depth()
     expired_n = claimed_n = delivered_n = fellback_n = 0
+    stale_iso = _iso(now - timedelta(minutes=STALE_CLAIM_MINUTES))
 
-    # 1) perishable sweep: anything undone and older than 15 minutes is
-    # fallen back (when it has telegram_text) and closed, no matter its
-    # claim or attempts state (single daemon: stale claims are ours).
-    old_rows = _sb_select("push_queue", {
-        "select": "*",
+    # 1) perishable sweep: select IDs, then compare-and-set a fresh claim before
+    # touching them. This prevents one drainer from expiring/falling back a row
+    # while another drainer is actively sending it.
+    old_ids = _sb_select("push_queue", {
+        "select": "id",
         "done_at": "is.null",
         "created_at": "lt." + _iso(now - timedelta(minutes=EXPIRE_MINUTES)),
+        "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")",
         "order": "created_at.asc",
         "limit": str(BATCH_LIMIT),
     })
-    for row in (old_rows or []):
-        fb = _send_fallback(row)
-        _finish(row, "expired before delivery" + (", telegram fallback sent" if fb else ""))
-        expired_n += 1
-        if fb:
-            fellback_n += 1
+    for candidate in (old_ids or []):
+        claim_stamp = _now_iso()
+        old_rows = _sb_patch(
+            "push_queue",
+            {"id": "eq." + str(candidate["id"]),
+             "done_at": "is.null",
+             "created_at": "lt." + _iso(now - timedelta(minutes=EXPIRE_MINUTES)),
+             "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")"},
+            {"claimed_at": claim_stamp},
+            want_rows=True,
+        )
+        for row in (old_rows or []):
+            expired_n += 1
+            if _expire_claimed_row(row):
+                fellback_n += 1
 
     # 2) claim a batch: unclaimed rows, plus claims older than
     # STALE_CLAIM_MINUTES (we died mid-row on a previous run). The
@@ -517,7 +866,6 @@ def work_once():
     # alongside the systemd service) matches zero rows instead of
     # overwriting a fresh claim and double-sending - the same guarded
     # claim-PATCH discipline the worker uses on shifts.
-    stale_iso = _iso(now - timedelta(minutes=STALE_CLAIM_MINUTES))
     ids = _sb_select("push_queue", {
         "select": "id",
         "done_at": "is.null",
@@ -537,28 +885,35 @@ def work_once():
     else:
         _read_fail_streak = 0
         if ids:
-            rows = _sb_patch("push_queue",
-                             {"id": "in.(" + ",".join(str(r["id"]) for r in ids) + ")",
-                              "done_at": "is.null",
-                              "attempts": "lt." + str(MAX_ATTEMPTS),
-                              "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")"},
-                             {"claimed_at": _iso(now)}, want_rows=True)
-            for row in (rows or []):
-                claimed_n += 1
-                try:
-                    d, fb = _process_row(row)
-                    delivered_n += d
-                    if fb:
-                        fellback_n += 1
-                except Exception:
-                    log.exception("row %s crashed; un-claiming for retry", row.get("id"))
+            for candidate in ids:
+                claim_stamp = _now_iso()
+                rows = _sb_patch(
+                    "push_queue",
+                    {"id": "eq." + str(candidate["id"]),
+                     "done_at": "is.null",
+                     "attempts": "lt." + str(MAX_ATTEMPTS),
+                     "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")"},
+                    {"claimed_at": claim_stamp},
+                    want_rows=True,
+                )
+                for row in (rows or []):
+                    claimed_n += 1
                     try:
-                        _sb_patch("push_queue", {"id": "eq." + str(row["id"])},
-                                  {"claimed_at": None,
-                                   "attempts": int(row.get("attempts") or 0) + 1,
-                                   "last_error": "drainer exception"})
+                        d, fb = _process_row(row)
+                        delivered_n += d
+                        if fb:
+                            fellback_n += 1
                     except Exception:
-                        pass
+                        log.exception("row %s crashed; un-claiming for retry", row.get("id"))
+                        try:
+                            _persist_queue_patch(
+                                row,
+                                {"claimed_at": None,
+                                 "attempts": int(row.get("attempts") or 0) + 1,
+                                 "last_error": "drainer exception"},
+                            )
+                        except Exception:
+                            pass
 
     # 3) heartbeat: one line per loop, always.
     log.info("loop: depth=%s expired=%d claimed=%d delivered=%d fellback=%d",

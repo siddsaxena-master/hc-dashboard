@@ -571,6 +571,11 @@ async function runScheduled(event, env, alsoNotify = true) {
       if (hourlyErr) throw hourlyErr;
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
+      // Live Activity END delivery is its own durable scan. It runs before
+      // summaries and never reads summary_sent_at, so a Telegram failure,
+      // an already-sent summary, or a late ActivityKit token cannot strand a
+      // clock-screen card. One queue row is claimed per phone token.
+      await runLiveActivityEndScan(env);
       // Shift summaries ride the same 5-minute tick. Runs AFTER intake
       // and never throws (fully wrapped inside), so a payroll failure
       // can never break intake cards.
@@ -2027,11 +2032,6 @@ async function runShiftSummaryScan(env) {
             const bodies = clockOutBodies(mins, rate, built.touched);
             if (await sendPushToOwners(env, row.worker_name + ' clocked out', bodies.owner, null, [],
                 { managerBody: bodies.manager, excludeEmail: row.worker_email })) delivered++;
-            // live activity: freeze the card with summary numbers, then
-            // clean up tokens. The frozen line is PAY-FREE for everyone
-            // (2026-08-06): the card is glanceable status, and owners
-            // already get the dollars in the banner + Telegram summary.
-            await endShiftLiveActivity(env, row, bodies.manager, Math.max(0, Math.round(mins)));
             // 40-hour week watch (2026-08-06): owners only, once per
             // crossing — fires on the shift that pushes the Mon-Sun ET
             // week total past 40h, so Sidd can rebalance schedules.
@@ -2578,25 +2578,70 @@ async function buildPayrollDigestLines(env) {
 // APPLE_TEAM_ID) are UNUSED here now; the droplet holds the key.
 // NOTHING in here throws.
 
-// One queue row. Returns true only when Supabase accepted the INSERT,
-// so callers can count "queued" as "will be delivered or fallen back"
-// in their claim/un-claim accounting. Never throws.
-async function enqueuePush(env, kind, payload) {
-  try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/push_queue', {
-      method: 'POST',
-      headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }),
-      body: JSON.stringify({ kind: kind, payload: payload }),
-    });
-    if (!resp.ok) {
+// One queue row. Its caller-generated UUID is both the database idempotency
+// key and the APNs collapse id. If the POST response is lost after Supabase
+// commits, a lookup by that UUID confirms ownership instead of creating a
+// second row or prematurely invoking Telegram fallback. Only durable la_end
+// may treat a fully unknown outcome as owned because its token lease guarantees
+// a later recovery scan. Generic alerts return failure so their established
+// direct Telegram fallback protects the operator from silent loss. In the rare
+// commit-plus-unreadable-lookup case, that can duplicate an alert.
+export async function enqueuePush(env, kind, payload, requestedQueueId = null) {
+  const queueId = requestedQueueId || crypto.randomUUID();
+  const queuePayload = {
+    ...(payload || {}),
+    headers: {
+      ...((payload && payload.headers) || {}),
+      collapse_id: queueId,
+    },
+  };
+  const row = { id: queueId, kind: kind, payload: queuePayload };
+  let lastLookup = null;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/push_queue', {
+        method: 'POST',
+        headers: sbHeaders(env, {
+          'Content-Type': 'application/json',
+          'Prefer': 'resolution=ignore-duplicates,return=minimal',
+        }),
+        body: JSON.stringify(row),
+      });
+      if (resp.ok) return true;
       console.error('push enqueue failed:', kind, resp.status, await resp.text());
-      return false;
+    } catch (e) {
+      console.error('push enqueue exception:', e);
     }
-    return true;
-  } catch (e) {
-    console.error('push enqueue exception:', e);
-    return false;
+
+    // A successful empty lookup proves the INSERT did not commit. A failed
+    // lookup is unknown, not absent. Retry the same UUID once in either case.
+    try {
+      const verify = await fetch(env.SUPABASE_URL + '/rest/v1/push_queue' +
+        '?id=eq.' + encodeURIComponent(queueId) + '&select=id,kind&limit=1', {
+        headers: sbHeaders(env),
+      });
+      if (verify.ok) {
+        const found = await verify.json();
+        if (Array.isArray(found) && found.some((item) => item.id === queueId && item.kind === kind)) {
+          return true;
+        }
+        lastLookup = false;
+      } else {
+        lastLookup = null;
+      }
+    } catch (e) {
+      lastLookup = null;
+    }
   }
+
+  if (lastLookup === null) {
+    const durableEnd = kind === 'la_end';
+    console.error('push enqueue outcome remains unknown:', kind, queueId,
+      durableEnd ? 'retaining durable END ownership' : 'using caller fallback');
+    return durableEnd;
+  }
+  return false;
 }
 
 // Queue one banner for every registered OWNER phone (same role=owner
@@ -2749,38 +2794,47 @@ async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds,
 const LA_TOPIC = 'com.hamptonscoconuts.field.push-type.liveactivity';
 let laLastSent = new Map();   // shiftId -> last pushed "status:minutes" (isolate memory; a recycle just re-sends one priority-5 update)
 
-// Compose the full aps dictionary here (the drainer is deliberately
-// dumb: it sends whatever aps it is handed) and queue ONE row carrying
-// every device token for this event. kind becomes la_start / la_update
-// / la_end. Live activities are cosmetic, so telegram_text is null:
-// they never fall back, they just expire. Never throws.
-async function enqueueLiveActivityPush(env, tokens, event, contentState, opts = {}) {
+// Compose the exact payload shared by the worker and its offline tests. For
+// END, callers pass one token plus its durable row identity. START/UPDATE may
+// still batch tokens; pushdrain now persists only failed tokens between tries.
+export function buildLiveActivityPushPayload(tokens, event, contentState, opts = {}, nowMs = Date.now()) {
+  const aps = {
+    timestamp: Math.floor(nowMs / 1000),
+    event: event,
+    'content-state': contentState,
+  };
+  if (event === 'start') {
+    // start requires attributes-type + attributes + alert (Apple doc)
+    aps['attributes-type'] = opts.attributesType || 'ShiftAttributes';
+    aps.attributes = opts.attributes || {};
+    aps.alert = opts.alert || { title: 'Shift started', body: '' };
+  }
+  if (event === 'end' && Number.isFinite(opts.dismissalDate)) {
+    aps['dismissal-date'] = opts.dismissalDate;
+  }
+  if (Number.isFinite(opts.staleDate)) aps['stale-date'] = opts.staleDate;
+  return {
+    tokens: [...new Set((tokens || []).filter(Boolean))],
+    headers: {
+      topic: LA_TOPIC,
+      push_type: 'liveactivity',
+      priority: opts.priority || (event === 'update' ? 5 : 10),
+    },
+    aps: aps,
+    telegram_text: null,
+    fallback_chat_ids: [],
+    ...(opts.metadata || {}),
+  };
+}
+
+// Queue a Live Activity payload. Placement in push_queue is NOT delivery:
+// update-token cleanup belongs exclusively to pushdrain after the exact
+// phone's APNs result is known. Never throws.
+async function enqueueLiveActivityPush(env, tokens, event, contentState, opts = {}, queueId = null) {
   try {
     if (!tokens || !tokens.length) return false;
-    const aps = {
-      timestamp: Math.floor(Date.now() / 1000),
-      event: event,
-      'content-state': contentState,
-    };
-    if (event === 'start') {
-      // start requires attributes-type + attributes + alert (Apple doc)
-      aps['attributes-type'] = opts.attributesType || 'ShiftAttributes';
-      aps.attributes = opts.attributes || {};
-      aps.alert = opts.alert || { title: 'Shift started', body: '' };
-    }
-    if (event === 'end' && opts.dismissalDate) aps['dismissal-date'] = opts.dismissalDate;
-    if (opts.staleDate) aps['stale-date'] = opts.staleDate;
-    return await enqueuePush(env, 'la_' + event, {
-      tokens: tokens,
-      headers: {
-        topic: LA_TOPIC,
-        push_type: 'liveactivity',
-        priority: opts.priority || (event === 'update' ? 5 : 10),
-      },
-      aps: aps,
-      telegram_text: null,
-      fallback_chat_ids: [],
-    });
+    return await enqueuePush(env, 'la_' + event,
+      buildLiveActivityPushPayload(tokens, event, contentState, opts), queueId);
   } catch (e) {
     console.error('live activity enqueue exception:', e);
     return false;
@@ -2861,31 +2915,90 @@ async function updateShiftLiveActivity(env, shiftId, status, minutes) {
   } catch (e) { console.error('updateShiftLiveActivity error:', e); }
 }
 
-// event:end with the summary line, then delete this shift's update-token
-// rows (service role; anon has no DELETE). Dismissal uses Apple's default
-// (card lingers up to 4h); pass opts.dismissalDate later if that annoys.
-// DELETE ONLY AFTER A QUEUED END (or when there was nothing to send):
-// once the row is in push_queue the drainer's retries own delivery, so
-// "queued" is the new "delivered" here. If the INSERT itself fails the
-// token rows stay, and the next isolate's sends or the drainer's
-// dead-token cleanup can still reach the card.
-async function endShiftLiveActivity(env, row, boxesLine, totalMins) {
+const LA_END_LEASE_MS = 30 * 60 * 1000;
+
+// Give back only OUR exact claim. The token and timestamp guards prevent an
+// old queue attempt from clearing a newer lease after ActivityKit rotates the
+// token. Never deletes a token and never throws.
+async function releaseLiveActivityEndClaim(env, tokenRow, claimStamp) {
   try {
-    const tokens = await laTokensForShift(env, row.id);
-    // null means the Supabase READ failed, not "no tokens". Deleting on that
-    // would strand the owner's card forever (the summary claim is spent, so
-    // nothing retries). Keep the rows and laLastSent; bail out entirely.
-    if (tokens === null) return;
-    let queued = false;
-    if (tokens.length) {
-      queued = await enqueueLiveActivityPush(env, tokens.map((t) => t.token), 'end',
-        { status: 'Clocked out', statusMinutes: totalMins, boxesLine: boxesLine });
+    const tokenId = tokenRow.token_id || tokenRow.id;
+    await fetch(env.SUPABASE_URL + '/rest/v1/live_activity_tokens' +
+      '?id=eq.' + encodeURIComponent(tokenId) +
+      '&token=eq.' + encodeURIComponent(tokenRow.token) +
+      '&token_type=eq.activity_update' +
+      '&shift_id=eq.' + encodeURIComponent(tokenRow.shift_id) +
+      '&end_queue_id=eq.' + encodeURIComponent(tokenRow.queue_id) +
+      '&end_requested_at=eq.' + encodeURIComponent(claimStamp), {
+      method: 'PATCH',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ end_requested_at: null, end_queue_id: null }),
+    });
+  } catch (e) {
+    console.error('live activity end un-claim failed on token ' +
+      (tokenRow.token_id || tokenRow.id) + ':', e);
+  }
+}
+
+// Independent five-minute END scan. It intentionally does not read or write
+// summary_sent_at. New tokens registered after clock-out are picked up because
+// their end_requested_at starts null. A claim older than 30 minutes is treated
+// as abandoned; push_queue expires after 15 minutes, so reclaiming then cannot
+// race a healthy delivery attempt.
+export async function runLiveActivityEndScan(env) {
+  try {
+    const claimStamp = new Date().toISOString();
+    const staleStamp = new Date(Date.now() - LA_END_LEASE_MS).toISOString();
+    const claim = await fetch(env.SUPABASE_URL +
+      '/rest/v1/rpc/hc_claim_live_activity_ends', {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        p_claimed_at: claimStamp,
+        p_stale_before: staleStamp,
+        p_limit: 50,
+      }),
+    });
+    if (!claim.ok) {
+      console.error('live activity end claim failed:', claim.status, await claim.text());
+      return;
     }
-    if (queued || tokens.length === 0) {
-      await fetch(env.SUPABASE_URL +
-        '/rest/v1/live_activity_tokens?token_type=eq.activity_update&shift_id=eq.' +
-        encodeURIComponent(row.id), { method: 'DELETE', headers: sbHeaders(env) });
+    const tokenRows = await claim.json();
+    if (!Array.isArray(tokenRows) || !tokenRows.length) return;
+
+    for (const tokenRow of tokenRows) {
+      const tokenId = tokenRow.token_id;
+      if (!tokenId || !tokenRow.queue_id || !tokenRow.shift_id || !tokenRow.token ||
+          !tokenRow.clock_in_at || !tokenRow.clock_out_at) continue;
+      try {
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const queued = await enqueueLiveActivityPush(env, [tokenRow.token], 'end', {
+          status: 'Clocked out',
+          statusMinutes: shiftMinutes(tokenRow),
+          boxesLine: 'Shift ended',
+        }, {
+          // Apple ActivityKit remote END uses a UNIX timestamp. A date in the
+          // past requests immediate lock-screen dismissal instead of the
+          // default linger period (which can be hours).
+          dismissalDate: nowSeconds - 1,
+          priority: 10,
+          metadata: {
+            live_activity_token_id: tokenId,
+            live_activity_shift_id: tokenRow.shift_id,
+            live_activity_queue_id: tokenRow.queue_id,
+            live_activity_end_requested_at: claimStamp,
+          },
+        }, tokenRow.queue_id);
+        if (!queued) {
+          await releaseLiveActivityEndClaim(env, tokenRow, claimStamp);
+          continue;
+        }
+        laLastSent.delete(tokenRow.shift_id);
+      } catch (e) {
+        console.error('live activity end queue failed on token ' + tokenId + ':', e);
+      }
     }
-    laLastSent.delete(row.id);
-  } catch (e) { console.error('endShiftLiveActivity error:', e); }
+  } catch (e) {
+    console.error('runLiveActivityEndScan error:', e);
+  }
 }

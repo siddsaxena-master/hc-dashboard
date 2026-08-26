@@ -1,2 +1,4 @@
 .claude/
 worker/.wrangler/
+__pycache__/
+*.pyc
