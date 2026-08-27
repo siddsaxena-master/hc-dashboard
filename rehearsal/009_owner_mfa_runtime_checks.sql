@@ -21,7 +21,9 @@ declare
   v_rate_cents integer;
   v_order_ny constant uuid := '00000000-0000-4000-8000-000000002801';
   v_order_miami constant uuid := '00000000-0000-4000-8000-000000002802';
+  v_managed_worker constant uuid := '00000000-0000-4000-8000-000000002803';
   v_pay_shift constant uuid := '00000000-0000-4000-8000-000000002811';
+  v_managed_shift constant uuid := '00000000-0000-4000-8000-000000002812';
   v_device_id constant uuid := '00000000-0000-4000-8000-000000002821';
   v_delivery_request constant uuid := '00000000-0000-4000-8000-000000002831';
   v_apns_token constant text :=
@@ -40,7 +42,6 @@ declare
   v_attributed_count integer;
   v_confirmed boolean;
   v_self_shift uuid;
-  v_managed_shift uuid;
   v_clock_in timestamptz;
   v_clock_out timestamptz;
 begin
@@ -83,7 +84,7 @@ begin
 
   -- Remove any prior owner open-shift collision inside this transaction only.
   update public.shifts
-  set clock_out_at = pg_catalog.greatest(clock_in_at, pg_catalog.clock_timestamp())
+  set clock_out_at = greatest(clock_in_at, pg_catalog.clock_timestamp())
   where field_worker_id = v_worker_id
     and clock_out_at is null;
 
@@ -91,6 +92,26 @@ begin
   set hourly_rate_cents = v_rate_cents,
       market = 'ny'
   where id = v_worker_id;
+
+  insert into public.field_workers (
+    id,
+    email,
+    name,
+    market,
+    role,
+    active,
+    hourly_rate_cents,
+    auth_user_id
+  ) values (
+    v_managed_worker,
+    'managed-worker-028@sandbox.invalid',
+    'Sandbox Managed Worker',
+    'ny',
+    'team',
+    true,
+    2400,
+    null
+  );
 
   insert into public.shifts (
     id,
@@ -110,6 +131,26 @@ begin
     pg_catalog.clock_timestamp() - interval '2 hours',
     pg_catalog.clock_timestamp() - interval '1 hour',
     'sandbox-mfa-payroll'
+  );
+
+  insert into public.shifts (
+    id,
+    field_worker_id,
+    worker_name,
+    worker_email,
+    market,
+    clock_in_at,
+    clock_out_at,
+    device
+  ) values (
+    v_managed_shift,
+    v_managed_worker,
+    'Sandbox Managed Worker',
+    'managed-worker-028@sandbox.invalid',
+    'ny',
+    pg_catalog.clock_timestamp() - interval '30 minutes',
+    null,
+    'sandbox-mfa-managed-clockout'
   );
 
   insert into public.shift_locations (
@@ -378,11 +419,6 @@ begin
       errcode = '55000',
       message = 'owner AAL2 self clock-out or order attribution failed';
   end if;
-
-  select started.id
-  into v_managed_shift
-  from public.hc_start_shift(null, null, 'sandbox-mfa-managed-clockout') as started
-  limit 1;
 
   perform *
   from public.hc_manage_clock_out(
@@ -689,7 +725,7 @@ begin
   -- Leave real fixture rows in place, but restore the linked identity to owner
   -- AAL1 for the authenticated-role RLS checks below.
   update public.field_workers
-  set role = 'owner', market = null
+  set role = 'owner', market = 'ny'
   where id = v_worker_id;
 
   perform pg_catalog.set_config(

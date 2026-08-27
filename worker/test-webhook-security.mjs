@@ -1324,8 +1324,37 @@ await check('migration 027 is private, bounded, service-only, and reversible onl
   assert.match(rehearsal, /^rollback;/im);
   assert.match(rehearsal, /authenticated caller reached service-only/i);
   assert.match(rehearsal, /lease/i);
+  assert.match(rehearsal, /v_enqueue_first := public\.hc_enqueue_webhook_intake\(v_items\)/);
+  assert.match(rehearsal, /v_enqueue_duplicate := public\.hc_enqueue_webhook_intake\(v_items\)/);
+  assert.doesNotMatch(rehearsal, /if public\.hc_enqueue_webhook_intake/);
+  assert.match(rehearsal, /v_owned_release := public\.hc_release_webhook_intake/);
+  assert.match(rehearsal, /\) into v_owned_release_state_ok/);
+  assert.match(rehearsal, /v_reclaimed_finish := public\.hc_finish_webhook_intake/);
+  assert.doesNotMatch(rehearsal, /if\s+public\.hc_(?:renew_webhook_delivery|finish_webhook_intake|release_webhook_intake)/i);
   assert.match(rehearsal, /repeat\('A', 21912\)/);
   assert.match(rehearsal, /repeat\('A', 32769\)/);
+});
+
+await check('migration 029 renews only the exact stored receipt lease', async () => {
+  const migration = readFileSync(
+    new URL('../migrations/029_webhook_delivery_lease_renewal_fix.sql', import.meta.url),
+    'utf8',
+  );
+  const rollback = readFileSync(
+    new URL('../migrations/029_webhook_delivery_lease_renewal_fix_rollback.sql', import.meta.url),
+    'utf8',
+  );
+  const functionDefinition = migration.match(
+    /create or replace function public\.hc_renew_webhook_delivery\([\s\S]*?\$function\$;/i,
+  )?.[0] || '';
+  assert.match(functionDefinition, /and receipt\.lease_token = p_claim_token/);
+  assert.doesNotMatch(functionDefinition, /receipt\.claim_token/);
+  assert.match(migration, /v_definition like '%receipt\.claim_token%'/);
+  assert.match(migration, /security definer[\s\S]*set search_path = ''/i);
+  assert.match(migration, /revoke all on function public\.hc_renew_webhook_delivery/i);
+  assert.match(migration, /grant execute on function public\.hc_renew_webhook_delivery[\s\S]*service_role/i);
+  assert.match(rollback, /raise exception/i);
+  assert.match(rollback, /lease_token/i);
 });
 
 await check('receipt migration is private, service-only, and stores no webhook payload', async () => {

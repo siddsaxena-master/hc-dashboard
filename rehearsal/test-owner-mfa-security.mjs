@@ -75,6 +75,7 @@ check(/rpc\/hc_claim_field_worker/.test(worker), 'Worker dashboard AI authorizat
 
 check(/raise exception[\s\S]*rollback blocked/i.test(rollback) && !/^\s*(?:drop|delete|truncate)\b/im.test(rollback), 'rollback is explicitly blocked and non-destructive');
 check(/^begin;/m.test(rehearsal) && /^rollback;/m.test(rehearsal), 'runtime rehearsal rolls every fixture and roster change back');
+check(!/pg_catalog\.greatest\s*\(/.test(rehearsal), 'runtime rehearsal uses valid greatest syntax');
 check(/'aal', 'aal1'/.test(rehearsal) && /'aal', 'aal2'/.test(rehearsal), 'rehearsal simulates owner AAL1 denial and AAL2 success');
 check(/'user_metadata'[\s\S]{0,180}'aal', 'aal2'/.test(rehearsal), 'rehearsal proves spoofed client metadata cannot upgrade assurance');
 check(/set role = 'manager'/.test(rehearsal) && /set role = 'team'/.test(rehearsal), 'rehearsal preserves manager and team AAL1 scope');
@@ -88,6 +89,8 @@ for (const name of wrappers) {
 check(/v_wrapper_count <> 10/.test(rehearsal), 'AAL1 runtime matrix requires all ten migration-028 wrappers');
 check(/hc_mark_shifts_paid\(/.test(rehearsal) && /shift_payment_records/.test(rehearsal), 'rehearsal covers payroll denial, success, and immutable payment audit');
 check(/hc_clock_out_my_shift\(/.test(rehearsal) && /hc_record_shift_orders\(/.test(rehearsal), 'rehearsal covers self clock-out and order attribution paths');
+check(/v_managed_worker constant uuid/.test(rehearsal) && /v_managed_shift constant uuid/.test(rehearsal) && !/into v_managed_shift[\s\S]{0,160}hc_start_shift/.test(rehearsal), 'manager clock-out rehearsal targets a separate synthetic worker shift');
+check(/set role = 'owner', market = 'ny'/.test(rehearsal) && !/set role = 'owner', market = null/.test(rehearsal), 'owner rehearsal fixture preserves the required market');
 check(/delivery_request_id = v_delivery_request/.test(rehearsal), 'rehearsal proves delivery-v2 success through its receipt row');
 check(/hc_authorize_notification_device\(v_device_id\)/.test(rehearsal) && /hc_sync_notification_device\(/.test(rehearsal) && /hc_register_live_activity_token\(/.test(rehearsal), 'rehearsal covers notification authorization, sync, and registration');
 check(/set local role authenticated;/.test(rehearsal) && /reset role;/.test(rehearsal), 'direct table checks run as the PostgREST authenticated role');

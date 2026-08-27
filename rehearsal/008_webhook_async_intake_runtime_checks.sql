@@ -24,6 +24,17 @@ declare
   v_receipt_token uuid;
   v_outbox_id uuid := pg_catalog.gen_random_uuid();
   v_attempt bigint;
+  v_enqueue_first integer;
+  v_enqueue_duplicate integer;
+  v_intake_rows bigint;
+  v_wrong_receipt_renew boolean;
+  v_owned_receipt_renew boolean;
+  v_expired_receipt_renew boolean;
+  v_foreign_finish boolean;
+  v_foreign_release boolean;
+  v_owned_release boolean;
+  v_owned_release_state_ok boolean;
+  v_reclaimed_finish boolean;
   v_denied boolean := false;
   v_rejected boolean := false;
   v_oversize_rejected boolean := false;
@@ -100,15 +111,22 @@ begin
   ) as claim
   where claim.claim_state = 'claimed';
 
-  if v_receipt_id is null
-     or v_receipt_token is null
-     or public.hc_renew_webhook_delivery(
-       'ms_graph', pg_catalog.repeat('e', 64),
-       pg_catalog.gen_random_uuid(), 300
-     ) is not false
-     or public.hc_renew_webhook_delivery(
-       'ms_graph', pg_catalog.repeat('e', 64), v_receipt_token, 300
-     ) is not true then
+  if v_receipt_id is null or v_receipt_token is null then
+    raise exception using
+      errcode = '55000',
+      message = 'receipt claim did not return an exact lease';
+  end if;
+
+  v_wrong_receipt_renew := public.hc_renew_webhook_delivery(
+    'ms_graph', pg_catalog.repeat('e', 64),
+    pg_catalog.gen_random_uuid(), 300
+  );
+  v_owned_receipt_renew := public.hc_renew_webhook_delivery(
+    'ms_graph', pg_catalog.repeat('e', 64), v_receipt_token, 300
+  );
+
+  if v_wrong_receipt_renew is not false
+     or v_owned_receipt_renew is not true then
     raise exception using
       errcode = '55000',
       message = 'exact receipt lease renewal contract failed';
@@ -118,21 +136,25 @@ begin
   set lease_expires_at = pg_catalog.clock_timestamp() - interval '1 second'
   where id = v_receipt_id;
 
-  if public.hc_renew_webhook_delivery(
-       'ms_graph', pg_catalog.repeat('e', 64), v_receipt_token, 300
-     ) is not false then
+  v_expired_receipt_renew := public.hc_renew_webhook_delivery(
+    'ms_graph', pg_catalog.repeat('e', 64), v_receipt_token, 300
+  );
+  if v_expired_receipt_renew is not false then
     raise exception using
       errcode = '55000',
       message = 'expired receipt lease was incorrectly revived';
   end if;
 
-  if public.hc_enqueue_webhook_intake(v_items) <> 2
-     or public.hc_enqueue_webhook_intake(v_items) <> 2
-     or (
-       select pg_catalog.count(*)
-       from public.webhook_intake_queue
-       where event_key in (v_event_a, v_event_b)
-     ) <> 2 then
+  v_enqueue_first := public.hc_enqueue_webhook_intake(v_items);
+  v_enqueue_duplicate := public.hc_enqueue_webhook_intake(v_items);
+  select pg_catalog.count(*)
+  into v_intake_rows
+  from public.webhook_intake_queue
+  where event_key in (v_event_a, v_event_b);
+
+  if v_enqueue_first <> 2
+     or v_enqueue_duplicate <> 2
+     or v_intake_rows <> 2 then
     raise exception using
       errcode = '55000',
       message = 'intake enqueue or exact duplicate handling failed';
@@ -173,28 +195,33 @@ begin
       message = 'intake claims did not create independent exact leases';
   end if;
 
-  if public.hc_finish_webhook_intake(
-       v_id_a, pg_catalog.gen_random_uuid()
-     ) is not false
-     or public.hc_release_webhook_intake(
-       v_id_a, pg_catalog.gen_random_uuid(), 30, 'sandbox retry'
-     ) is not false then
+  v_foreign_finish := public.hc_finish_webhook_intake(
+    v_id_a, pg_catalog.gen_random_uuid()
+  );
+  v_foreign_release := public.hc_release_webhook_intake(
+    v_id_a, pg_catalog.gen_random_uuid(), 30, 'sandbox retry'
+  );
+  if v_foreign_finish is not false
+     or v_foreign_release is not false then
     raise exception using
       errcode = '55000',
       message = 'foreign intake lease changed queue state';
   end if;
 
-  if public.hc_release_webhook_intake(
-       v_id_a, v_claim_token_a, 30, 'sandbox retry'
-     ) is not true
-     or not exists (
+  v_owned_release := public.hc_release_webhook_intake(
+    v_id_a, v_claim_token_a, 30, 'sandbox retry'
+  );
+  select exists (
        select 1
        from public.webhook_intake_queue
        where id = v_id_a
          and delivery_state = 'pending'
          and next_attempt_at > pg_catalog.clock_timestamp()
          and lease_token is null
-     ) then
+  ) into v_owned_release_state_ok;
+
+  if v_owned_release is not true
+     or v_owned_release_state_ok is not true then
     raise exception using
       errcode = '55000',
       message = 'owning intake release did not schedule backoff';
@@ -211,10 +238,16 @@ begin
 
   if v_reclaimed_token is null
      or v_reclaimed_token = v_claim_token_a
-     or v_attempt <> 2
-     or public.hc_finish_webhook_intake(
-       v_id_a, v_reclaimed_token
-     ) is not true then
+     or v_attempt <> 2 then
+    raise exception using
+      errcode = '55000',
+      message = 'released intake did not reclaim exactly';
+  end if;
+
+  v_reclaimed_finish := public.hc_finish_webhook_intake(
+    v_id_a, v_reclaimed_token
+  );
+  if v_reclaimed_finish is not true then
     raise exception using
       errcode = '55000',
       message = 'released intake did not reclaim and finish exactly';
