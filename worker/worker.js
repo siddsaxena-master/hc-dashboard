@@ -571,10 +571,11 @@ async function runScheduled(event, env, alsoNotify = true) {
       if (hourlyErr) throw hourlyErr;
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
-      // Live Activity END delivery is its own durable scan. It runs before
-      // summaries and never reads summary_sent_at, so a Telegram failure,
-      // an already-sent summary, or a late ActivityKit token cannot strand a
-      // clock-screen card. One queue row is claimed per phone token.
+      // Live Activity START and END delivery use independent durable scans.
+      // Neither one depends on the normal clock-in banner or Telegram stamps.
+      // START owns one stable queue row per shift + physical phone, while END
+      // owns one row per activity-update token.
+      await runLiveActivityStartScan(env);
       await runLiveActivityEndScan(env);
       // Shift summaries ride the same 5-minute tick. Runs AFTER intake
       // and never throws (fully wrapped inside), so a payroll failure
@@ -2094,25 +2095,11 @@ async function runClockInAlertScan(env) {
         const claimed = claim.ok ? await claim.json() : null;
         if (!Array.isArray(claimed) || !claimed.length) continue;
 
-        // Same un-claim rule as the summary scan (2026-08-03 audit): if
-        // neither a push banner nor a Telegram ping lands, the finally
-        // block gives the row back so the next tick retries. A retry
-        // re-runs the live-activity start too - accepted: when every
-        // alert channel failed, the start push almost certainly failed
-        // with them, and a duplicate card beats a silent clock-in.
+        // This claim owns only the normal banner/Telegram alert. Live Activity
+        // START delivery has its own per-shift, per-phone ledger and scan, so
+        // giving this alert claim back can never create a duplicate card.
         let delivered = 0;
         try {
-          // live activity: pin the shift card on owner lock screens.
-          // claimed[0] is the FULL row (return=representation): skip the
-          // start when the shift already clocked out. The cron runs the
-          // summary (end) scan BEFORE this scan, so a shift that clocked
-          // in AND out inside one 5-minute gap has already spent its end
-          // claim; starting a card now would pin one that nothing can
-          // ever end.
-          if (!claimed[0].clock_out_at) {
-            await startShiftLiveActivities(env, row);
-          }
-
           // ONE queue row carries both the banner and its Telegram
           // fallback: the droplet drainer pushes to owner phones and
           // sends this text over Telegram ONLY if no device gets the
@@ -2215,10 +2202,10 @@ async function runShiftStatusScan(env) {
         const atGarage = p.lat != null && p.lng != null &&
           distMeters(p.lat, p.lng, GARAGE_LAT, GARAGE_LNG) <= GARAGE_RADIUS_M;
 
-        // live activity status line: runs for every classification; the
-        // continue guards below only gate ALERTS. Dedupe inside
-        // updateShiftLiveActivity means this pushes only when status or
-        // the 5-min stopped bucket changes.
+        // Live Activity state runs for every classification; the continue
+        // guards below only gate ALERTS. Its dedupe key includes the latest GPS
+        // report time, so an owner can see honest freshness even when the
+        // status label itself has not changed.
         try {
           let laStatus = 'Enroute';
           let laMins = 0;
@@ -2228,7 +2215,7 @@ async function runShiftStatusScan(env) {
             laStatus = 'Stopped';
             laMins = Math.floor(ageMin / 5) * 5; // bucket = what we render, "Stopped 15m", "Stopped 20m"...
           }
-          await updateShiftLiveActivity(env, row.id, laStatus, laMins);
+          await updateShiftLiveActivity(env, row.id, laStatus, laMins, p.at);
         } catch (e) { console.error('la status hook:', e); }
 
         // AT_GARAGE: parked at base is normal. (Miami has no garage, so
@@ -2637,9 +2624,18 @@ export async function enqueuePush(env, kind, payload, requestedQueueId = null) {
 
   if (lastLookup === null) {
     const durableEnd = kind === 'la_end';
+    const unknownStart = kind === 'la_start';
     console.error('push enqueue outcome remains unknown:', kind, queueId,
-      durableEnd ? 'retaining durable END ownership' : 'using caller fallback');
-    return durableEnd;
+      durableEnd ? 'retaining durable END ownership' :
+        unknownStart ? 'retaining START lease for stable-ID recovery' :
+          'using caller fallback');
+    // END already owns an exact activity-token lease and treats unknown as
+    // queued. START uses null as a deliberate third state: its caller must
+    // neither release nor complete the ledger claim. After 30 minutes the same
+    // stable queue UUID is retried, safely covering both commit and no-commit.
+    if (durableEnd) return true;
+    if (unknownStart) return null;
+    return false;
   }
   return false;
 }
@@ -2794,6 +2790,21 @@ async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds,
 const LA_TOPIC = 'com.hamptonscoconuts.field.push-type.liveactivity';
 let laLastSent = new Map();   // shiftId -> last pushed "status:minutes" (isolate memory; a recycle just re-sends one priority-5 update)
 
+// ContentState gained lastReportISO as an optional field. Old app builds ignore
+// the unknown JSON key, while the next widget can render the latest GPS report
+// time as a native relative label without one push per displayed minute.
+export function buildLiveActivityContentState(status, statusMinutes, lastReportISO = null) {
+  const state = {
+    status: status,
+    statusMinutes: Number.isFinite(statusMinutes) ? statusMinutes : 0,
+  };
+  const reportMs = new Date(lastReportISO || '').getTime();
+  if (Number.isFinite(reportMs)) {
+    state.lastReportISO = new Date(reportMs).toISOString();
+  }
+  return state;
+}
+
 // Compose the exact payload shared by the worker and its offline tests. For
 // END, callers pass one token plus its durable row identity. START/UPDATE may
 // still batch tokens; pushdrain now persists only failed tokens between tries.
@@ -2819,6 +2830,7 @@ export function buildLiveActivityPushPayload(tokens, event, contentState, opts =
       topic: LA_TOPIC,
       push_type: 'liveactivity',
       priority: opts.priority || (event === 'update' ? 5 : 10),
+      ...(event === 'start' ? { expiration: 0 } : {}),
     },
     aps: aps,
     telegram_text: null,
@@ -2862,55 +2874,199 @@ async function laTokensForShift(env, shiftId) {
     encodeURIComponent(shiftId) + '&email=in.(' + inList + ')');
 }
 
-// event:start to every owner push_to_start token; exactly-once is inherited
-// from the caller's claim-first PATCH, so this can never storm.
-async function startShiftLiveActivities(env, row) {
-  try {
-    const emails = await laManageEmails(env);
-    if (!emails || !emails.length) return;
-    // Self-echo: never start a card about someone's shift on their own
-    // phone. Because the self device never gets the start, it never emits
-    // an update token for this shift, so downstream needs no self filter.
-    const ex = (row.worker_email || '').toLowerCase();
-    const targets = emails.filter((e) => e !== ex);
-    if (!targets.length) return;
-    const inList = targets.map((e) => encodeURIComponent('"' + e + '"')).join(',');
-    const tokens = await fetchSb(env,
-      'live_activity_tokens?select=email,token&token_type=eq.push_to_start&email=in.(' + inList + ')') || [];
-    if (!tokens.length) return;
-    // initial status from clock-in coords vs garage (distMeters + the
-    // stillness-watch constants above); the 5-min scan corrects it.
-    let status = 'At NJ Garage';
-    if (row.clock_in_lat != null && row.clock_in_lng != null &&
-        distMeters(row.clock_in_lat, row.clock_in_lng, GARAGE_LAT, GARAGE_LNG) > GARAGE_RADIUS_M) {
-      status = 'Enroute';
-    }
-    // normalize to millis+Z so the widget's ISO8601 parse always succeeds
-    const clockInISO = new Date(row.clock_in_at).toISOString();
-    const name = row.worker_name || 'Team';
-    const queued = await enqueueLiveActivityPush(env, tokens.map((t) => t.token), 'start',
-      { status: status, statusMinutes: 0 },
-      {
-        attributes: { workerName: name, clockInISO: clockInISO, shiftId: row.id },
-        alert: { title: name + ' is on shift', body: 'Shift card is live' },
-      });
-    // seed dedupe so tick 1 does not re-queue identical content; only
-    // on a queued row, so a failed INSERT can try again via updates.
-    if (queued) laLastSent.set(row.id, status + ':0');
-  } catch (e) { console.error('startShiftLiveActivities error:', e); }
+const LA_START_LEASE_MS = 30 * 60 * 1000;
+
+function liveActivityStartStatus(row) {
+  const reportMs = new Date(row.report_at || row.clock_in_at).getTime();
+  const ageMin = Number.isFinite(reportMs) ? Math.max(0, (Date.now() - reportMs) / 60000) : 0;
+  const atGarage = row.report_lat != null && row.report_lng != null &&
+    distMeters(row.report_lat, row.report_lng, GARAGE_LAT, GARAGE_LNG) <= GARAGE_RADIUS_M;
+  if (atGarage) return { status: 'At NJ Garage', minutes: 0 };
+  if (ageMin >= STOP_ALERT_MIN) {
+    return { status: 'Stopped', minutes: Math.floor(ageMin / 5) * 5 };
+  }
+  return { status: 'Enroute', minutes: 0 };
 }
 
-// event:update only when the RENDERED content changed (status or 5-min
-// stopped bucket). No tokens yet = do not mark sent, retry next tick.
-async function updateShiftLiveActivity(env, shiftId, status, minutes) {
+function liveActivityStartIdentityQuery(row, claimStamp) {
+  const deliveryId = String(row.delivery_id || '');
+  const queueId = String(row.queue_id || '');
+  const deviceId = String(row.device_id || '');
+  const shiftId = String(row.shift_id || '');
+  const generation = Number(row.generation);
+  const startToken = String(row.token || '').toLowerCase();
+  if (!UUID_RE.test(deliveryId) || !UUID_RE.test(queueId) ||
+      !UUID_RE.test(deviceId) || !UUID_RE.test(shiftId) ||
+      !Number.isInteger(generation) || generation < 1 ||
+      !/^[0-9a-f]{32,512}$/.test(startToken) || !claimStamp) return null;
+  return 'live_activity_start_deliveries' +
+    '?id=eq.' + encodeURIComponent(deliveryId) +
+    '&shift_id=eq.' + encodeURIComponent(shiftId) +
+    '&queue_id=eq.' + encodeURIComponent(queueId) +
+    '&generation=eq.' + encodeURIComponent(String(generation)) +
+    '&start_token=eq.' + encodeURIComponent(startToken) +
+    '&claimed_at=eq.' + encodeURIComponent(claimStamp) +
+    '&queued_at=is.null';
+}
+
+async function releaseLiveActivityStartClaim(env, row, claimStamp) {
+  const query = liveActivityStartIdentityQuery(row, claimStamp);
+  if (!query) return false;
+  try {
+    const response = await fetch(env.SUPABASE_URL + '/rest/v1/' + query, {
+      method: 'PATCH',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ claimed_at: null }),
+    });
+    if (!response.ok) {
+      console.error('Live Activity START claim release failed:', response.status,
+        await response.text());
+    }
+    return response.ok;
+  } catch (e) {
+    console.error('Live Activity START claim release exception:', e);
+    return false;
+  }
+}
+
+async function completeLiveActivityStartClaim(env, row, claimStamp) {
+  const query = liveActivityStartIdentityQuery(row, claimStamp);
+  if (!query) return false;
+  try {
+    const response = await fetch(env.SUPABASE_URL + '/rest/v1/' + query, {
+      method: 'PATCH',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        claimed_at: null,
+        queued_at: new Date().toISOString(),
+      }),
+    });
+    if (!response.ok) {
+      console.error('Live Activity START completion failed:', response.status,
+        await response.text());
+    }
+    return response.ok;
+  } catch (e) {
+    // The queue row already has the stable UUID. Keep the lease instead of
+    // releasing it; stale recovery can re-insert that same UUID without a
+    // second APNs destination.
+    console.error('Live Activity START completion exception:', e);
+    return false;
+  }
+}
+
+// Independent five-minute producer for remote START. The database atomically
+// seeds and leases one row per open shift + physical management phone. A late
+// phone token creates its missing pair on a later scan. Queue insertion uses the
+// ledger's immutable UUID, so a lost response or stale lease can never create a
+// second logical START row.
+export async function runLiveActivityStartScan(env) {
+  const claimStamp = new Date().toISOString();
+  const staleBefore = new Date(Date.now() - LA_START_LEASE_MS).toISOString();
+  const startedAfter = new Date(Date.now() - 48 * 3600000).toISOString();
+  let claimedRows = null;
+  try {
+    const response = await fetch(
+      env.SUPABASE_URL + '/rest/v1/rpc/hc_claim_live_activity_starts', {
+        method: 'POST',
+        headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          p_claimed_at: claimStamp,
+          p_stale_before: staleBefore,
+          p_started_after: startedAfter,
+          p_limit: 50,
+        }),
+      });
+    if (!response.ok) {
+      console.error('Live Activity START claim failed:', response.status,
+        await response.text());
+      return 0;
+    }
+    claimedRows = await response.json();
+    if (!Array.isArray(claimedRows)) {
+      console.error('Live Activity START claim returned a non-array response');
+      return 0;
+    }
+  } catch (e) {
+    console.error('runLiveActivityStartScan claim error:', e);
+    return 0;
+  }
+
+  let queuedCount = 0;
+  for (const row of claimedRows) {
+    let queueOwned = false;
+    try {
+      if (!liveActivityStartIdentityQuery(row, claimStamp) || !row.clock_in_at) {
+        throw new Error('malformed START claim row');
+      }
+      const clockInISO = new Date(row.clock_in_at).toISOString();
+      const reportISO = new Date(row.report_at || row.clock_in_at).toISOString();
+      const initial = liveActivityStartStatus(row);
+      const name = row.worker_name || 'Team';
+      const contentState = buildLiveActivityContentState(
+        initial.status, initial.minutes, reportISO,
+      );
+      const queued = await enqueueLiveActivityPush(
+        env,
+        [row.token],
+        'start',
+        contentState,
+        {
+          attributes: {
+            workerName: name,
+            clockInISO: clockInISO,
+            shiftId: row.shift_id,
+          },
+          alert: { title: name + ' is on shift', body: 'Shift card is live' },
+          metadata: {
+            live_activity_start_delivery_id: row.delivery_id,
+            live_activity_start_shift_id: row.shift_id,
+            live_activity_start_device_id: row.device_id,
+            live_activity_start_queue_id: row.queue_id,
+            live_activity_start_generation: row.generation,
+            live_activity_start_claimed_at: claimStamp,
+          },
+        },
+        row.queue_id,
+      );
+      if (queued === null) {
+        // Unknown POST plus unknown verification. Keep the exact claim in
+        // place. Stale recovery retries this same queue UUID and cannot create
+        // a second logical START whether the first INSERT committed or not.
+        queueOwned = true;
+        continue;
+      }
+      if (!queued) {
+        await releaseLiveActivityStartClaim(env, row, claimStamp);
+        continue;
+      }
+      queueOwned = true;
+      queuedCount++;
+      await completeLiveActivityStartClaim(env, row, claimStamp);
+      // Do not stamp the shift-wide UPDATE cache here. This START belongs to
+      // one phone. Existing phones may still need this tick's latest state.
+    } catch (e) {
+      console.error('Live Activity START row failed:', row && row.delivery_id, e);
+      if (!queueOwned) {
+        await releaseLiveActivityStartClaim(env, row || {}, claimStamp);
+      }
+    }
+  }
+  return queuedCount;
+}
+
+// event:update only when rendered status, its 5-minute stopped bucket, or the
+// latest GPS report timestamp changed. No tokens means retry on the next tick.
+async function updateShiftLiveActivity(env, shiftId, status, minutes, lastReportISO = null) {
   try {
     if (laLastSent.size > 200) laLastSent.clear(); // bound isolate memory
-    const key = status + ':' + minutes;
+    const contentState = buildLiveActivityContentState(status, minutes, lastReportISO);
+    const key = status + ':' + minutes + ':' + (contentState.lastReportISO || '');
     if (laLastSent.get(shiftId) === key) return;
     const tokens = await laTokensForShift(env, shiftId);
     if (!tokens || !tokens.length) return; // null (read failed) or none: do not mark sent, retry next tick
     const queued = await enqueueLiveActivityPush(env, tokens.map((t) => t.token), 'update',
-      { status: status, statusMinutes: minutes });
+      contentState);
     if (queued) laLastSent.set(shiftId, key);
   } catch (e) { console.error('updateShiftLiveActivity error:', e); }
 }

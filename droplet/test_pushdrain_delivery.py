@@ -18,6 +18,8 @@ SHIFT_ID = "11111111-1111-4111-8111-111111111111"
 CLAIM_STAMP = "2026-08-25T14:16:00.000Z"
 QUEUE_CLAIM_STAMP = "2026-08-25T14:16:01.000Z"
 QUEUE_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+START_DELIVERY_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+START_DEVICE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
 
 def end_row(attempts=0):
@@ -72,6 +74,39 @@ def alert_row(attempts=0):
     }
 
 
+def start_row(attempts=0):
+    return {
+        "id": QUEUE_ID,
+        "kind": "la_start",
+        "attempts": attempts,
+        "claimed_at": QUEUE_CLAIM_STAMP,
+        "payload": {
+            "tokens": [TOKEN_A],
+            "headers": {
+                "topic": "com.hamptonscoconuts.field.push-type.liveactivity",
+                "push_type": "liveactivity",
+                "priority": 10,
+                "collapse_id": QUEUE_ID,
+            },
+            "aps": {
+                "event": "start",
+                "attributes-type": "ShiftAttributes",
+                "attributes": {"shiftId": SHIFT_ID},
+                "content-state": {"status": "At NJ Garage",
+                                  "statusMinutes": 0},
+            },
+            "telegram_text": None,
+            "fallback_chat_ids": [],
+            "live_activity_start_delivery_id": START_DELIVERY_ID,
+            "live_activity_start_shift_id": SHIFT_ID,
+            "live_activity_start_device_id": START_DEVICE_ID,
+            "live_activity_start_queue_id": QUEUE_ID,
+            "live_activity_start_generation": 1,
+            "live_activity_start_claimed_at": CLAIM_STAMP,
+        },
+    }
+
+
 class PushdrainDeliveryTests(unittest.TestCase):
     def setUp(self):
         self.old_configured = pd._APNS_CONFIGURED
@@ -85,6 +120,245 @@ class PushdrainDeliveryTests(unittest.TestCase):
         pd._LA_BLOCKED_UNTIL = self.old_blocked
         pd._JWT.clear()
         pd._JWT.update(self.old_jwt)
+
+    def test_start_success_rechecks_open_shift_and_records_before_queue_close(self):
+        events = []
+
+        def send(_token, headers, _aps, _request_id):
+            self.assertEqual(headers["expiration"], 0)
+            events.append("send")
+            return (200, "")
+
+        def record(_row, _token, outcome, reason=None):
+            events.append("record-" + outcome)
+            self.assertIsNone(reason)
+            return True
+
+        def save_state(_table, _params, body, want_rows=False):
+            if "done_at" in body:
+                events.append("finish")
+            return True
+
+        with patch.object(pd, "_validate_live_activity_start",
+                          return_value=True) as validate, \
+             patch.object(pd, "_apns_send", side_effect=send), \
+             patch.object(pd, "_record_live_activity_start_result",
+                          side_effect=record), \
+             patch.object(pd, "_sb_patch", side_effect=save_state), \
+             patch.object(pd, "_alert_owner"):
+            result = pd._process_row(start_row())
+
+        self.assertEqual(result, (1, False))
+        validate.assert_called_once()
+        self.assertEqual(events, ["send", "record-delivered", "finish"])
+
+    def test_closed_start_is_finished_without_contacting_apple(self):
+        with patch.object(pd, "_validate_live_activity_start",
+                          return_value=False), \
+             patch.object(pd, "_apns_send") as send, \
+             patch.object(pd, "_sb_patch", return_value=True) as state, \
+             patch.object(pd, "_alert_owner"):
+            result = pd._process_row(start_row())
+
+        self.assertEqual(result, (0, False))
+        send.assert_not_called()
+        done = next(call.args[2] for call in state.call_args_list
+                    if "done_at" in call.args[2])
+        self.assertEqual(done["last_error"],
+                         "Live Activity START no longer eligible")
+
+    def test_malformed_start_receipt_is_rejected_before_any_send(self):
+        row = start_row()
+        row["payload"]["live_activity_start_delivery_id"] = "not-a-uuid"
+        with patch.object(pd, "_validate_live_activity_start") as validate, \
+             patch.object(pd, "_apns_send") as send, \
+             patch.object(pd, "_sb_patch", return_value=True), \
+             patch.object(pd, "_alert_owner") as alert:
+            result = pd._process_row(row)
+
+        self.assertEqual(result, (0, False))
+        validate.assert_not_called()
+        send.assert_not_called()
+        alert.assert_called_once()
+
+    def test_non_object_start_headers_are_rejected_before_any_send(self):
+        row = start_row()
+        row["payload"]["headers"] = ["not", "an", "object"]
+        with patch.object(pd, "_validate_live_activity_start") as validate, \
+             patch.object(pd, "_apns_send") as send, \
+             patch.object(pd, "_sb_patch", return_value=True) as state:
+            result = pd._process_row(row)
+
+        self.assertEqual(result, (0, False))
+        validate.assert_not_called()
+        send.assert_not_called()
+        done = next(call.args[2] for call in state.call_args_list
+                    if "done_at" in call.args[2])
+        self.assertEqual(done["last_error"],
+                         "bad payload (headers is not an object)")
+
+    def test_non_object_start_aps_is_rejected_before_any_send(self):
+        row = start_row()
+        row["payload"]["aps"] = "not an object"
+        with patch.object(pd, "_validate_live_activity_start") as validate, \
+             patch.object(pd, "_apns_send") as send, \
+             patch.object(pd, "_sb_patch", return_value=True) as state:
+            result = pd._process_row(row)
+
+        self.assertEqual(result, (0, False))
+        validate.assert_not_called()
+        send.assert_not_called()
+        done = next(call.args[2] for call in state.call_args_list
+                    if "done_at" in call.args[2])
+        self.assertEqual(done["last_error"],
+                         "bad payload (aps is not an object)")
+
+    def test_start_eligibility_read_failure_retries_without_sending(self):
+        with patch.object(pd, "_validate_live_activity_start",
+                          return_value=None), \
+             patch.object(pd, "_apns_send") as send, \
+             patch.object(pd, "_sb_patch", return_value=True) as state, \
+             patch.object(pd, "_alert_owner"):
+            result = pd._process_row(start_row())
+
+        self.assertEqual(result, (0, False))
+        send.assert_not_called()
+        retry = next(call.args[2] for call in state.call_args_list
+                     if call.args[2].get("claimed_at", "missing") is None)
+        self.assertEqual(retry["attempts"], 1)
+        self.assertIn("eligibility check unavailable", retry["last_error"])
+
+    def test_dead_start_token_is_recorded_terminal_before_exact_cleanup(self):
+        events = []
+
+        def record(_row, _token, outcome, reason=None):
+            events.append(("record", outcome, reason))
+            return True
+
+        def cleanup(_row, _token):
+            events.append(("delete",))
+            return True
+
+        with patch.object(pd, "_validate_live_activity_start",
+                          return_value=True), \
+             patch.object(pd, "_apns_send",
+                          return_value=(410, "Unregistered")), \
+             patch.object(pd, "_record_live_activity_start_result",
+                          side_effect=record), \
+             patch.object(pd, "_delete_live_activity_start_token",
+                          side_effect=cleanup), \
+             patch.object(pd, "_sb_patch", return_value=True), \
+             patch.object(pd, "_send_fallback", return_value=False), \
+             patch.object(pd, "_alert_owner"):
+            result = pd._process_row(start_row())
+
+        self.assertEqual(result, (0, False))
+        self.assertEqual(events[0][0:2], ("record", "terminal"))
+        self.assertIn("410 Unregistered", events[0][2])
+        self.assertEqual(events[1], ("delete",))
+
+    def test_token_not_for_topic_is_terminal_and_never_retried(self):
+        with patch.object(pd, "_validate_live_activity_start",
+                          return_value=True), \
+             patch.object(pd, "_apns_send",
+                          return_value=(400, "DeviceTokenNotForTopic")), \
+             patch.object(pd, "_record_live_activity_start_result",
+                          return_value=True) as record, \
+             patch.object(pd, "_delete_live_activity_start_token",
+                          return_value=True) as cleanup, \
+             patch.object(pd, "_sb_patch", return_value=True) as state, \
+             patch.object(pd, "_send_fallback", return_value=False), \
+             patch.object(pd, "_alert_owner"):
+            result = pd._process_row(start_row())
+
+        self.assertEqual(result, (0, False))
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[2], "terminal")
+        self.assertIn("400 DeviceTokenNotForTopic", record.call_args.args[3])
+        cleanup.assert_called_once()
+        retry_writes = [call for call in state.call_args_list
+                        if "payload" in call.args[2]]
+        self.assertEqual(retry_writes, [])
+
+    def test_lost_start_receipt_write_latches_success_and_never_resends(self):
+        saved_bodies = []
+
+        def patch_state(_table, _params, body, want_rows=False):
+            saved_bodies.append(copy.deepcopy(body))
+            return True
+
+        first = start_row()
+        with patch.object(pd, "_validate_live_activity_start",
+                          return_value=True), \
+             patch.object(pd, "_apns_send", return_value=(200, "")) as send, \
+             patch.object(pd, "_record_live_activity_start_result",
+                          return_value=False), \
+             patch.object(pd, "_sb_patch", side_effect=patch_state), \
+             patch.object(pd, "_alert_owner"):
+            self.assertEqual(pd._process_row(first), (1, False))
+
+        latched = next(body for body in saved_bodies if "payload" in body)
+        self.assertTrue(latched["payload"]["delivery_succeeded"])
+        self.assertIsNone(latched["claimed_at"])
+        send.assert_called_once()
+
+        retry = start_row(attempts=1)
+        retry["payload"] = latched["payload"]
+        with patch.object(pd, "_record_live_activity_start_result",
+                          return_value=True) as record, \
+             patch.object(pd, "_apns_send") as resend, \
+             patch.object(pd, "_sb_patch", return_value=True), \
+             patch.object(pd, "_alert_owner"):
+            self.assertEqual(pd._process_row(retry), (0, False))
+
+        record.assert_called_once()
+        resend.assert_not_called()
+
+    def test_start_result_write_uses_exact_generation_and_token_receipt(self):
+        with patch.object(pd, "_sb_patch",
+                          return_value=[{"id": START_DELIVERY_ID}]) as save, \
+             patch.object(pd, "_alert_owner"):
+            result = pd._record_live_activity_start_result(
+                start_row(), TOKEN_A, "delivered")
+
+        self.assertTrue(result)
+        table, params, body = save.call_args.args
+        self.assertEqual(table, "live_activity_start_deliveries")
+        self.assertEqual(params["id"], "eq." + START_DELIVERY_ID)
+        self.assertEqual(params["shift_id"], "eq." + SHIFT_ID)
+        self.assertNotIn("device_id", params)
+        self.assertEqual(params["queue_id"], "eq." + QUEUE_ID)
+        self.assertEqual(params["generation"], "eq.1")
+        self.assertEqual(params["start_token"], "eq." + TOKEN_A)
+        self.assertEqual(params["terminal_at"], "is.null")
+        self.assertIn("delivered_at", body)
+        self.assertTrue(save.call_args.kwargs["want_rows"])
+
+    def test_start_validation_uses_immutable_receipt_not_mutable_device_id(self):
+        with patch.object(pd, "_sb_rpc", return_value=True) as rpc:
+            result = pd._validate_live_activity_start(start_row(), TOKEN_A)
+
+        self.assertTrue(result)
+        name, body = rpc.call_args.args
+        self.assertEqual(name, "hc_validate_live_activity_start_delivery")
+        self.assertEqual(body["p_delivery_id"], START_DELIVERY_ID)
+        self.assertEqual(body["p_shift_id"], SHIFT_ID)
+        self.assertEqual(body["p_queue_id"], QUEUE_ID)
+        self.assertEqual(body["p_generation"], 1)
+        self.assertEqual(body["p_start_token"], TOKEN_A)
+        self.assertNotIn("p_device_id", body)
+
+    def test_dead_start_cleanup_uses_exact_token_across_device_remap(self):
+        with patch.object(pd, "_sb_delete", return_value=True) as delete:
+            result = pd._delete_live_activity_start_token(start_row(), TOKEN_A)
+
+        self.assertTrue(result)
+        table, params = delete.call_args.args
+        self.assertEqual(table, "live_activity_tokens")
+        self.assertEqual(params["token_type"], "eq.push_to_start")
+        self.assertEqual(params["shift_id"], "is.null")
+        self.assertEqual(params["token"], "eq." + TOKEN_A)
+        self.assertNotIn("device_id", params)
 
     def test_end_success_deletes_exact_token_only_after_apns_200(self):
         events = []
@@ -292,6 +566,7 @@ class PushdrainDeliveryTests(unittest.TestCase):
             "push_type": "alert",
             "priority": 10,
             "collapse_id": QUEUE_ID,
+            "expiration": 0,
         }
         with patch.object(pd, "_apns_jwt", return_value="offline-jwt"), \
              patch.object(pd.subprocess, "run", return_value=completed) as run:
@@ -301,6 +576,7 @@ class PushdrainDeliveryTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("apns-id: " + QUEUE_ID, command)
         self.assertIn("apns-collapse-id: " + QUEUE_ID, command)
+        self.assertIn("apns-expiration: 0", command)
 
     def test_temporary_end_failure_stays_retryable_without_token_delete(self):
         with patch.object(pd, "_apns_send", return_value=(503, "ServiceUnavailable")), \

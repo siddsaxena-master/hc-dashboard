@@ -66,6 +66,7 @@ import logging
 import os
 import subprocess
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -237,6 +238,26 @@ def _sb_delete(table, params) -> bool:
         return False
 
 
+def _sb_rpc(name, body):
+    """Call one service-role Supabase RPC. Returns its JSON value, or None
+    when the request failed or returned invalid JSON."""
+    try:
+        resp = requests.post(
+            _table("rpc/" + name),
+            headers=_sb_headers({"Content-Type": "application/json"}),
+            data=json.dumps(body),
+            timeout=15,
+        )
+        if not resp.ok:
+            log.error("supabase rpc %s -> %s %s", name, resp.status_code,
+                      resp.text[:200])
+            return None
+        return resp.json()
+    except Exception:
+        log.exception("supabase rpc failed: %s", name)
+        return None
+
+
 def _queue_depth():
     """Undone-row count for the heartbeat line. None = read failed."""
     try:
@@ -304,6 +325,13 @@ def _apns_send(device_token, headers_cfg, aps, request_id=None):
         collapse_id = str(headers_cfg.get("collapse_id") or "").strip()
         if collapse_id:
             stable_headers += ["-H", "apns-collapse-id: " + collapse_id[:64]]
+        expiration = headers_cfg.get("expiration")
+        if expiration is not None:
+            try:
+                stable_headers += ["-H", "apns-expiration: "
+                                   + str(max(0, int(expiration)))]
+            except (TypeError, ValueError):
+                return (0, "invalid-apns-expiration")
         cmd = [
             "curl", "-s", "--http2", "--max-time", "15",
             "-o", "-", "-w", "\n%{http_code}",
@@ -338,7 +366,12 @@ def _apns_send(device_token, headers_cfg, aps, request_id=None):
 
 # ── queue mechanics ──────────────────────────────────────────────────
 _LA_BLOCKED_UNTIL = 0.0  # Apple rejected the liveactivity topic; skip la_* rows until then
-_DEAD_TOKEN_REASONS = ("BadDeviceToken", "Unregistered", "ExpiredToken")
+_DEAD_TOKEN_REASONS = (
+    "BadDeviceToken",
+    "Unregistered",
+    "ExpiredToken",
+    "DeviceTokenNotForTopic",
+)
 
 
 def _delete_dead_token(kind, token):
@@ -369,6 +402,139 @@ def _live_activity_end_identity(row, token):
         "end_queue_id": "eq." + queue_id,
         "end_requested_at": "eq." + claim_stamp,
     }
+
+
+def _live_activity_start_identity(row, token):
+    """Return the exact durable receipt for one la_start destination.
+    A START queue row is deliberately limited to one Apple token."""
+    payload = row.get("payload") or {}
+    delivery_id = str(
+        payload.get("live_activity_start_delivery_id") or "").strip()
+    shift_id = str(
+        payload.get("live_activity_start_shift_id") or "").strip()
+    device_id = str(
+        payload.get("live_activity_start_device_id") or "").strip()
+    queue_id = str(
+        payload.get("live_activity_start_queue_id") or "").strip()
+    claim_stamp = str(
+        payload.get("live_activity_start_claimed_at") or "").strip()
+    token_text = str(token or "").strip().lower()
+    try:
+        generation = int(payload.get("live_activity_start_generation"))
+    except (TypeError, ValueError):
+        generation = 0
+    try:
+        for receipt_uuid in (delivery_id, shift_id, device_id, queue_id):
+            uuid.UUID(receipt_uuid)
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if (not delivery_id or not shift_id or not device_id or not queue_id
+            or not claim_stamp or queue_id != str(row.get("id") or "")
+            or generation < 1 or len(token_text) < 32
+            or len(token_text) > 512
+            or any(char not in "0123456789abcdef" for char in token_text)):
+        return None
+    return {
+        "id": "eq." + delivery_id,
+        "shift_id": "eq." + shift_id,
+        "device_id": "eq." + device_id,
+        "queue_id": "eq." + queue_id,
+        "generation": "eq." + str(generation),
+        "start_token": "eq." + token_text,
+    }
+
+
+def _validate_live_activity_start(row, token):
+    """Recheck the shift, token, and manager link immediately before APNs.
+    True is eligible, False is definitively ineligible, None is a read failure."""
+    identity = _live_activity_start_identity(row, token)
+    if not identity:
+        return False
+    result = _sb_rpc("hc_validate_live_activity_start_delivery", {
+        "p_delivery_id": identity["id"][3:],
+        "p_shift_id": identity["shift_id"][3:],
+        "p_queue_id": identity["queue_id"][3:],
+        "p_generation": int(identity["generation"][3:]),
+        "p_start_token": identity["start_token"][3:],
+    })
+    return result if isinstance(result, bool) else None
+
+
+def _live_activity_start_result_present(identity, outcome, reason=None):
+    rows = _sb_select("live_activity_start_deliveries", {
+        **identity,
+        "select": "id,delivered_at,terminal_at,terminal_reason",
+        "limit": "1",
+    })
+    if rows is None:
+        return None
+    if len(rows) != 1:
+        return False
+    current = rows[0]
+    if outcome == "delivered":
+        return (current.get("delivered_at") is not None
+                and current.get("terminal_at") is None)
+    return (current.get("terminal_at") is not None
+            and current.get("delivered_at") is None
+            and current.get("terminal_reason") == reason)
+
+
+def _record_live_activity_start_result(row, token, outcome, reason=None) -> bool:
+    """Persist Apple's exact START result before allowing the queue to close.
+    Ambiguous write responses are verified, then retried with the same receipt."""
+    identity = _live_activity_start_identity(row, token)
+    if not identity or outcome not in ("delivered", "terminal"):
+        return False
+    # device_id can legitimately change when the same exact Apple token is
+    # reclaimed after reinstall. The other fields form the immutable receipt.
+    identity = {
+        key: value for key, value in identity.items()
+        if key != "device_id"
+    }
+    terminal_reason = str(reason or "")[:300] if outcome == "terminal" else None
+    if outcome == "terminal" and not terminal_reason:
+        return False
+    params = {
+        **identity,
+        "delivered_at": "is.null",
+        "terminal_at": "is.null",
+    }
+    body = ({"delivered_at": _now_iso()}
+            if outcome == "delivered"
+            else {"terminal_at": _now_iso(),
+                  "terminal_reason": terminal_reason})
+    for attempt in range(3):
+        changed = _sb_patch(
+            "live_activity_start_deliveries", params, body, want_rows=True)
+        if changed is True or (isinstance(changed, list) and changed):
+            return True
+        present = _live_activity_start_result_present(
+            identity, outcome, terminal_reason)
+        if present is True:
+            return True
+        if isinstance(changed, list) and not changed and present is False:
+            return False
+        if attempt < 2:
+            time.sleep(0.05 * (attempt + 1))
+    _alert_owner(
+        "la_start_result_write",
+        "pushdrain: Apple's Live Activity START result could not be saved for "
+        "queue row " + str(row.get("id")) + ". The queue receipt is being "
+        "retained to avoid a blind resend. Check Supabase and: journalctl -u "
+        "pushdrain -n 80",
+    )
+    return False
+
+
+def _delete_live_activity_start_token(row, token) -> bool:
+    identity = _live_activity_start_identity(row, token)
+    if not identity:
+        return False
+    return _sb_delete("live_activity_tokens", {
+        "token_type": "eq.push_to_start",
+        "shift_id": "is.null",
+        "token": identity["start_token"],
+    })
 
 
 def _delete_live_activity_end_token(row, token) -> bool:
@@ -553,6 +719,46 @@ def _row_had_delivery(row) -> bool:
     return bool(payload.get("delivery_succeeded"))
 
 
+def _park_live_activity_start_result(row, token, outcome, reason=None) -> bool:
+    """Save Apple's already-known result in the queue without closing it.
+    Future passes reconcile the ledger and never contact Apple again."""
+    payload = dict(row.get("payload") or {})
+    payload["tokens"] = [str(token)]
+    if outcome == "delivered":
+        payload["delivery_succeeded"] = True
+        payload.pop("live_activity_start_terminal_reason", None)
+        error = "Apple accepted START; receipt write pending"
+    else:
+        payload["live_activity_start_terminal_reason"] = str(reason or "")[:300]
+        payload.pop("delivery_succeeded", None)
+        error = "Apple rejected dead START token; receipt write pending"
+    return _persist_queue_patch(
+        row,
+        {"claimed_at": None,
+         "attempts": int(row.get("attempts") or 0) + 1,
+         "last_error": error,
+         "payload": payload},
+    )
+
+
+def _reconcile_live_activity_start_result(row, token):
+    """Return None when Apple has not answered, otherwise True/False for
+    whether the saved queue result was durably reconciled into the ledger."""
+    payload = row.get("payload") or {}
+    terminal_reason = str(
+        payload.get("live_activity_start_terminal_reason") or "").strip()
+    if terminal_reason:
+        saved = _record_live_activity_start_result(
+            row, token, "terminal", terminal_reason)
+        if saved:
+            _delete_live_activity_start_token(row, token)
+        return saved
+    if payload.get("delivery_succeeded"):
+        return _record_live_activity_start_result(
+            row, token, "delivered")
+    return None
+
+
 def _park_delivery_retry(row, retry_tokens, delivered_before, error):
     """Persist only failed phones. delivery_succeeded suppresses Telegram
     fallback forever once any phone accepted this notification."""
@@ -627,8 +833,20 @@ def _process_row(row):
     # Stable de-duplication: one accidental duplicate token in a payload must
     # never produce two lock-screen notifications in the same drain pass.
     tokens = list(dict.fromkeys(str(t) for t in raw_tokens if t))
-    headers_cfg = payload.get("headers") or {}
+    raw_headers = payload.get("headers") or {}
+    if not isinstance(raw_headers, dict):
+        _finish(row, "bad payload (headers is not an object)")
+        return (0, False)
+    headers_cfg = dict(raw_headers)
+    # A START delivered after clock-out creates a ghost card with no update
+    # token available for the earlier END. Never let APNs store STARTs. Enforce
+    # this here as well as in the current worker payload so legacy rows are safe.
+    if kind == "la_start":
+        headers_cfg["expiration"] = 0
     aps = payload.get("aps") or {}
+    if not isinstance(aps, dict):
+        _finish(row, "bad payload (aps is not an object)")
+        return (0, False)
     delivered_before = _row_had_delivery(row)
 
     if kind == "la_end" and (len(tokens) != 1 or not _live_activity_end_identity(row, tokens[0] if tokens else None)):
@@ -637,6 +855,36 @@ def _process_row(row):
                      + str(row.get("id")) + "). No phone token was deleted.")
         _finish(row, "bad la_end payload: exact one-token identity required")
         return (0, False)
+
+    if kind == "la_start" and (
+            len(tokens) != 1
+            or not _live_activity_start_identity(
+                row, tokens[0] if tokens else None)):
+        _alert_owner(
+            "la_start_bad_payload",
+            "pushdrain: rejected a malformed Live Activity START queue row ("
+            + str(row.get("id")) + "). No banner was sent.",
+        )
+        _finish(row, "bad la_start payload: exact one-token receipt required")
+        return (0, False)
+
+    # If Apple already answered but the receipt write was interrupted, repair
+    # database state first. The queue latch makes this path strictly no-send.
+    if kind == "la_start":
+        reconciled = _reconcile_live_activity_start_result(row, tokens[0])
+        if reconciled is not None:
+            if reconciled:
+                _finish(row, None)
+            else:
+                terminal_reason = str(payload.get(
+                    "live_activity_start_terminal_reason") or "").strip()
+                _park_live_activity_start_result(
+                    row,
+                    tokens[0],
+                    "terminal" if terminal_reason else "delivered",
+                    terminal_reason or None,
+                )
+            return (0, False)
 
     # Live Activity topic is blocked: close la_* rows immediately
     # (cosmetic, perishable, no fallback). Alert rows are unaffected.
@@ -687,9 +935,24 @@ def _process_row(row):
             log.warning("queue row %s lost its claim before token %d; stopping",
                         row.get("id"), token_index + 1)
             return (delivered, False)
+        if kind == "la_start":
+            eligible = _validate_live_activity_start(row, t)
+            if eligible is None:
+                _park_delivery_retry(
+                    row, [t], False,
+                    "Live Activity START eligibility check unavailable",
+                )
+                return (delivered, False)
+            if eligible is False:
+                _finish(row, "Live Activity START no longer eligible")
+                return (delivered, False)
         status, reason = _apns_send(t, headers_cfg, aps, row.get("id"))
         if status == 200:
             delivered += 1
+            if kind == "la_start" and not _record_live_activity_start_result(
+                    row, t, "delivered"):
+                _park_live_activity_start_result(row, t, "delivered")
+                return (delivered, False)
             if kind == "la_end" and not _delete_live_activity_end_token(row, t):
                 _alert_owner("la_end_cleanup",
                              "pushdrain: Apple accepted a Live Activity END, but its exact "
@@ -698,7 +961,22 @@ def _process_row(row):
             continue
         errors.append(str(status) + " " + reason)
         if status == 410 or reason in _DEAD_TOKEN_REASONS:
-            if kind == "la_end":
+            if kind == "la_start":
+                terminal_reason = (str(status) + " " + str(reason or "dead token"))[:300]
+                if not _record_live_activity_start_result(
+                        row, t, "terminal", terminal_reason):
+                    _park_live_activity_start_result(
+                        row, t, "terminal", terminal_reason)
+                    return (delivered, False)
+                if not _delete_live_activity_start_token(row, t):
+                    _alert_owner(
+                        "la_start_cleanup",
+                        "pushdrain: Apple reported a dead Live Activity START "
+                        "token, but its exact token row could not be cleaned up. "
+                        "The durable receipt prevents a blind resend. Check "
+                        "Supabase and pushdrain logs.",
+                    )
+            elif kind == "la_end":
                 if not _delete_live_activity_end_token(row, t):
                     _alert_owner("la_end_cleanup",
                                  "pushdrain: Apple reported a dead Live Activity END token, "
@@ -796,6 +1074,33 @@ def _process_row(row):
 def _expire_claimed_row(row) -> bool:
     """Expire one row whose exact queue lease was just claimed. Returns whether
     Telegram fallback was accepted."""
+    if row.get("kind") == "la_start":
+        payload = row.get("payload") or {}
+        tokens = payload.get("tokens") or []
+        token = tokens[0] if isinstance(tokens, list) and len(tokens) == 1 else None
+        if not token or not _live_activity_start_identity(row, token):
+            _alert_owner(
+                "la_start_bad_payload",
+                "pushdrain: an expired Live Activity START row had no exact "
+                "receipt (" + str(row.get("id")) + "). No banner was sent.",
+            )
+            _finish(row, "expired malformed la_start payload")
+            return False
+        reconciled = _reconcile_live_activity_start_result(row, token)
+        if reconciled is True:
+            _finish(row, "expired after Apple result reconciliation")
+        elif reconciled is False:
+            terminal_reason = str(payload.get(
+                "live_activity_start_terminal_reason") or "").strip()
+            _park_live_activity_start_result(
+                row,
+                token,
+                "terminal" if terminal_reason else "delivered",
+                terminal_reason or None,
+            )
+        else:
+            _finish(row, "expired before Live Activity START delivery")
+        return False
     if row.get("kind") == "la_end":
         payload = row.get("payload") or {}
         tokens = payload.get("tokens") or []
