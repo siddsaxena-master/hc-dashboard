@@ -20,6 +20,12 @@ QUEUE_CLAIM_STAMP = "2026-08-25T14:16:01.000Z"
 QUEUE_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 START_DELIVERY_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 START_DEVICE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+OUTBOX_CURRENT_KEY = bytes(range(32))
+OUTBOX_PREVIOUS_KEY = bytes(reversed(range(32)))
+OUTBOX_CURRENT_CONFIG = "current:" + pd.base64.b64encode(
+    OUTBOX_CURRENT_KEY).decode("ascii")
+OUTBOX_PREVIOUS_CONFIG = "previous:" + pd.base64.b64encode(
+    OUTBOX_PREVIOUS_KEY).decode("ascii")
 
 
 def end_row(attempts=0):
@@ -74,6 +80,37 @@ def alert_row(attempts=0):
     }
 
 
+def telegram_outbox_row(queue_id, chat_id, text, attempts=0,
+                        key=OUTBOX_CURRENT_KEY, key_version="current"):
+    nonce = bytes(range(12))
+    aad = ("hc-telegram-outbox-v2\0" + key_version + "\0"
+           + queue_id).encode("utf-8")
+    plaintext = json.dumps({
+        "chat_id": chat_id,
+        "text": text,
+    }, separators=(",", ":")).encode("utf-8")
+    ciphertext = pd.AESGCM(key).encrypt(nonce, plaintext, aad)
+    return {
+        "id": queue_id,
+        "kind": "alert",
+        "outbox_type": "webhook_telegram",
+        "attempts": attempts,
+        "claimed_at": QUEUE_CLAIM_STAMP,
+        "next_attempt_at": "2026-08-25T14:00:00.000Z",
+        "payload": {
+            "tokens": [],
+            "headers": {},
+            "aps": {},
+            "telegram_outbox": {
+                "version": 2,
+                "key_version": key_version,
+                "nonce": pd.base64.b64encode(nonce).decode("ascii"),
+                "ciphertext": pd.base64.b64encode(ciphertext).decode("ascii"),
+            },
+        },
+    }
+
+
 def start_row(attempts=0):
     return {
         "id": QUEUE_ID,
@@ -112,14 +149,23 @@ class PushdrainDeliveryTests(unittest.TestCase):
         self.old_configured = pd._APNS_CONFIGURED
         self.old_blocked = pd._LA_BLOCKED_UNTIL
         self.old_jwt = dict(pd._JWT)
+        self.old_outbox_current = pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT
+        self.old_outbox_previous = pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS
+        self.old_webhook_config_warning_at = pd._WEBHOOK_CONFIG_WARNING_AT
         pd._APNS_CONFIGURED = True
         pd._LA_BLOCKED_UNTIL = 0.0
+        pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT = OUTBOX_CURRENT_CONFIG
+        pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS = ""
+        pd._WEBHOOK_CONFIG_WARNING_AT = 0.0
 
     def tearDown(self):
         pd._APNS_CONFIGURED = self.old_configured
         pd._LA_BLOCKED_UNTIL = self.old_blocked
         pd._JWT.clear()
         pd._JWT.update(self.old_jwt)
+        pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT = self.old_outbox_current
+        pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS = self.old_outbox_previous
+        pd._WEBHOOK_CONFIG_WARNING_AT = self.old_webhook_config_warning_at
 
     def test_start_success_rechecks_open_shift_and_records_before_queue_close(self):
         events = []
@@ -680,6 +726,402 @@ class PushdrainDeliveryTests(unittest.TestCase):
                          if "done_at" in call.args[2])
         self.assertIn("telegram fallback sent", done_body["last_error"])
 
+    def test_encrypted_telegram_outbox_decrypts_and_closes_after_acceptance(self):
+        row = telegram_outbox_row(
+            "12121212-1212-4212-8212-121212121212",
+            "private-chat",
+            "Private webhook alert",
+        )
+        stored = json.dumps(row)
+        self.assertNotIn("private-chat", stored)
+        self.assertNotIn("Private webhook alert", stored)
+        accepted = Mock(ok=True, status_code=200, text="ok")
+
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "offline-bot-token"), \
+             patch.object(pd.requests, "post", return_value=accepted) as post, \
+             patch.object(pd, "_sb_patch", return_value=True) as sb_patch:
+            result = pd._process_row(row)
+
+        self.assertEqual(result, (0, True))
+        post.assert_called_once()
+        self.assertEqual(post.call_args.kwargs["json"], {
+            "chat_id": "private-chat",
+            "text": "Private webhook alert",
+        })
+        done = next(call.args[2] for call in sb_patch.call_args_list
+                    if "done_at" in call.args[2])
+        self.assertIsNone(done["last_error"])
+
+    def test_partial_multi_chat_failure_retries_only_the_unfinished_chat(self):
+        row_a = telegram_outbox_row(
+            "13131313-1313-4313-8313-131313131313",
+            "chat-a",
+            "Alert A",
+        )
+        row_b = telegram_outbox_row(
+            "14141414-1414-4414-8414-141414141414",
+            "chat-b",
+            "Alert B",
+        )
+        sent = []
+        chat_b_attempts = 0
+        done_ids = set()
+
+        def send(_url, json=None, timeout=None):
+            nonlocal chat_b_attempts
+            self.assertEqual(timeout, 10)
+            sent.append(json["chat_id"])
+            if json["chat_id"] == "chat-b":
+                chat_b_attempts += 1
+                if chat_b_attempts == 1:
+                    return Mock(ok=False, status_code=503, text="offline")
+            return Mock(ok=True, status_code=200, text="ok")
+
+        def save(_table, params, body, want_rows=False):
+            self.assertTrue(want_rows)
+            row_id = params["id"].replace("eq.", "", 1)
+            if "done_at" in body:
+                done_ids.add(row_id)
+            return [{"id": row_id}]
+
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "offline-bot-token"), \
+             patch.object(pd.requests, "post", side_effect=send), \
+             patch.object(pd, "_sb_patch", side_effect=save):
+            self.assertEqual(pd._process_row(row_a), (0, True))
+            self.assertEqual(pd._process_row(row_b), (0, False))
+
+            # This mirrors pushdrain's done_at-is-null selector. The completed
+            # chat A row is absent from the retry set, while chat B remains.
+            pending = [row for row in (row_a, row_b)
+                       if row["id"] not in done_ids]
+            self.assertEqual([row["id"] for row in pending], [row_b["id"]])
+            pending[0]["attempts"] = 1
+            self.assertEqual(pd._process_row(pending[0]), (0, True))
+
+        self.assertEqual(sent, ["chat-a", "chat-b", "chat-b"])
+        self.assertEqual(done_ids, {row_a["id"], row_b["id"]})
+
+    def test_ambiguous_telegram_response_stays_pending_for_at_least_once_retry(self):
+        row = telegram_outbox_row(
+            "15151515-1515-4515-8515-151515151515",
+            "ambiguous-chat",
+            "Ambiguous alert",
+        )
+        accepted = Mock(ok=True, status_code=200, text="ok")
+        patches = []
+
+        def save(_table, params, body, want_rows=False):
+            self.assertTrue(want_rows)
+            patches.append(copy.deepcopy(body))
+            return [{"id": params["id"].replace("eq.", "", 1)}]
+
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "offline-bot-token"), \
+             patch.object(pd.requests, "post",
+                          side_effect=[TimeoutError("response lost"), accepted]) as post, \
+             patch.object(pd, "_sb_patch", side_effect=save):
+            self.assertEqual(pd._process_row(row), (0, False))
+            self.assertNotIn("done_at", patches[-1])
+            self.assertIsNone(patches[-1]["claimed_at"])
+            self.assertIn("next_attempt_at", patches[-1])
+            row["attempts"] = 1
+            self.assertEqual(pd._process_row(row), (0, True))
+
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("done_at", patches[-1])
+
+    def test_expired_telegram_outbox_uses_dedicated_retry_schedule(self):
+        row = telegram_outbox_row(
+            "16161616-1616-4616-8616-161616161616",
+            "outage-chat",
+            "Outage alert",
+            attempts=pd.MAX_ATTEMPTS,
+        )
+        refused = Mock(ok=False, status_code=503, text="offline")
+        patches = []
+
+        def save(_table, params, body, want_rows=False):
+            self.assertTrue(want_rows)
+            patches.append(copy.deepcopy(body))
+            return [{"id": params["id"].replace("eq.", "", 1)}]
+
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "offline-bot-token"), \
+             patch.object(pd.requests, "post", return_value=refused), \
+             patch.object(pd, "_sb_patch", side_effect=save):
+            self.assertFalse(pd._expire_claimed_row(row))
+
+        self.assertEqual(len(patches), 1)
+        self.assertNotIn("done_at", patches[0])
+        self.assertIsNone(patches[0]["claimed_at"])
+        self.assertIn("next_attempt_at", patches[0])
+        self.assertEqual(patches[0]["attempts"], pd.MAX_ATTEMPTS + 1)
+        self.assertIn("temporarily unavailable", patches[0]["last_error"])
+
+    def test_previous_encryption_key_decrypts_during_rotation(self):
+        row = telegram_outbox_row(
+            "17171717-1717-4717-8717-171717171717",
+            "previous-key-chat",
+            "Rotated alert",
+            key=OUTBOX_PREVIOUS_KEY,
+            key_version="previous",
+        )
+        accepted = Mock(ok=True, status_code=200, text="ok")
+        pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS = OUTBOX_PREVIOUS_CONFIG
+
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "offline-bot-token"), \
+             patch.object(pd.requests, "post", return_value=accepted) as post, \
+             patch.object(pd, "_sb_patch", return_value=True):
+            self.assertEqual(pd._process_row(row), (0, True))
+
+        self.assertEqual(post.call_args.kwargs["json"], {
+            "chat_id": "previous-key-chat",
+            "text": "Rotated alert",
+        })
+
+    def test_markdown_characters_are_plain_and_final_length_is_4096(self):
+        prefix = "*_[link](https://example.test) `code` # "
+        text = prefix + "x" * (4096 - len(prefix))
+        self.assertEqual(len(text), 4096)
+        row = telegram_outbox_row(
+            "18181818-1818-4818-8818-181818181818",
+            "plain-chat",
+            text,
+        )
+        accepted = Mock(ok=True, status_code=200, text="ok")
+
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "offline-bot-token"), \
+             patch.object(pd.requests, "post", return_value=accepted) as post, \
+             patch.object(pd, "_sb_patch", return_value=True):
+            self.assertEqual(pd._process_row(row), (0, True))
+
+        request_json = post.call_args.kwargs["json"]
+        self.assertEqual(request_json, {"chat_id": "plain-chat", "text": text})
+        self.assertNotIn("parse_mode", request_json)
+
+    def test_terminal_telegram_statuses_dead_letter_without_retry(self):
+        for offset, status in enumerate((400, 403), start=1):
+            with self.subTest(status=status):
+                row = telegram_outbox_row(
+                    f"19191919-1919-4919-8919-{offset:012d}",
+                    "terminal-chat",
+                    "Terminal alert",
+                )
+                patches = []
+
+                def save(_table, _params, body, want_rows=False):
+                    self.assertTrue(want_rows)
+                    patches.append(copy.deepcopy(body))
+                    return [{"id": row["id"]}]
+
+                refused = Mock(ok=False, status_code=status, text="refused")
+                with patch.object(pd, "TELEGRAM_BOT_TOKEN", "offline-bot-token"), \
+                     patch.object(pd.requests, "post", return_value=refused), \
+                     patch.object(pd, "_sb_patch", side_effect=save), \
+                     patch.object(pd, "_alert_owner") as alert:
+                    self.assertEqual(pd._process_row(row), (0, False))
+
+                terminal = patches[-1]
+                self.assertIn("done_at", terminal)
+                self.assertIn("dead_lettered_at", terminal)
+                self.assertIn("permanently rejected", terminal["dead_letter_reason"])
+                self.assertNotIn("next_attempt_at", terminal)
+                alert.assert_called_once()
+
+    def test_retryable_telegram_statuses_and_network_use_backoff(self):
+        outcomes = (
+            Mock(ok=False, status_code=409, text="conflict"),
+            Mock(ok=False, status_code=429, text="rate limited"),
+            Mock(ok=False, status_code=500, text="offline"),
+            TimeoutError("response lost"),
+        )
+        for offset, outcome in enumerate(outcomes, start=1):
+            with self.subTest(outcome=type(outcome).__name__):
+                row = telegram_outbox_row(
+                    f"20202020-2020-4020-8020-{offset:012d}",
+                    "retry-chat",
+                    "Retry alert",
+                )
+                patches = []
+
+                def save(_table, _params, body, want_rows=False):
+                    self.assertTrue(want_rows)
+                    patches.append(copy.deepcopy(body))
+                    return [{"id": row["id"]}]
+
+                with patch.object(pd, "TELEGRAM_BOT_TOKEN", "offline-bot-token"), \
+                     patch.object(pd.requests, "post", side_effect=[outcome]), \
+                     patch.object(pd, "_sb_patch", side_effect=save), \
+                     patch.object(pd, "_alert_owner") as alert:
+                    self.assertEqual(pd._process_row(row), (0, False))
+
+                retry = patches[-1]
+                self.assertNotIn("done_at", retry)
+                self.assertIsNone(retry["claimed_at"])
+                self.assertIn("next_attempt_at", retry)
+                self.assertEqual(retry["attempts"], 1)
+                alert.assert_not_called()
+
+    def test_missing_or_rejected_bot_configuration_retries_with_warning(self):
+        cases = (("missing", None), ("http", 401), ("http", 404))
+        for offset, (kind, status) in enumerate(cases, start=1):
+            with self.subTest(kind=kind, status=status):
+                row = telegram_outbox_row(
+                    f"21212121-2121-4121-8121-{offset:012d}",
+                    "config-chat",
+                    "Configuration alert",
+                )
+                patches = []
+
+                def save(_table, _params, body, want_rows=False):
+                    self.assertTrue(want_rows)
+                    patches.append(copy.deepcopy(body))
+                    return [{"id": row["id"]}]
+
+                pd._WEBHOOK_CONFIG_WARNING_AT = 0.0
+                response = (Mock(ok=False, status_code=status, text="refused")
+                            if status is not None else None)
+                with patch.object(
+                        pd, "TELEGRAM_BOT_TOKEN",
+                        "" if kind == "missing" else "bad-token"), \
+                     patch.object(pd.requests, "post", return_value=response) as post, \
+                     patch.object(pd, "_sb_patch", side_effect=save), \
+                     patch.object(pd, "_alert_owner") as alert:
+                    self.assertEqual(pd._process_row(row), (0, False))
+
+                retry = patches[-1]
+                self.assertNotIn("done_at", retry)
+                self.assertNotIn("dead_lettered_at", retry)
+                self.assertIsNone(retry["claimed_at"])
+                self.assertIn("next_attempt_at", retry)
+                self.assertIn("configuration", retry["last_error"])
+                alert.assert_called_once()
+                if kind == "missing":
+                    post.assert_not_called()
+
+    def test_unknown_or_mismatched_key_retries_without_dead_letter(self):
+        cases = ("unknown", "mismatched")
+        for offset, kind in enumerate(cases, start=1):
+            with self.subTest(kind=kind):
+                row = telegram_outbox_row(
+                    f"23232323-2323-4323-8323-{offset:012d}",
+                    "key-chat",
+                    "Key recovery alert",
+                )
+                if kind == "unknown":
+                    row["payload"]["telegram_outbox"]["key_version"] = "old-key"
+                else:
+                    pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT = (
+                        "current:" + pd.base64.b64encode(
+                            OUTBOX_PREVIOUS_KEY).decode("ascii"))
+                patches = []
+
+                def save(_table, _params, body, want_rows=False):
+                    self.assertTrue(want_rows)
+                    patches.append(copy.deepcopy(body))
+                    return [{"id": row["id"]}]
+
+                pd._WEBHOOK_CONFIG_WARNING_AT = 0.0
+                with patch.object(pd.requests, "post") as post, \
+                     patch.object(pd, "_sb_patch", side_effect=save), \
+                     patch.object(pd, "_alert_owner") as alert:
+                    self.assertEqual(pd._process_row(row), (0, False))
+
+                post.assert_not_called()
+                self.assertNotIn("done_at", patches[-1])
+                self.assertNotIn("dead_lettered_at", patches[-1])
+                self.assertIn("next_attempt_at", patches[-1])
+                self.assertIn("key unavailable", patches[-1]["last_error"])
+                alert.assert_called_once()
+                pd.WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT = OUTBOX_CURRENT_CONFIG
+
+    def test_structurally_corrupt_payload_is_operator_visible_dead_letter(self):
+        row = telegram_outbox_row(
+            "24242424-2424-4424-8424-242424242424",
+            "hidden-chat",
+            "Hidden alert",
+        )
+        row["payload"]["telegram_outbox"]["nonce"] = "!" * 16
+        patches = []
+
+        def save(_table, _params, body, want_rows=False):
+            self.assertTrue(want_rows)
+            patches.append(copy.deepcopy(body))
+            return [{"id": row["id"]}]
+
+        with patch.object(pd.requests, "post") as post, \
+             patch.object(pd, "_sb_patch", side_effect=save), \
+             patch.object(pd, "_alert_owner") as alert:
+            self.assertEqual(pd._process_row(row), (0, False))
+
+        post.assert_not_called()
+        self.assertIn("dead_lettered_at", patches[-1])
+        self.assertIn("undecryptable", patches[-1]["dead_letter_reason"])
+        alert.assert_called_once()
+
+    def test_startup_preflight_requires_current_key_and_telegram_token(self):
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "configured-token"):
+            self.assertIsNone(pd._webhook_outbox_configuration_error())
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", ""):
+            self.assertIn("token", pd._webhook_outbox_configuration_error())
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "configured-token"), \
+             patch.object(pd, "WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT", ""):
+            self.assertIn("current", pd._webhook_outbox_configuration_error())
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "configured-token"), \
+             patch.object(pd, "WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT", "bad"):
+            self.assertIn("invalid", pd._webhook_outbox_configuration_error())
+        with patch.object(pd, "TELEGRAM_BOT_TOKEN", "configured-token"), \
+             patch.object(
+                 pd, "WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT",
+                 "é:" + pd.base64.b64encode(OUTBOX_CURRENT_KEY).decode("ascii")):
+            self.assertIn("invalid", pd._webhook_outbox_configuration_error())
+
+    def test_webhook_backoff_never_turns_five_failures_into_15_minute_blackout(self):
+        self.assertEqual(
+            [pd._webhook_outbox_backoff_seconds(attempt)
+             for attempt in range(1, 8)],
+            [20, 40, 80, 160, 300, 300, 300],
+        )
+
+    def test_work_loop_claims_due_webhook_rows_in_separate_scan(self):
+        row = telegram_outbox_row(
+            "22222222-2222-4222-8222-222222222222",
+            "due-chat",
+            "Due alert",
+        )
+
+        def claim(_table, params, body, want_rows=False):
+            self.assertEqual(params["outbox_type"], "eq.webhook_telegram")
+            self.assertIn("next_attempt_at", params)
+            self.assertTrue(want_rows)
+            return [{**row, "claimed_at": body["claimed_at"]}]
+
+        old_purge = pd._last_purge
+        old_streak = pd._read_fail_streak
+        pd._last_purge = time.time()
+        pd._read_fail_streak = 0
+        try:
+            with patch.object(pd, "_queue_depth", return_value=1), \
+                 patch.object(pd, "_sb_select", side_effect=[
+                     [{"id": row["id"]}], [], [],
+                 ]) as select, \
+                 patch.object(pd, "_sb_patch", side_effect=claim), \
+                 patch.object(pd, "_process_webhook_outbox",
+                              return_value=(0, True)) as process, \
+                 patch.object(pd, "_sb_delete"):
+                pd.work_once()
+        finally:
+            pd._last_purge = old_purge
+            pd._read_fail_streak = old_streak
+
+        process.assert_called_once()
+        self.assertEqual(
+            select.call_args_list[0].args[1]["outbox_type"],
+            "eq.webhook_telegram",
+        )
+        self.assertEqual(select.call_args_list[1].args[1]["outbox_type"],
+                         "eq.push")
+        self.assertEqual(select.call_args_list[2].args[1]["outbox_type"],
+                         "eq.push")
+
     def test_expiry_loser_does_not_fallback_or_release_another_drainers_row(self):
         old_purge = pd._last_purge
         old_streak = pd._read_fail_streak
@@ -688,7 +1130,7 @@ class PushdrainDeliveryTests(unittest.TestCase):
         try:
             with patch.object(pd, "_queue_depth", return_value=1), \
                  patch.object(pd, "_sb_select",
-                              side_effect=[[{"id": QUEUE_ID}], []]), \
+                              side_effect=[[], [{"id": QUEUE_ID}], []]), \
                  patch.object(pd, "_sb_patch", return_value=[]) as claim, \
                  patch.object(pd, "_process_row") as process, \
                  patch.object(pd, "_send_fallback") as fallback, \
@@ -732,7 +1174,7 @@ class PushdrainDeliveryTests(unittest.TestCase):
         pd._read_fail_streak = 0
         try:
             with patch.object(pd, "_queue_depth", return_value=2), \
-                 patch.object(pd, "_sb_select", side_effect=[[], [
+                 patch.object(pd, "_sb_select", side_effect=[[], [], [
                      {"id": row_a["id"]}, {"id": row_b["id"]},
                  ]]), \
                  patch.object(pd, "_sb_patch", side_effect=claim_one), \

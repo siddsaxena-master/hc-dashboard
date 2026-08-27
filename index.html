@@ -351,6 +351,28 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
 .google-signin-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:12px 20px;border-radius:12px;border:1px solid var(--border-mid);background:#fff;font-size:14px;font-weight:600;color:#3c4043;cursor:pointer;transition:all .15s;box-shadow:var(--shadow-sm);margin-bottom:12px}
 .google-signin-btn:hover{background:#f8f9fa;box-shadow:var(--shadow)}
 .google-signin-btn:active{transform:scale(.98)}
+.auth-field{width:100%;padding:12px 13px;border:1px solid var(--border-mid);border-radius:11px;background:#fff;color:var(--text);font:inherit;margin-bottom:10px}
+.auth-field::placeholder{color:var(--text-hint)}
+.auth-hint{font-size:11px;line-height:1.45;color:var(--text-muted);margin:-2px 0 12px}
+.auth-code-wrap{display:none}
+.auth-code-wrap.show{display:block}
+.auth-secondary{border:0;background:transparent;color:var(--green-mid);font-size:11px;font-weight:700;cursor:pointer;padding:4px 8px}
+.auth-mfa-wrap{display:none;text-align:left}
+.auth-mfa-wrap.show{display:block}
+.auth-mfa-title{font-size:16px;font-weight:800;color:var(--text);text-align:center;margin-bottom:7px}
+.auth-mfa-copy{font-size:11px;line-height:1.5;color:var(--text-muted);text-align:center;margin-bottom:12px}
+.auth-mfa-qr{display:none;width:180px;height:180px;object-fit:contain;margin:0 auto 10px;border:1px solid var(--border);border-radius:10px;background:#fff;padding:6px}
+.auth-mfa-qr.show{display:block}
+.auth-mfa-secret-wrap{display:none;margin-bottom:10px}
+.auth-mfa-secret-wrap.show{display:block}
+.auth-mfa-label{font-size:10px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;color:var(--text-muted);margin-bottom:4px}
+.auth-mfa-secret{display:block;width:100%;padding:9px;border:1px solid var(--border-mid);border-radius:9px;background:var(--surface2);font:12px ui-monospace,monospace;color:var(--text);overflow-wrap:anywhere;user-select:all}
+.auth-mfa-factors{display:none;gap:7px;margin:0 0 11px}
+.auth-mfa-factors.show{display:grid}
+.auth-mfa-factor{width:100%;padding:11px 12px;border:1px solid var(--border-mid);border-radius:10px;background:#fff;color:var(--text);font:inherit;font-size:12px;font-weight:700;text-align:left;cursor:pointer}
+.auth-mfa-factor:hover{background:var(--surface2)}
+.auth-mfa-note{font-size:10.5px;line-height:1.45;color:var(--text-muted);text-align:center;margin:9px 0 11px}
+.auth-mfa-actions{display:flex;justify-content:center;gap:6px}
 .pin-error{color:var(--red);font-size:12px;font-weight:600;min-height:18px;margin-top:4px}
 .auth-role-badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;margin-bottom:16px}
 .auth-role-badge.owner{background:var(--green-pale);color:#116446}
@@ -360,7 +382,7 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
 /* ═══════════ TEAM ROLE RESTRICTIONS (functional; keep exact) ═══════════ */
 .market-ny-only .add-btn,.market-miami-only .add-btn{display:none}
 .market-ny-only .owner-hide,.market-miami-only .owner-hide{display:none}
-.market-ny-only .topbar-actions .icon-btn,.market-miami-only .topbar-actions .icon-btn{display:none}
+.market-ny-only .topbar-actions .icon-btn:not(.signout-btn),.market-miami-only .topbar-actions .icon-btn:not(.signout-btn){display:none}
 .team-view-only .add-btn{display:none}
 .team-view-only .section-add{display:none}
 .team-view-only .card-edit-btn{display:none}
@@ -559,13 +581,34 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
     <div class="pin-logo">🥥</div>
     <div class="pin-brand">Hamptons Coconuts</div>
     <div class="pin-sub">Ops Dashboard</div>
-    <div id="pin-role-display"></div>
-    <button class="google-signin-btn" id="google-signin-btn" onclick="googleSignIn()">
-      <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
-      Sign in with Google
-    </button>
+    <form id="auth-email-form" onsubmit="requestLoginCode(event)">
+      <input class="auth-field" id="auth-email" type="email" inputmode="email" autocomplete="email" placeholder="Work email" maxlength="254" required>
+      <button class="google-signin-btn" id="auth-send-btn" type="submit">Email me a sign-in code</button>
+    </form>
+    <form class="auth-code-wrap" id="auth-code-form" onsubmit="verifyLoginCode(event)">
+      <div class="auth-hint" id="auth-code-hint">Enter the one-time code from your email.</div>
+      <input class="auth-field" id="auth-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" maxlength="8" pattern="[0-9]{6,8}" required>
+      <button class="google-signin-btn" id="auth-verify-btn" type="submit">Verify and sign in</button>
+      <button class="auth-secondary" type="button" onclick="resetLoginForm()">Use a different email</button>
+    </form>
+    <form class="auth-mfa-wrap" id="auth-mfa-form" onsubmit="verifyDashboardMfa(event)">
+      <div class="auth-mfa-title" id="auth-mfa-title">Owner authenticator required</div>
+      <div class="auth-mfa-copy" id="auth-mfa-copy">Enter the current code from your authenticator app.</div>
+      <img class="auth-mfa-qr" id="auth-mfa-qr" alt="Authenticator setup QR code">
+      <div class="auth-mfa-secret-wrap" id="auth-mfa-secret-wrap">
+        <div class="auth-mfa-label">Manual setup key</div>
+        <code class="auth-mfa-secret" id="auth-mfa-secret"></code>
+      </div>
+      <div class="auth-mfa-factors" id="auth-mfa-factors" aria-label="Verified authenticators"></div>
+      <input class="auth-field" id="auth-mfa-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit authenticator code" maxlength="6" pattern="[0-9]{6}" required>
+      <button class="google-signin-btn" id="auth-mfa-verify-btn" type="submit">Verify authenticator</button>
+      <div class="auth-mfa-note" id="auth-mfa-note">After setup, add a second authenticator as a backup. Recovery requires a verified administrator. Email alone cannot bypass this step.</div>
+      <div class="auth-mfa-actions">
+        <button class="auth-secondary" id="auth-mfa-retry-btn" type="button" onclick="retryDashboardMfa()">Retry setup</button>
+        <button class="auth-secondary" type="button" onclick="signOutDashboardMfa()">Sign out</button>
+      </div>
+    </form>
     <div class="pin-error" id="pin-error"></div>
-    <button id="local-preview-btn" onclick="localPreviewSignIn()" style="display:none;margin-top:10px;width:100%;padding:10px;border-radius:10px;border:1.5px dashed var(--border-mid);background:var(--surface2);color:var(--text-muted);font-size:12px;font-weight:600;cursor:pointer">👀 Preview as owner (localhost only)</button>
   </div>
 </div>
 
@@ -583,7 +626,7 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
       <button class="vt-btn" id="vt-deliv" onclick="setView('deliv')">🚚 Deliveries</button>
     </div>
     <div class="topbar-actions">
-      <button class="icon-btn" onclick="lockOwner()" title="Sign out" style="color:#4ade80">🔓 Sign Out</button>
+      <button class="icon-btn signout-btn" onclick="lockOwner()" title="Sign out" style="color:#4ade80">🔓 Sign Out</button>
       <button class="icon-btn" onclick="exportData()" title="Backup data">↓ Backup</button>
       <button class="icon-btn" onclick="importData()" title="Restore data">↑ Restore</button>
     </div>
@@ -598,7 +641,6 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
   <span style="flex:1"></span>
   <span id="gmail-status" class="gmail-status"></span>
   <button class="gmail-btn" id="gmail-btn" onclick="gmailConnect()">📧 Connect Gmail</button>
-  <button class="gmail-btn" id="tg-btn" onclick="document.getElementById('tg-setup').style.display=document.getElementById('tg-setup').style.display==='none'?'flex':'none'" title="Telegram stamp alerts">📲</button>
 </div>
 <div id="import-panel" class="import-panel" style="display:none">
   <div class="import-panel-header">
@@ -609,14 +651,6 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
     </div>
   </div>
   <div id="import-items"></div>
-</div>
-
-<div id="tg-setup" class="gmail-setup-bar" style="display:none">
-  <span>📲 Telegram Bot:</span>
-  <input type="text" id="tg-bot-token" placeholder="Bot token from @BotFather" style="flex:1;min-width:180px">
-  <input type="text" id="tg-chat-id" placeholder="Your chat ID" style="flex:0.5;min-width:100px">
-  <button onclick="saveTgConfig()">Connect</button>
-  <button onclick="document.getElementById('tg-setup').style.display='none'" style="background:transparent;border-color:var(--border);color:var(--text-muted)">Later</button>
 </div>
 
 <div class="urgent-banner" id="urgent-banner">
@@ -700,44 +734,69 @@ function initKeyUI(){}
 
 // Proxy function for batch text parsing (used by Gmail batch parser)
 async function workerParseBatch(systemPrompt,messages,maxTokens){
+  if(currentRole!=='owner')throw new Error('Owner access required');
+  const accessToken=await getSupabaseAccessToken();
+  if(currentRole!=='owner'||accessToken!==sbSession?.access_token)throw staleSessionError();
+  const requestIdentity=captureSessionIdentity();
   const resp=await fetch(WORKER_URL+'/parse-batch',{
     method:'POST',
-    headers:{'Content-Type':'application/json'},
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+accessToken},
     body:JSON.stringify({systemPrompt,messages,maxTokens:maxTokens||1200})
   });
+  requireCurrentSessionIdentity(requestIdentity);
   if(!resp.ok)throw new Error('Worker HTTP '+resp.status);
   const data=await resp.json();
+  requireCurrentSessionIdentity(requestIdentity);
   if(data.error)throw new Error(data.error);
   return data.text||'';
 }
 
 // Proxy function for file/attachment parsing (used by invoice upload + email attachments)
 async function workerParseFile(systemPrompt,contentBlocks,maxTokens){
+  if(currentRole!=='owner')throw new Error('Owner access required');
+  const accessToken=await getSupabaseAccessToken();
+  if(currentRole!=='owner'||accessToken!==sbSession?.access_token)throw staleSessionError();
+  const requestIdentity=captureSessionIdentity();
   const resp=await fetch(WORKER_URL+'/parse-file',{
     method:'POST',
-    headers:{'Content-Type':'application/json'},
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+accessToken},
     body:JSON.stringify({systemPrompt,contentBlocks,maxTokens:maxTokens||1000})
   });
+  requireCurrentSessionIdentity(requestIdentity);
   if(!resp.ok)throw new Error('Worker HTTP '+resp.status);
   const data=await resp.json();
+  requireCurrentSessionIdentity(requestIdentity);
   if(data.error)throw new Error(data.error);
   return data.text||'';
 }
 
 // ── STORAGE
-const SEED=[
-  {id:'ev_seed_rafa',type:'event',name:'Rafael Ingannamorte — Another A Story',venue:'Another A Story',contact:'Rafael Ingannamorte',email:'',phone:'',event_date:'2026-04-08',coconuts:'24',stage:'payment_full',stamp_design:'Custom Logo Equipment',stamp_status:'Received',logo_received:'Yes',logo_data_url:'',source:'Referral — Event',event_end_date:'',coi_requested:false,debrief_issues:'',debrief_next:'',debrief_rating:'',crack_straw:'12',crack_circle:'',crack_whole:'12',pre_tax_amount:'761.23',tax_amount:'0',total_amount:'761.23',deposit_amount:'761.23',balance_amount:'0',pay_notes:'Paid in full',invoice_name:'Rafa_Event_HC_Invoice.pdf',invoice_url:'',delivery_date:'2026-04-08',delivery_time:'',delivery_notes:'216 Lafayette St, New York, NY',market:'ny',venue_type:'',event_type:'Corporate Event',followup_added:'',notes:'Invoice #1918'},
-  {id:'ev_seed_erin',type:'event',name:'Erin Cintron — Indian Creek Country Club',venue:'Indian Creek Country Club',contact:'Erin Cintron',email:'',phone:'',event_date:'2026-03-28',coconuts:'100',stage:'lead',stamp_design:'Custom Logo Equipment',stamp_status:'Not ordered',logo_received:'No',logo_data_url:'',source:'',event_end_date:'',coi_requested:false,debrief_issues:'Stamp size incorrect | No customer phone number | No walk-in cooler at venue',debrief_next:'Always confirm stamp dimensions before fabricating. Collect customer mobile at booking (mandatory). Confirm walk-in cooler availability with venue before delivery day.',debrief_rating:'2',crack_straw:'',crack_circle:'',crack_whole:'',pre_tax_amount:'1202.68',tax_amount:'0',total_amount:'1202.68',deposit_amount:'0',balance_amount:'0',pay_notes:'Payment pending',invoice_name:'Erin_Cintron_HC_Invoice.png',invoice_url:'',delivery_date:'2026-03-28',delivery_time:'',delivery_notes:'Indian Creek Country Club, Indian Creek, FL',market:'miami',venue_type:'Country Club',event_type:'',followup_added:'2026-03-22',notes:'Invoice #1890'}
-];
-
+function eventsCacheKey(){
+  if(currentRole==='owner')return'hc_events_owner';
+  if(currentRole==='manager'||currentRole==='team'){
+    const market=String(currentMarket||'').toLowerCase().replace(/[^a-z0-9_]/g,'').slice(0,40);
+    return market?'hc_events_field_'+market:null;
+  }
+  return null;
+}
+function clearCachedOrders(){
+  const keys=[];
+  for(let i=0;i<localStorage.length;i++){
+    const key=localStorage.key(i);
+    if(key==='hc_events'||key==='hc_events_owner'||key?.startsWith('hc_events_field_'))keys.push(key);
+  }
+  keys.forEach(key=>localStorage.removeItem(key));
+}
 function loadEvents(){
+  if(!currentRole){events=[];return;}
   try{
-    const r=localStorage.getItem('hc_events');
+    const key=eventsCacheKey();
+    const r=key?localStorage.getItem(key):null;
     if(r){
       const parsed=JSON.parse(r);
       if(Array.isArray(parsed)){
         // Sanitize: ensure every event has an id and type, strip non-string fields that should be strings
-        events=parsed.filter(e=>e&&typeof e==='object'&&e.id).map(e=>{
+        events=parsed.filter(e=>e&&typeof e==='object'&&safeEventId(e.id)).map(e=>{
           if(!e.type)e.type='event';
           return e;
         });
@@ -745,21 +804,24 @@ function loadEvents(){
       }
     }
   }catch(e){console.error('loadEvents error:',e);}
-  events=SEED;saveEvents();
+  events=[];
 }
 function saveEvents(){
-  localStorage.setItem('hc_events',JSON.stringify(events));
-  // Auto-sync to JSONBin if connected
-  if(jbBinId&&jbMasterKey){jbPush(true);}
+  if(!currentRole)return;
+  const key=eventsCacheKey();
+  if(key)localStorage.setItem(key,JSON.stringify(events));
+  if(currentRole==='owner'&&sbSession?.access_token&&jbBinId&&jbMasterKey){jbPush(true);}
 }
 
 // ── BACKUP / RESTORE
 function exportData(){
+  if(currentRole!=='owner')return;
   const blob=new Blob([JSON.stringify(events,null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');a.href=url;a.download='hc_backup_'+new Date().toISOString().slice(0,10)+'.json';a.click();URL.revokeObjectURL(url);
 }
 function importData(){
+  if(currentRole!=='owner')return;
   const inp=document.createElement('input');inp.type='file';inp.accept='.json';
   inp.addEventListener('change',function(){
     if(!this.files||!this.files[0])return;
@@ -768,8 +830,13 @@ function importData(){
       try{
         const imp=JSON.parse(e.target.result);
         if(!Array.isArray(imp)){alert('Invalid backup file.');return;}
-        if(!confirm(`Import ${imp.length} events? This will replace your current ${events.length} events.`))return;
-        events=imp;saveEvents();render();alert('✓ '+imp.length+' events restored!');
+        const clean=imp.filter(x=>x&&typeof x==='object'&&safeEventId(x.id)).map(x=>({
+          ...x,
+          logo_data_url:safeImageDataUrl(x.logo_data_url),
+          invoice_url:safeHttpUrl(x.invoice_url)
+        }));
+        if(!confirm(`Import ${clean.length} valid events? This will replace your current ${events.length} events.`))return;
+        events=clean;saveEvents();render();alert('✓ '+clean.length+' events restored!');
       }catch(err){alert('Could not read file: '+err.message);}
     };r.readAsText(this.files[0]);
   });inp.click();
@@ -791,6 +858,7 @@ function isStampUrgent(e){
 
 // ── VIEW
 function setView(v){
+  if(currentRole&&currentRole!=='owner'&&v!=='deliv')return;
   currentView=v;
   document.getElementById('vt-list').className='vt-btn'+(v==='list'?' active':'');
   document.getElementById('vt-cal').className='vt-btn'+(v==='cal'?' active':'');
@@ -870,10 +938,11 @@ function renderOps(){
     evs.forEach(e=>{
       const n=parseFloat(e.coconuts)||0;
       const b=n?Math.ceil(n/9):0;
-      const where=e.delivery_notes||e.venue||'<span class="ops-missing">no address — tap to add</span>';
-      html+='<div class="ops-row'+(isLead(e)?' ops-lead':'')+'" onclick="openEdit(\''+e.id+'\')">'
+      const where=e.delivery_notes||e.venue||'';
+      const whereHtml=where?esc(where):'<span class="ops-missing">no address — tap to add</span>';
+      html+='<div class="ops-row'+(isLead(e)?' ops-lead':'')+'" onclick="openEdit(\''+safeEventId(e.id)+'\')">'
         +'<div class="ops-qty">'+(b?b+' boxes':'—')+'<span>'+(n?n+' coco':'')+'</span></div>'
-        +'<div class="ops-who"><strong>'+esc(e.name||'?')+' '+(isLead(e)?'<span class="badge b-lead">Lead</span>':'<span class="badge b-paid">Confirmed</span>')+'</strong><span>'+ (typeof where==='string'?where:where) +'</span></div>'
+        +'<div class="ops-who"><strong>'+esc(e.name||'?')+' '+(isLead(e)?'<span class="badge b-lead">Lead</span>':'<span class="badge b-paid">Confirmed</span>')+'</strong><span>'+whereHtml+'</span></div>'
         +'<div class="ops-when">'+esc(e.delivery_time||'—')+'<span>'+_opsCrack(e)+'</span></div>'
         +'</div>';
     });
@@ -901,23 +970,23 @@ function renderTodos(){
     // 1. Stamp needs ordering — deposit or full payment received, stamp not ordered
     if(hasPaid && e.stage!=='lead' && e.stamp_status==='Not ordered' && e.logo_received!=='unbranded'){
       const urgency=days!==null&&days<=7?'urgent':'warn';
-      todos.push({urgency,tag:'stamp',text:`<strong>Make stamp</strong> (laser; buy brass stock if low) for ${e.name}${days!==null?' — event in '+days+' day'+(days===1?'':'s'):''}`,id:e.id});
+      todos.push({urgency,tag:'stamp',text:`<strong>Make stamp</strong> (laser; buy brass stock if low) for ${esc(e.name)}${days!==null?' — event in '+days+' day'+(days===1?'':'s'):''}`,id:safeEventId(e.id)});
     }
 
     // 2. Logo PNG not received but stamp not yet ordered
     if(hasPaid && e.stage!=='lead' && e.logo_received==='No' && e.stamp_status==='Not ordered'){
-      todos.push({urgency:'warn',tag:'logo',text:`<strong>Chase logo PNG</strong> from ${e.name} — needed before the stamp can be made`,id:e.id});
+      todos.push({urgency:'warn',tag:'logo',text:`<strong>Chase logo PNG</strong> from ${esc(e.name)} — needed before the stamp can be made`,id:safeEventId(e.id)});
     }
 
     // 3. COI requested but not yet sent (stage not completed)
     if(e.coi_requested){
-      todos.push({urgency:'info',tag:'coi',text:`<strong>Send COI</strong> to ${e.name}`,id:e.id});
+      todos.push({urgency:'info',tag:'coi',text:`<strong>Send COI</strong> to ${esc(e.name)}`,id:safeEventId(e.id)});
     }
 
     // 4. Balance still owed and event is upcoming within 14 days
     if(days!==null&&days<=14&&days>=0&&tot>0&&paid<tot){
       const owed=tot-paid;
-      todos.push({urgency:'warn',tag:'payment',text:`<strong>Collect balance</strong> from ${e.name} — $${owed.toLocaleString()} outstanding, event in ${days} day${days===1?'':'s'}`,id:e.id});
+      todos.push({urgency:'warn',tag:'payment',text:`<strong>Collect balance</strong> from ${esc(e.name)} — $${owed.toLocaleString()} outstanding, event in ${days} day${days===1?'':'s'}`,id:safeEventId(e.id)});
     }
 
     // 5. Delivery date set but no delivery time/address
@@ -926,7 +995,7 @@ function renderTodos(){
       if(!e.delivery_time)missing.push('delivery window');
       if(!e.delivery_notes)missing.push('delivery address');
       if(days!==null&&days<=14&&days>=0){
-        todos.push({urgency:days<=3?'urgent':'info',tag:'delivery',text:`<strong>Confirm ${missing.join(' & ')}</strong> for ${e.name}`,id:e.id});
+        todos.push({urgency:days<=3?'urgent':'info',tag:'delivery',text:`<strong>Confirm ${missing.join(' &amp; ')}</strong> for ${esc(e.name)}`,id:safeEventId(e.id)});
       }
     }
 
@@ -935,13 +1004,13 @@ function renderTodos(){
       const added=parseLocalDate(e.followup_added);
       const daysSince=Math.round((today-added)/(1000*60*60*24));
       if(daysSince>=7){
-        todos.push({urgency:'info',tag:'lead',text:`<strong>Follow up</strong> with ${e.name} — lead added ${daysSince} days ago`,id:e.id});
+        todos.push({urgency:'info',tag:'lead',text:`<strong>Follow up</strong> with ${esc(e.name)} — lead added ${daysSince} days ago`,id:safeEventId(e.id)});
       }
     }
 
     // 7. Event is tomorrow or today and stamp not received
     if(days!==null&&days<=1&&days>=0&&e.stage!=='lead'&&e.stamp_status!=='Received'){
-      todos.push({urgency:'urgent',tag:'stamp',text:`<strong>${days===0?'TODAY':'TOMORROW'}: Stamp not ready</strong> for ${e.name}`,id:e.id});
+      todos.push({urgency:'urgent',tag:'stamp',text:`<strong>${days===0?'TODAY':'TOMORROW'}: Stamp not ready</strong> for ${esc(e.name)}`,id:safeEventId(e.id)});
     }
   });
 
@@ -986,11 +1055,11 @@ function renderUrgent(){
   urgent.forEach(e=>{
     const d=daysUntil(e.event_date||e.delivery_date);
     const lbl=d===0?'TODAY':d===1?'TOMORROW':`${d} DAYS`;
-    html+=`<div class="urgent-item" onclick="openEdit('${e.id}')"><span class="days-left">${lbl}</span><strong>${esc(e.name)}</strong> — stamp not ordered</div>`;
+    html+=`<div class="urgent-item" onclick="openEdit('${safeEventId(e.id)}')"><span class="days-left">${lbl}</span><strong>${esc(e.name)}</strong> — stamp not ordered</div>`;
   });
   if(leads.length){
     html+=`<div style="margin-top:${urgent.length?'6px':'0'}">`;
-    leads.forEach(e=>{html+=`<div class="urgent-item" onclick="openEdit('${e.id}')"><span class="days-left" style="background:#b45309">FOLLOW UP</span><strong>${esc(e.name)}</strong> — weekly follow-up due</div>`;});
+    leads.forEach(e=>{html+=`<div class="urgent-item" onclick="openEdit('${safeEventId(e.id)}')"><span class="days-left" style="background:#b45309">FOLLOW UP</span><strong>${esc(e.name)}</strong> — weekly follow-up due</div>`;});
     html+='</div>';
   }
   itemsEl.innerHTML=html;
@@ -1049,7 +1118,7 @@ function renderStats(){renderStageStrip();
 function stageBadge(stage){
   const map={lead:'b-lead',deposit_paid:'b-deposit',in_kind:'b-inkind',partial_paid:'b-partial',stamp_ordered:'b-stamp',payment_full:'b-paid',completed:'b-done',passed:'b-passed',dnb:'b-dnb'};
   const labels={lead:'⚪ Lead',deposit_paid:'🟡 Deposit',in_kind:'🤝 In-Kind',partial_paid:'🟠 Partial',stamp_ordered:'🔵 Stamp Ordered',payment_full:'🟢 Fully Paid',completed:'✓ Done',passed:'✕ Passed',dnb:'🚫 DNB'};
-  return `<span class="badge ${map[stage]||'b-lead'}">${labels[stage]||stage}</span>`;
+  return `<span class="badge ${map[stage]||'b-lead'}">${labels[stage]||esc(stage||'Lead')}</span>`;
 }
 function stampBadge(e,urgent){
   if(urgent)return`<span class="badge b-stamp-urgent">🚨 ORDER STAMP</span>`;
@@ -1103,7 +1172,7 @@ function venueGroupCard(group,expanded){
     const d=parseLocalDate(e.delivery_date||e.event_date);
     const dstr=d?d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'No date';
     const amt=parseFloat(e.total_amount)||0;
-    return `<div class="vg-row" onclick="event.stopPropagation();openEdit('${e.id}')"><span class="vg-row-date">${dstr}</span>${stageBadge(e.stage)}<span class="vg-row-amt">${amt?'$'+amt.toLocaleString():''}</span></div>`;
+    return `<div class="vg-row" onclick="event.stopPropagation();openEdit('${safeEventId(e.id)}')"><span class="vg-row-date">${dstr}</span>${stageBadge(e.stage)}<span class="vg-row-amt">${amt?'$'+amt.toLocaleString():''}</span></div>`;
   }).join('');
   return `<div class="venue-group${expanded?' open':''}">
     <div class="vg-header" onclick="toggleVenueGroup(this)">
@@ -1163,7 +1232,7 @@ function renderLists(){
       const nextDate=e.next_order_date?parseLocalDate(e.next_order_date):null;
       const d=daysUntil(e.next_order_date);
       const dep=parseFloat(e.deposit_amount)||0,tot=parseFloat(e.total_amount)||0;
-      return `<div class="account-card market-${e.market||''}${urg?' urgent':''}${isAccPassed?' passed-event':''}" onclick="openEdit('${e.id}')">
+      return `<div class="account-card market-${safeMarketClass(e.market)}${urg?' urgent':''}${isAccPassed?' passed-event':''}" onclick="openEdit('${safeEventId(e.id)}')">
         <div class="account-top">
           <div>
             <div class="account-name">${esc(e.name||'Unnamed')}</div>
@@ -1177,7 +1246,7 @@ function renderLists(){
         <div class="account-meta">
           ${marketBadge(e.market)}${e.venue_type?`<span class="badge" style="background:#f0f9ff;color:#075985;border:1px solid #bae6fd">${esc(e.venue_type)}</span>`:''}
           ${stageBadge(e.stage)}${stampBadge(e,urg)}${logoBadge(e)}${coiBadge(e)}${debriefBadge(e)}${sourceBadge(e)}
-          ${e.coconuts?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🥥 ${e.coconuts} · 📦 ${(parseInt(e.coconuts)/9).toFixed(1)}box</span>`:''}
+          ${e.coconuts?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🥥 ${esc(e.coconuts)} · 📦 ${(parseInt(e.coconuts)/9).toFixed(1)}box</span>`:''}
         </div>
         <div class="account-stats">
           ${tot>0?`<span>Per order: <strong>$${parseFloat(tot).toLocaleString()}</strong></span>`:''}
@@ -1255,7 +1324,7 @@ function renderLists(){
       const isPast=evDate&&evEndDate<today;
       const isPassed=e.stage==='passed';
       const payClass=e.stage==='payment_full'||e.stage==='completed'?'pay-full':e.stage==='partial_paid'?'pay-partial':e.stage==='deposit_paid'?'pay-deposit':e.stage==='stamp_ordered'?'pay-partial':'pay-none';
-      return divider+`<div class="event-card market-${e.market||''} ${payClass}${urg?' urgent':''}${isPast?' past-event':''}${isPassed?' passed-event':''}${isDnbItem?' dnb-event':''}" onclick="openEdit('${e.id}')">
+      return divider+`<div class="event-card market-${safeMarketClass(e.market)} ${payClass}${urg?' urgent':''}${isPast?' past-event':''}${isPassed?' passed-event':''}${isDnbItem?' dnb-event':''}" onclick="openEdit('${safeEventId(e.id)}')">
         <div class="event-card-top">
           <div>
             <div class="event-name">${esc(e.name||'Unnamed')}</div>
@@ -1269,8 +1338,8 @@ function renderLists(){
         <div class="event-meta">
           ${marketBadge(e.market)}${e.venue_type?`<span class="badge" style="background:#f0f9ff;color:#075985;border:1px solid #bae6fd">${esc(e.venue_type)}</span>`:''}
           ${stageBadge(e.stage)}${stampBadge(e,urg)}${logoBadge(e)}${coiBadge(e)}${debriefBadge(e)}${sourceBadge(e)}
-          ${e.coconuts?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🥥 ${e.coconuts} · 📦 ${(parseInt(e.coconuts)/9).toFixed(1)}box</span>`:''}
-          ${e.delivery_date?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🚚 ${parseLocalDate(e.delivery_date).toLocaleDateString('en-US',{month:'short',day:'numeric'})}${e.delivery_time?' '+e.delivery_time:''}</span>`:''}
+          ${e.coconuts?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🥥 ${esc(e.coconuts)} · 📦 ${(parseInt(e.coconuts)/9).toFixed(1)}box</span>`:''}
+          ${e.delivery_date?`<span class="badge" style="background:#f0ede8;color:var(--text-muted)">🚚 ${parseLocalDate(e.delivery_date).toLocaleDateString('en-US',{month:'short',day:'numeric'})}${e.delivery_time?' '+esc(e.delivery_time):''}</span>`:''}
         </div>
         ${(function(){
           if(!tot)return'';
@@ -1293,8 +1362,8 @@ function renderLists(){
             s+='Total: <strong>$'+parseFloat(tot).toLocaleString()+'</strong></span>';
             return s;
           })()}
-          ${(e.delivery_date||e.event_date)?`<button type="button" onclick="event.stopPropagation();addToCalendarById('${e.id}')" style="margin-left:8px;display:inline-flex;align-items:center;gap:3px;background:var(--green-pale);color:var(--green);border:1px solid var(--green-mid2);border-radius:5px;padding:2px 8px;font-size:10px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap">📅 Add to Calendar</button>`:''}
-          <a href="${buildWhatsAppLink(e)}" target="_blank" onclick="event.stopPropagation()" style="display:inline-flex;align-items:center;gap:3px;background:#dcfce7;color:#15803d;border:1px solid #86efac;border-radius:5px;padding:2px 8px;font-size:10px;font-weight:600;text-decoration:none;white-space:nowrap">📱 Send Brief</a>
+          ${(e.delivery_date||e.event_date)?`<button type="button" onclick="event.stopPropagation();addToCalendarById('${safeEventId(e.id)}')" style="margin-left:8px;display:inline-flex;align-items:center;gap:3px;background:var(--green-pale);color:var(--green);border:1px solid var(--green-mid2);border-radius:5px;padding:2px 8px;font-size:10px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap">📅 Add to Calendar</button>`:''}
+          <a href="${esc(buildWhatsAppLink(e))}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()" style="display:inline-flex;align-items:center;gap:3px;background:#dcfce7;color:#15803d;border:1px solid #86efac;border-radius:5px;padding:2px 8px;font-size:10px;font-weight:600;text-decoration:none;white-space:nowrap">📱 Send Brief</a>
         </div>
         ${(function(){
           if(!(e.cost_per_box||e.cost_labor||e.cost_other))return'';
@@ -1460,7 +1529,7 @@ function renderCal(){
     const evHtml=shown.map(e=>{
       if(e._placeholder)return`<div class="cal-ev multi-slot-placeholder">&nbsp;</div>`;
       const urg=isStampUrgent(e);
-      const typeClass=e.type==='recurring'?'type-recurring':'type-event market-'+(e.market||'');
+      const typeClass=e.type==='recurring'?'type-recurring':'type-event market-'+safeMarketClass(e.market);
       const isLead=(e.stage==='lead'||!e.stage)&&e.stage!=='in_kind';
       const isPassed=e.stage==='passed';
       const stageClass=isPassed?' cal-passed':isLead?' cal-lead':' cal-confirmed';
@@ -1470,7 +1539,7 @@ function renderCal(){
       else if(e._multiPos==='end')multiClass=' multi-end';
       const prefix=e.type==='recurring'?'🔄 ':isLead?'○ ':'● ';
       const label=e._multiPos==='mid'?'&nbsp;':e._multiPos==='end'?esc(e.name):prefix+esc(e.name);
-      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}${stageClass}${multiClass}" onclick="event.stopPropagation();openEdit('${e.id}')" title="${esc(e.name)}${isLead?' (Lead)':isPassed?' (Passed)':' (Confirmed)'}">${label}</div>`;
+      return `<div class="cal-ev ${typeClass}${urg?' cal-urgent':''}${stageClass}${multiClass}" onclick="event.stopPropagation();openEdit('${safeEventId(e.id)}')" title="${esc(e.name)}${isLead?' (Lead)':isPassed?' (Passed)':' (Confirmed)'}">${label}</div>`;
     }).join('');
     cells+=`<div class="cal-cell${!isThisMonth?' other-month':''}${isToday?' today':''}">
       <div class="cal-date">${d.getDate()}</div>${evHtml}${extra>0?`<div class="cal-more">+${extra}</div>`:''}
@@ -1501,9 +1570,17 @@ function calPrev(){calMonth--;if(calMonth<0){calMonth=11;calYear--;}renderCal();
 function calNext(){calMonth++;if(calMonth>11){calMonth=0;calYear++;}renderCal();}
 function calToday(){calYear=new Date().getFullYear();calMonth=new Date().getMonth();renderCal();}
 
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function openNew(type){editingId=null;buildModal({type:type||'event'});}
-function openEdit(id){editingId=id;buildModal(events.find(x=>x.id===id)||{});}
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+const SAFE_EVENT_ID_RE=/^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|ev_[A-Za-z0-9_]{1,100})$/i;
+function safeEventId(id){const value=String(id||'');return SAFE_EVENT_ID_RE.test(value)?value:'';}
+function safeMarketClass(market){return market==='ny'?'ny':market==='miami'?'miami':market==='other'?'other':'';}
+function safeHttpUrl(value){try{const u=new URL(String(value||''));return u.protocol==='https:'?u.href:'';}catch(_){return'';}}
+function safeImageDataUrl(value){
+  const data=String(value||'');
+  return data.length<=2097152&&/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/i.test(data)?data:'';
+}
+function openNew(type){if(currentRole!=='owner')return;editingId=null;buildModal({type:type||'event'});}
+function openEdit(id){if(currentRole!=='owner'||!safeEventId(id))return;editingId=id;buildModal(events.find(x=>x.id===id)||{});}
 
 // ── MODAL
 function buildModal(e){
@@ -1523,9 +1600,9 @@ function buildModal(e){
       ${formBody(e)}
     </div>
     <div class="modal-footer">
-      ${isEdit?`<button class="btn btn-danger" onclick="delEvent('${editingId}')">Delete</button>`:''}
+      ${isEdit?`<button class="btn btn-danger del-btn" onclick="delEvent('${safeEventId(editingId)}')">Delete</button>`:''}
       <button class="btn" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="saveEvent()">Save</button>
+      <button class="btn btn-primary save-btn" onclick="saveEvent()">Save</button>
     </div>
   </div>`;
   document.body.appendChild(div);
@@ -1543,6 +1620,7 @@ function switchType(t){
 
 function formBody(e){
   const isRecurring=e.type==='recurring';
+  const logoUrl=safeImageDataUrl(e.logo_data_url);
   return`
     ${!editingId?`<div class="inv-section full">
       <button class="pick-btn" id="inv-pick-btn" type="button">📄 Choose invoice</button>
@@ -1582,27 +1660,27 @@ function formBody(e){
     <div class="field"><label class="flbl">Frequency</label><select id="f-frequency">
       ${FREQ_OPTIONS.map(f=>`<option value="${f}"${e.frequency===f?' selected':''}>${f}</option>`).join('')}
     </select></div>
-    <div class="field"><label class="flbl">Next order date</label><input type="date" id="f-next-order-date" value="${e.next_order_date||''}"></div>
+    <div class="field"><label class="flbl">Next order date</label><input type="date" id="f-next-order-date" value="${esc(e.next_order_date||'')}"></div>
     <div class="field"><label class="flbl">Typical order time</label><input type="text" id="f-order-time" value="${esc(e.order_time||'')}" placeholder="e.g. Mondays 10am"></div>
     `:`
-    <div class="field"><label class="flbl">Event start date</label><input type="date" id="f-event-date" value="${e.event_date||''}"></div>
+    <div class="field"><label class="flbl">Event start date</label><input type="date" id="f-event-date" value="${esc(e.event_date||'')}"></div>
     <div class="field" style="display:flex;align-items:center;gap:8px;padding-top:18px">
       <input type="checkbox" id="f-multi-day" ${e.event_end_date?'checked':''} onchange="toggleMultiDay(this.checked)" style="width:15px;height:15px;accent-color:var(--green);cursor:pointer">
       <label for="f-multi-day" style="font-size:13px;font-weight:500;cursor:pointer;margin:0">Multi-day event</label>
     </div>
     <div class="field" id="end-date-wrap" style="display:${e.event_end_date?'flex':'none'};flex-direction:column;gap:4px">
       <label class="flbl">Event end date</label>
-      <input type="date" id="f-event-end-date" value="${e.event_end_date||''}">
+      <input type="date" id="f-event-end-date" value="${esc(e.event_end_date||'')}">
     </div>
     `}
     <div class="sec-hdr">Order</div>
-    <div class="field"><label class="flbl">Coconuts</label><input type="number" id="f-coconuts" value="${e.coconuts||''}" min="1" placeholder="e.g. 100" oninput="updateBoxCount(this.value)"></div>
-    <div class="field"><label class="flbl">Boxes <span style="font-weight:400;font-size:10px">(auto · 9/box)</span></label><input type="text" id="f-boxes" value="${e.coconuts?((parseInt(e.coconuts)/9).toFixed(1)+' boxes'):'—'}" readonly style="background:#f5f3ee;color:var(--text-muted);cursor:default"></div>
+    <div class="field"><label class="flbl">Coconuts</label><input type="number" id="f-coconuts" value="${esc(e.coconuts||'')}" min="1" placeholder="e.g. 100" oninput="updateBoxCount(this.value)"></div>
+    <div class="field"><label class="flbl">Boxes <span style="font-weight:400;font-size:10px">(auto · 9/box)</span></label><input type="text" id="f-boxes" value="${esc(e.coconuts?((parseInt(e.coconuts)/9).toFixed(1)+' boxes'):'—')}" readonly style="background:#f5f3ee;color:var(--text-muted);cursor:default"></div>
     <div class="sec-hdr">Cracking breakdown</div>
-    <div class="field"><label class="flbl">Straw hole</label><input type="number" id="f-crack-straw" value="${e.crack_straw||''}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
-    <div class="field"><label class="flbl">Circle cracked</label><input type="number" id="f-crack-circle" value="${e.crack_circle||''}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
-    <div class="field"><label class="flbl">Whole</label><input type="number" id="f-crack-whole" value="${e.crack_whole||''}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
-    <div class="field"><label class="flbl">Total <span style="font-weight:400;font-size:10px">(vs coconuts)</span></label><input type="text" id="f-crack-total" value="${(function(){const s=parseInt(e.crack_straw||0),c=parseInt(e.crack_circle||0),w=parseInt(e.crack_whole||0),t=parseInt(e.coconuts||0);const sum=s+c+w;if(!sum&&!t)return'—';return sum+(t?' / '+t:'');})()}" readonly style="background:#f5f3ee;color:var(--text-muted);cursor:default"></div>
+    <div class="field"><label class="flbl">Straw hole</label><input type="number" id="f-crack-straw" value="${esc(e.crack_straw||'')}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
+    <div class="field"><label class="flbl">Circle cracked</label><input type="number" id="f-crack-circle" value="${esc(e.crack_circle||'')}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
+    <div class="field"><label class="flbl">Whole</label><input type="number" id="f-crack-whole" value="${esc(e.crack_whole||'')}" min="0" placeholder="0" oninput="updateCrackTotal()"></div>
+    <div class="field"><label class="flbl">Total <span style="font-weight:400;font-size:10px">(vs coconuts)</span></label><input type="text" id="f-crack-total" value="${esc((function(){const s=parseInt(e.crack_straw||0),c=parseInt(e.crack_circle||0),w=parseInt(e.crack_whole||0),t=parseInt(e.coconuts||0);const sum=s+c+w;if(!sum&&!t)return'—';return sum+(t?' / '+t:'');})())}" readonly style="background:#f5f3ee;color:var(--text-muted);cursor:default"></div>
     <div class="sec-hdr">Brass stamp</div>
     <div class="field"><label class="flbl">Design / notes</label><textarea id="f-stamp-design">${esc(e.stamp_design||'')}</textarea></div>
     <div class="field"><label class="flbl">Stamp status</label><select id="f-stamp-status">${STAMP_STATUSES.map(s=>`<option value="${s}"${e.stamp_status===s?' selected':''}>${s}</option>`).join('')}</select></div>
@@ -1614,9 +1692,9 @@ function formBody(e){
     </select></div>
     <div class="full">
       <label class="flbl" style="display:block;margin-bottom:5px">Logo image <span style="font-weight:400;font-size:10px;text-transform:none">(upload PNG/JPG for day-of brief reference)</span></label>
-      ${e.logo_data_url
+      ${logoUrl
         ? `<div style="position:relative;display:inline-block;width:100%">
-            <img src="${e.logo_data_url}" class="logo-preview" id="logo-preview-img" onclick="viewLogoFullscreen('${e.logo_data_url}')" title="Click to view full size">
+            <img src="${esc(logoUrl)}" class="logo-preview" id="logo-preview-img" title="Click to view full size">
             <button type="button" onclick="clearLogo()" style="position:absolute;top:4px;right:4px;background:rgba(0,0,0,0.5);color:#fff;border:none;border-radius:50%;width:22px;height:22px;cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center">×</button>
            </div>`
         : `<div class="logo-upload-area" id="logo-upload-area" onclick="document.getElementById('logo-file-input').click()">
@@ -1630,15 +1708,15 @@ function formBody(e){
     <div class="sec-hdr">Pipeline</div>
     <div class="field"><label class="flbl">Stage</label><select id="f-stage" onchange="onStageChange(this.value)">${STAGES.map(s=>`<option value="${s.id}"${e.stage===s.id?' selected':''}>${s.label}</option>`).join('')}</select></div>
     <div class="sec-hdr">Payment</div>
-    <div class="field"><label class="flbl">Pre-tax total ($) <span style="font-weight:400;font-size:9px;color:var(--text-hint)">used for profit calc</span></label><input type="number" id="f-pretax" value="${e.pre_tax_amount||''}" placeholder="0.00" oninput="autoCalcTax()"></div>
-    <div class="field"><label class="flbl">Tax ($)</label><input type="number" id="f-tax" value="${e.tax_amount||''}" placeholder="0.00" oninput="autoCalcTax()"></div>
-    <div class="field"><label class="flbl">Total incl. tax ($)</label><input type="number" id="f-total" value="${e.total_amount||''}" placeholder="0.00" style="background:#f5f3ee;color:var(--text-muted)" readonly></div>
-    <div class="field"><label class="flbl">Deposit received ($)</label><input type="number" id="f-deposit" value="${e.deposit_amount||''}" placeholder="0.00"></div>
-    <div class="field"><label class="flbl">Balance received ($)</label><input type="number" id="f-balance" value="${e.balance_amount||''}" placeholder="0.00"></div>
+    <div class="field"><label class="flbl">Pre-tax total ($) <span style="font-weight:400;font-size:9px;color:var(--text-hint)">used for profit calc</span></label><input type="number" id="f-pretax" value="${esc(e.pre_tax_amount||'')}" placeholder="0.00" oninput="autoCalcTax()"></div>
+    <div class="field"><label class="flbl">Tax ($)</label><input type="number" id="f-tax" value="${esc(e.tax_amount||'')}" placeholder="0.00" oninput="autoCalcTax()"></div>
+    <div class="field"><label class="flbl">Total incl. tax ($)</label><input type="number" id="f-total" value="${esc(e.total_amount||'')}" placeholder="0.00" style="background:#f5f3ee;color:var(--text-muted)" readonly></div>
+    <div class="field"><label class="flbl">Deposit received ($)</label><input type="number" id="f-deposit" value="${esc(e.deposit_amount||'')}" placeholder="0.00"></div>
+    <div class="field"><label class="flbl">Balance received ($)</label><input type="number" id="f-balance" value="${esc(e.balance_amount||'')}" placeholder="0.00"></div>
     <div class="field"><label class="flbl">Payment notes</label><input type="text" id="f-pay-notes" value="${esc(e.pay_notes||'')}" placeholder="Venmo, check #1024"></div>
     ${!isRecurring?`
     <div class="sec-hdr">Delivery</div>
-    <div class="field"><label class="flbl">Delivery date</label><input type="date" id="f-delivery-date" value="${e.delivery_date||''}"></div>
+    <div class="field"><label class="flbl">Delivery date</label><input type="date" id="f-delivery-date" value="${esc(e.delivery_date||'')}"></div>
     <div class="field"><label class="flbl">Time window</label><input type="text" id="f-delivery-time" value="${esc(e.delivery_time||'')}" placeholder="e.g. 10am – 2pm"></div>
     <div class="field full"><label class="flbl">Delivery address / notes</label><input type="text" id="f-delivery-notes" value="${esc(e.delivery_notes||'')}" placeholder="Address, loading dock, call on arrival..."></div>
     `:''}
@@ -1648,9 +1726,9 @@ function formBody(e){
 
     <div class="sec-hdr owner-lock" style="color:#4ade80;border-bottom-color:#1a3a2a;background:#0d2418;margin-left:-26px;margin-right:-26px;padding-left:26px;padding-right:26px">💰 Costs & Profit <span style="font-size:9px;font-weight:400;color:#7bbf9a">(owner only)</span></div>
     <div class="owner-lock cost-row full">
-      <div class="field"><label class="flbl" style="color:#7bbf9a">Cost per box ($)</label><input type="number" id="f-cost-per-box" value="${e.cost_per_box||''}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
-      <div class="field"><label class="flbl" style="color:#7bbf9a">Labor cost ($)</label><input type="number" id="f-cost-labor" value="${e.cost_labor||''}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
-      <div class="field"><label class="flbl" style="color:#7bbf9a">Other costs ($)</label><input type="number" id="f-cost-other" value="${e.cost_other||''}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
+      <div class="field"><label class="flbl" style="color:#7bbf9a">Cost per box ($)</label><input type="number" id="f-cost-per-box" value="${esc(e.cost_per_box||'')}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
+      <div class="field"><label class="flbl" style="color:#7bbf9a">Labor cost ($)</label><input type="number" id="f-cost-labor" value="${esc(e.cost_labor||'')}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
+      <div class="field"><label class="flbl" style="color:#7bbf9a">Other costs ($)</label><input type="number" id="f-cost-other" value="${esc(e.cost_other||'')}" placeholder="0.00" step="0.01" style="background:#1a3a2a;border-color:#2d5c42;color:#e8f5ec"></div>
     </div>
     <div class="sec-hdr">Notes</div>
     <div class="field full"><textarea id="f-notes" placeholder="Any other notes...">${esc(e.notes||'')}</textarea></div>
@@ -1703,13 +1781,20 @@ function wirePickers(){
   const logoInp=document.getElementById('logo-file-input');
   if(!logoInp){
     const li=document.createElement('input');
-    li.type='file';li.accept='image/*';li.id='logo-file-input';li.style.display='none';
+    li.type='file';li.accept='.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp';li.id='logo-file-input';li.style.display='none';
     document.body.appendChild(li);
     li.addEventListener('change',function(){
       if(!this.files||!this.files[0])return;
+      const file=this.files[0];
+      if(!['image/png','image/jpeg','image/webp'].includes(file.type)||file.size>1500000){
+        alert('Choose a PNG, JPG, or WebP logo smaller than 1.5 MB.');
+        this.value='';
+        return;
+      }
       const reader=new FileReader();
       reader.onload=function(ev){
-        const dataUrl=ev.target.result;
+        const dataUrl=safeImageDataUrl(ev.target.result);
+        if(!dataUrl){alert('That logo file could not be validated.');return;}
         document.getElementById('f-logo-data-url').value=dataUrl;
         // Replace upload area with preview
         const area=document.getElementById('logo-upload-area');
@@ -1720,19 +1805,26 @@ function wirePickers(){
           if(pImg){pImg.src=dataUrl;pImg.onclick=function(){viewLogoFullscreen(window._currentLogoUrl);};}
         }
       };
-      reader.readAsDataURL(this.files[0]);
+      reader.readAsDataURL(file);
     });
   }
   // Pre-populate hidden field if editing event with existing logo
   const fld=document.getElementById('f-logo-data-url');
   if(fld&&editingId){
     const ev=events.find(x=>x.id===editingId);
-    if(ev&&ev.logo_data_url)fld.value=ev.logo_data_url;
+    const safeLogo=safeImageDataUrl(ev?.logo_data_url);
+    if(safeLogo){
+      fld.value=safeLogo;
+      window._currentLogoUrl=safeLogo;
+      const preview=document.getElementById('logo-preview-img');
+      if(preview){preview.src=safeLogo;preview.onclick=()=>viewLogoFullscreen(safeLogo);}
+    }
   }
 }
 function clearLogo(){
   const fld=document.getElementById('f-logo-data-url');
   if(fld)fld.value='';
+  window._currentLogoUrl='';
   const preview=document.getElementById('logo-preview-img');
   if(preview&&preview.parentNode){
     preview.parentNode.outerHTML=`<div class="logo-upload-area" id="logo-upload-area" onclick="document.getElementById('logo-file-input').click()">
@@ -1743,10 +1835,15 @@ function clearLogo(){
   }
 }
 function viewLogoFullscreen(url){
+  const safeUrl=safeImageDataUrl(url);
+  if(!safeUrl)return;
   const m=document.createElement('div');
   m.className='logo-modal';
   m.onclick=()=>m.remove();
-  m.innerHTML=`<img src="${url}" alt="Logo">`;
+  const img=document.createElement('img');
+  img.src=safeUrl;
+  img.alt='Logo';
+  m.appendChild(img);
   document.body.appendChild(m);
 }
 
@@ -1786,7 +1883,7 @@ function getCurrentFormData(){
     delivery_date:document.getElementById('f-delivery-date')?.value||'',
     delivery_time:document.getElementById('f-delivery-time')?.value||'',
     delivery_notes:document.getElementById('f-delivery-notes')?.value||'',
-    logo_data_url:document.getElementById('f-logo-data-url')?.value||'',
+    logo_data_url:safeImageDataUrl(document.getElementById('f-logo-data-url')?.value||''),
     invoice_name:document.getElementById('f-inv')?.value||'',
     invoice_url:document.getElementById('f-inv-url')?.value||'',
     cost_per_box:document.getElementById('f-cost-per-box')?.value||'',
@@ -1862,9 +1959,13 @@ function updateCrackTotal(){
 function closeModal(){const o=document.getElementById('modal-overlay');if(o)o.remove();if(currentView==='cal')renderCal();}
 
 function saveEvent(){
+  if(currentRole!=='owner'){alert('Owner access required.');return;}
   const d=getCurrentFormData();
   const name=d.name.trim();
   if(!name){alert('Please enter a name.');return;}
+  const rawInvoice=String(d.invoice_url||'').trim();
+  if(rawInvoice&&!safeHttpUrl(rawInvoice)){alert('Invoice links must be valid HTTPS links.');return;}
+  d.invoice_url=safeHttpUrl(rawInvoice);
   const isRecurring=d.type==='recurring';
   const ev={
     id:editingId||('ev_'+Date.now()),
@@ -1874,18 +1975,13 @@ function saveEvent(){
   };
   if(editingId){
     const i=events.findIndex(x=>x.id===editingId);
-    const oldStage=i>=0?events[i].stage:'';
     if(i>=0)events[i]=ev;else events.push(ev);
-    // Trigger telegram if stage just changed to confirmed and stamp not ordered
-    const confirmedStages=['deposit_paid','in_kind','stamp_ordered','payment_full'];
-    if(confirmedStages.includes(ev.stage)&&oldStage!==ev.stage&&ev.stamp_status==='Not ordered'){
-      sendTelegramStampAlert(ev,0);
-    }
   } else events.push(ev);
   saveEvents();closeModal();render();
 }
 
 function delEvent(id){
+  if(currentRole!=='owner'||!safeEventId(id))return;
   if(!confirm('Delete this entry?'))return;
   events=events.filter(e=>e.id!==id);
   saveEvents();closeModal();render();
@@ -2084,111 +2180,657 @@ function renderReports(){
 
 
 // ══════════════════════════════════════════════
-// 🔐  ROLE-BASED PIN ACCESS CONTROL
+// 🔐  SUPABASE AUTH + SERVER-DERIVED ROLE
 // ══════════════════════════════════════════════
-// ── AUTH: Google OAuth + Email Whitelist
-const AUTH_USERS={
-  'siddsaxena@gmail.com':{role:'owner',label:'Owner',market:null},
-  'hamptonscoconuts@gmail.com':{role:'owner',label:'Owner',market:null},
-  // Field team (view-only, scoped to their market):
-  'jayden.martin1100@gmail.com':{role:'ny',label:'NY Team',market:'ny'},
-  // 'miamiperson@gmail.com':{role:'miami',label:'Miami Team',market:'miami'},
-};
-let currentRole=null; // 'owner','ny','miami'
-let currentMarket=null; // null=all, 'ny', 'miami'
+const SB_SESSION_KEY='hc_sb_session_v1';
+const ACCESS_RECHECK_MS=5*60*1000;
+let currentRole=null;
+let currentMarket=null;
 let currentUserEmail=null;
+let currentUserId=null;
+let sbSession=null;
+let sbRefreshPromise=null;
+let sbRefreshContext=null;
+let pendingLoginEmail='';
+let dashboardSessionGeneration=0;
+let pendingMfaBootstrap=null;
+let pendingMfaFactorId=null;
+let pendingMfaEnrollment=false;
+let pendingMfaFactors=[];
+let pendingMfaUnverifiedFactorIds=[];
+let pendingMfaAction=false;
+let accessRecheckPromise=null;
+let accessRecheckTimer=null;
 
-// Localhost-only design-review bypass: Google OAuth refuses to run on
-// localhost (origin not on the client's allowlist), so local previews
-// couldn't sign in at all. Never active on the deployed site, and the
-// session is not persisted (refresh = click again).
-if(['localhost','127.0.0.1'].includes(location.hostname)){
-  var _lpb=document.getElementById('local-preview-btn');
-  if(_lpb)_lpb.style.display='block';
+function authErrorMessage(data,fallback){
+  if(!data||typeof data!=='object')return fallback;
+  return String(data.msg||data.message||data.error_description||data.error||fallback);
 }
-function localPreviewSignIn(){
-  if(!['localhost','127.0.0.1'].includes(location.hostname))return;
-  currentUserEmail='siddsaxena@gmail.com';
-  currentRole='owner';
-  currentMarket=null;
-  activateSession();
+
+function authResponseError(data,fallback,status,authRejected=false){
+  const err=new Error(authErrorMessage(data,fallback));
+  err.status=status;
+  err.authRejected=authRejected;
+  return err;
 }
-function googleSignIn(){
-  const btn=document.getElementById('google-signin-btn');
-  btn.textContent='Signing in...';
-  btn.disabled=true;
-  const client=google.accounts.oauth2.initTokenClient({
-    client_id:GMAIL_CLIENT_ID,
-    scope:'email profile '+GMAIL_SCOPES,
-    callback:async(resp)=>{
-      if(resp.error){
-        btn.innerHTML='<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Sign in with Google';
-        btn.disabled=false;
-        document.getElementById('pin-error').textContent='Sign-in cancelled';
-        setTimeout(()=>document.getElementById('pin-error').textContent='',3000);
-        return;
-      }
-      // Got token — now get user's email
-      gmailToken=resp.access_token;
-      try{
-        const infoResp=await fetch('https://www.googleapis.com/oauth2/v2/userinfo',{
-          headers:{'Authorization':'Bearer '+resp.access_token}
-        });
-        const info=await infoResp.json();
-        const email=(info.email||'').toLowerCase();
-        const authEntry=AUTH_USERS[email];
-        if(!authEntry){
-          document.getElementById('pin-error').textContent='Access denied — '+email+' is not authorized';
-          btn.innerHTML='<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Sign in with Google';
-          btn.disabled=false;
-          gmailToken=null;
-          return;
-        }
-        // Authorized — activate session
-        currentUserEmail=email;
-        currentRole=authEntry.role;
-        currentMarket=authEntry.market;
-        localStorage.setItem('hc_auth_email',email);
-        localStorage.setItem('hc_role',currentRole);
-        localStorage.setItem('hc_market',currentMarket||'');
-        activateSession();
-      }catch(e){
-        console.error('Auth error:',e);
-        btn.innerHTML='<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Sign in with Google';
-        btn.disabled=false;
-        document.getElementById('pin-error').textContent='Sign-in failed — try again';
+
+function staleSessionError(){
+  const err=new Error('The signed-in session changed while this request was running');
+  err.staleSession=true;
+  return err;
+}
+
+function captureSessionIdentity(){
+  return{
+    generation:dashboardSessionGeneration,
+    refreshToken:sbSession?.refresh_token||null,
+    userId:currentUserId
+  };
+}
+
+function sessionIdentityIsCurrent(identity){
+  return !!identity&&identity.generation===dashboardSessionGeneration&&identity.refreshToken===sbSession?.refresh_token&&identity.userId===currentUserId;
+}
+
+function requireCurrentSessionIdentity(identity){
+  if(!sessionIdentityIsCurrent(identity))throw staleSessionError();
+}
+
+function normalizeSession(data){
+  if(!data||typeof data.access_token!=='string'||typeof data.refresh_token!=='string')return null;
+  const expiresAt=Number(data.expires_at)||Math.floor(Date.now()/1000)+(Number(data.expires_in)||3600);
+  return{access_token:data.access_token,refresh_token:data.refresh_token,expires_at:expiresAt};
+}
+
+function saveSupabaseSession(data){
+  const clean=normalizeSession(data);
+  if(!clean)throw new Error('Sign-in did not return a valid session');
+  if(sbSession?.refresh_token&&sbSession.refresh_token!==clean.refresh_token){
+    sbRefreshPromise=null;
+    sbRefreshContext=null;
+  }
+  sbSession=clean;
+  localStorage.setItem(SB_SESSION_KEY,JSON.stringify(clean));
+}
+
+function readSupabaseSession(){
+  try{return normalizeSession(JSON.parse(localStorage.getItem(SB_SESSION_KEY)||'null'));}
+  catch(_){return null;}
+}
+
+// Only this top-level claim is Supabase's signed assurance level. Never read
+// AAL or role from user_metadata, app_metadata, localStorage, or the UI.
+function signedSessionClaims(){
+  try{
+    const encoded=String(sbSession?.access_token||'').split('.')[1]||'';
+    const base64=encoded.replace(/-/g,'+').replace(/_/g,'/').padEnd(Math.ceil(encoded.length/4)*4,'=');
+    const bytes=Uint8Array.from(atob(base64),char=>char.charCodeAt(0));
+    const claims=JSON.parse(new TextDecoder().decode(bytes));
+    return claims&&typeof claims==='object'?claims:null;
+  }catch(_){return null;}
+}
+
+function signedSessionAal(){
+  const aal=String(signedSessionClaims()?.aal||'').toLowerCase();
+  return aal==='aal2'?'aal2':'aal1';
+}
+
+function clearLegacyAuthState(){
+  localStorage.removeItem('hc_auth_email');
+  localStorage.removeItem('hc_role');
+  localStorage.removeItem('hc_market');
+}
+
+function clearLegacyTelegramCredentials(){
+  localStorage.removeItem('hc_tg_bot_token');
+  localStorage.removeItem('hc_tg_chat_id');
+}
+
+async function refreshSupabaseSession(){
+  const refreshToken=sbSession?.refresh_token||null;
+  const refreshGeneration=dashboardSessionGeneration;
+  const refreshUserId=currentUserId;
+  if(!refreshToken)throw new Error('Sign in again');
+  if(sbRefreshPromise&&sbRefreshContext?.generation===refreshGeneration&&sbRefreshContext?.refreshToken===refreshToken&&sbRefreshContext?.userId===refreshUserId)return sbRefreshPromise;
+  const refreshContext={generation:refreshGeneration,refreshToken,userId:refreshUserId};
+  const refreshIsCurrent=()=>sessionIdentityIsCurrent(refreshContext);
+  const refreshWork=(async()=>{
+    const resp=await fetch(SUPABASE_URL+'/auth/v1/token?grant_type=refresh_token',{
+      method:'POST',
+      headers:{apikey:SUPABASE_ANON_KEY,'Content-Type':'application/json'},
+      body:JSON.stringify({refresh_token:refreshToken})
+    });
+    if(!refreshIsCurrent())throw staleSessionError();
+    const data=await resp.json().catch(()=>null);
+    if(!refreshIsCurrent())throw staleSessionError();
+    if(!resp.ok){
+      const rejected=[400,401,403].includes(resp.status);
+      if(rejected)clearDashboardSession();
+      throw authResponseError(data,'Session refresh failed',resp.status,rejected);
+    }
+    if(!refreshIsCurrent())throw staleSessionError();
+    saveSupabaseSession(data);
+    return sbSession.access_token;
+  })();
+  let trackedPromise;
+  trackedPromise=refreshWork.finally(()=>{
+    if(sbRefreshPromise===trackedPromise){sbRefreshPromise=null;sbRefreshContext=null;}
+  });
+  sbRefreshPromise=trackedPromise;
+  sbRefreshContext=refreshContext;
+  return sbRefreshPromise;
+}
+
+async function getSupabaseAccessToken(){
+  if(!sbSession)sbSession=readSupabaseSession();
+  if(!sbSession)throw new Error('Sign in required');
+  if(Number(sbSession.expires_at)>Math.floor(Date.now()/1000)+60)return sbSession.access_token;
+  return refreshSupabaseSession();
+}
+
+async function supabaseFetch(path,opts={},retry=true){
+  const operationGeneration=dashboardSessionGeneration;
+  const accessToken=await getSupabaseAccessToken();
+  if(operationGeneration!==dashboardSessionGeneration||accessToken!==sbSession?.access_token)throw staleSessionError();
+  let requestIdentity=captureSessionIdentity();
+  const requestWithToken=(token)=>{
+    const headers={...(opts.headers||{}),apikey:SUPABASE_ANON_KEY,Authorization:'Bearer '+token};
+    if(opts.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';
+    return fetch(SUPABASE_URL+'/rest/v1/'+path,{...opts,headers});
+  };
+  let resp=await requestWithToken(accessToken);
+  requireCurrentSessionIdentity(requestIdentity);
+  if(resp.status===401&&retry){
+    const refreshedAccessToken=await refreshSupabaseSession();
+    if(operationGeneration!==dashboardSessionGeneration||refreshedAccessToken!==sbSession?.access_token)throw staleSessionError();
+    requestIdentity=captureSessionIdentity();
+    resp=await requestWithToken(refreshedAccessToken);
+    requireCurrentSessionIdentity(requestIdentity);
+  }
+  return resp;
+}
+
+async function authApiFetch(path,opts={},retry=true){
+  const operationGeneration=dashboardSessionGeneration;
+  const accessToken=await getSupabaseAccessToken();
+  if(operationGeneration!==dashboardSessionGeneration||accessToken!==sbSession?.access_token)throw staleSessionError();
+  let requestIdentity=captureSessionIdentity();
+  const requestWithToken=(token)=>{
+    const headers={...(opts.headers||{}),apikey:SUPABASE_ANON_KEY,Authorization:'Bearer '+token};
+    if(opts.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';
+    return fetch(SUPABASE_URL+'/auth/v1/'+path,{...opts,headers});
+  };
+  let resp=await requestWithToken(accessToken);
+  requireCurrentSessionIdentity(requestIdentity);
+  if(resp.status===401&&retry){
+    const refreshedAccessToken=await refreshSupabaseSession();
+    if(operationGeneration!==dashboardSessionGeneration||refreshedAccessToken!==sbSession?.access_token)throw staleSessionError();
+    requestIdentity=captureSessionIdentity();
+    resp=await requestWithToken(refreshedAccessToken);
+    requireCurrentSessionIdentity(requestIdentity);
+  }
+  return resp;
+}
+
+async function claimAuthBootstrap(){
+  const resp=await supabaseFetch('rpc/hc_get_auth_bootstrap',{method:'POST',body:'{}'});
+  const responseIdentity=captureSessionIdentity();
+  const data=await resp.json().catch(()=>null);
+  requireCurrentSessionIdentity(responseIdentity);
+  if(!resp.ok)throw authResponseError(data,'This account is not authorized',resp.status,[401,403].includes(resp.status));
+  const row=Array.isArray(data)?data[0]:null;
+  const userId=String(row?.auth_user_id||'').toLowerCase();
+  const role=String(row?.role||'').trim().toLowerCase();
+  if(!UUID_RE.test(userId)||!['owner','manager','team'].includes(role)){
+    throw authResponseError(null,'This account is not on the active field roster',403,true);
+  }
+  return{userId,role,mfaRequired:row?.mfa_required===true};
+}
+
+async function claimDashboardProfile(){
+  const resp=await supabaseFetch('rpc/hc_claim_field_worker_v2',{method:'POST',body:'{}'});
+  const responseIdentity=captureSessionIdentity();
+  const data=await resp.json().catch(()=>null);
+  requireCurrentSessionIdentity(responseIdentity);
+  if(!resp.ok)throw authResponseError(data,'This account is not authorized',resp.status,[401,403].includes(resp.status));
+  const row=Array.isArray(data)?data[0]:null;
+  const role=String(row?.role||'').toLowerCase();
+  const market=String(row?.market||'').trim().toLowerCase();
+  const userId=String(row?.auth_user_id||'').toLowerCase();
+  if(!UUID_RE.test(userId)||!row?.email||!row?.name||!['owner','manager','team'].includes(role))throw authResponseError(null,'This account is not on the active field roster',resp.status,true);
+  if(role!=='owner'&&!market)throw authResponseError(null,'This field account does not have a market assigned',resp.status,true);
+  return{userId,email:String(row.email).toLowerCase(),name:String(row.name),role,market:role==='owner'?null:market};
+}
+function setAuthError(message){
+  const el=document.getElementById('pin-error');
+  if(el)el.textContent=message||'';
+}
+
+function resetMfaForm(){
+  pendingMfaBootstrap=null;
+  pendingMfaFactorId=null;
+  pendingMfaEnrollment=false;
+  pendingMfaFactors=[];
+  pendingMfaUnverifiedFactorIds=[];
+  const form=document.getElementById('auth-mfa-form');
+  const code=document.getElementById('auth-mfa-code');
+  const qr=document.getElementById('auth-mfa-qr');
+  const secretWrap=document.getElementById('auth-mfa-secret-wrap');
+  const secret=document.getElementById('auth-mfa-secret');
+  const factors=document.getElementById('auth-mfa-factors');
+  if(form)form.classList.remove('show');
+  if(code)code.value='';
+  if(qr){qr.classList.remove('show');qr.removeAttribute('src');}
+  if(secretWrap)secretWrap.classList.remove('show');
+  if(secret)secret.textContent='';
+  if(factors){factors.classList.remove('show');factors.replaceChildren();}
+}
+
+function resetLoginForm(){
+  pendingLoginEmail='';
+  const emailForm=document.getElementById('auth-email-form');
+  const email=document.getElementById('auth-email');
+  const codeForm=document.getElementById('auth-code-form');
+  const code=document.getElementById('auth-code');
+  if(emailForm)emailForm.style.display='block';
+  if(email)email.value='';
+  if(codeForm)codeForm.classList.remove('show');
+  if(code)code.value='';
+  resetMfaForm();
+  setAuthError('');
+}
+
+function safeMfaQrSource(qrCode){
+  const value=String(qrCode||'').trim();
+  if(/^data:image\/(?:svg\+xml|png)(?:;(?:charset=)?utf-8)?(?:;base64)?,/i.test(value))return value;
+  if(/^<svg[\s>]/i.test(value))return'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(value);
+  return'';
+}
+
+function dashboardTotpFactors(user){
+  return(Array.isArray(user?.factors)?user.factors:[]).filter(factor=>
+    String(factor?.factor_type||factor?.type||'').toLowerCase()==='totp'&&
+    String(factor?.status||'').toLowerCase()==='verified'&&
+    UUID_RE.test(String(factor?.id||''))
+  ).map((factor,index)=>{
+    const friendlyName=String(factor?.friendly_name||factor?.friendlyName||'')
+      .replace(/\s+/g,' ').trim().slice(0,60);
+    return{factorId:String(factor.id).toLowerCase(),label:friendlyName||'Authenticator '+(index+1)};
+  });
+}
+
+function dashboardUnverifiedTotpFactorIds(user){
+  return(Array.isArray(user?.factors)?user.factors:[]).filter(factor=>
+    String(factor?.factor_type||factor?.type||'').toLowerCase()==='totp'&&
+    String(factor?.status||'').toLowerCase()!=='verified'&&
+    UUID_RE.test(String(factor?.id||''))
+  ).map(factor=>String(factor.id).toLowerCase());
+}
+
+function renderDashboardMfaFactorChoices(){
+  const list=document.getElementById('auth-mfa-factors');
+  if(!list)return;
+  list.replaceChildren();
+  pendingMfaFactors.forEach(factor=>{
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='auth-mfa-factor';
+    button.textContent=factor.label;
+    button.addEventListener('click',()=>selectDashboardMfaFactor(factor.factorId));
+    list.appendChild(button);
+  });
+}
+
+function showDashboardMfaPanel({enrollment=false,selection=false,restart=false,checking=false,qrCode='',secret='',factorLabel=''}={}){
+  const emailForm=document.getElementById('auth-email-form');
+  const codeForm=document.getElementById('auth-code-form');
+  const form=document.getElementById('auth-mfa-form');
+  const title=document.getElementById('auth-mfa-title');
+  const copy=document.getElementById('auth-mfa-copy');
+  const qr=document.getElementById('auth-mfa-qr');
+  const secretWrap=document.getElementById('auth-mfa-secret-wrap');
+  const secretEl=document.getElementById('auth-mfa-secret');
+  const factorList=document.getElementById('auth-mfa-factors');
+  const code=document.getElementById('auth-mfa-code');
+  const verify=document.getElementById('auth-mfa-verify-btn');
+  const retry=document.getElementById('auth-mfa-retry-btn');
+  if(emailForm)emailForm.style.display='none';
+  if(codeForm)codeForm.classList.remove('show');
+  if(form)form.classList.add('show');
+  if(title)title.textContent=checking?'Checking owner security'
+    :selection?'Choose an authenticator'
+    :restart?'Finish authenticator setup'
+    :enrollment?'Secure the owner account':'Owner authenticator required';
+  if(copy)copy.textContent=checking?'Loading your verified authenticators.'
+    :selection?'Use any verified backup below. Only its friendly name is shown.'
+    :restart?'An earlier setup stopped before verification. Restarting removes only that unfinished setup and creates a fresh key.'
+    :enrollment?'Scan this QR code in a trusted authenticator app, then enter its current six-digit code.'
+    :'Enter the current six-digit code from '+(factorLabel||'your verified authenticator')+'.';
+  const safeQr=safeMfaQrSource(qrCode);
+  if(qr){
+    qr.classList.toggle('show',enrollment&&!!safeQr);
+    if(enrollment&&safeQr)qr.src=safeQr;else qr.removeAttribute('src');
+  }
+  if(secretWrap)secretWrap.classList.toggle('show',enrollment&&!!secret);
+  if(secretEl)secretEl.textContent=enrollment?String(secret||''):'';
+  if(factorList)factorList.classList.toggle('show',selection);
+  const showCode=!selection&&!restart&&!checking;
+  if(code){code.style.display=showCode?'block':'none';if(!showCode)code.value='';}
+  if(verify)verify.style.display=showCode?'flex':'none';
+  if(retry){
+    retry.style.display=checking||selection?'none':'inline-block';
+    retry.textContent=restart||enrollment?'Restart setup'
+      :(pendingMfaFactors.length>1?'Use another authenticator':'Retry check');
+  }
+  document.getElementById('pin-overlay')?.classList.remove('hidden');
+  if(showCode)setTimeout(()=>document.getElementById('auth-mfa-code')?.focus(),0);
+}
+
+async function getCurrentAuthUser(){
+  const resp=await authApiFetch('user',{method:'GET'});
+  const responseIdentity=captureSessionIdentity();
+  const data=await resp.json().catch(()=>null);
+  requireCurrentSessionIdentity(responseIdentity);
+  if(!resp.ok)throw authResponseError(data,'Could not verify the authenticator account',resp.status,[401,403].includes(resp.status));
+  const userId=String(data?.id||'').toLowerCase();
+  if(!UUID_RE.test(userId)||userId!==pendingMfaBootstrap?.userId){
+    throw authResponseError(null,'The signed-in account changed',403,true);
+  }
+  return data;
+}
+
+async function enrollDashboardTotp(){
+  const resp=await authApiFetch('factors',{
+    method:'POST',
+    body:JSON.stringify({
+      factor_type:'totp',
+      friendly_name:'HC Owner Dashboard',
+      issuer:'Hamptons Coconuts'
+    })
+  });
+  const responseIdentity=captureSessionIdentity();
+  const data=await resp.json().catch(()=>null);
+  requireCurrentSessionIdentity(responseIdentity);
+  if(!resp.ok)throw authResponseError(data,'Could not start authenticator setup',resp.status,[401,403].includes(resp.status));
+  const factorId=String(data?.id||'').toLowerCase();
+  const secret=String(data?.totp?.secret||'').trim();
+  const qrCode=String(data?.totp?.qr_code||'').trim();
+  if(!UUID_RE.test(factorId)||!secret||!safeMfaQrSource(qrCode))throw new Error('Authenticator setup returned incomplete data');
+  pendingMfaFactorId=factorId;
+  pendingMfaEnrollment=true;
+  pendingMfaFactors=[];
+  pendingMfaUnverifiedFactorIds=[factorId];
+  showDashboardMfaPanel({enrollment:true,qrCode,secret});
+}
+
+function selectDashboardMfaFactor(factorId){
+  const selected=pendingMfaFactors.find(factor=>factor.factorId===factorId&&UUID_RE.test(factor.factorId));
+  if(!selected)return;
+  pendingMfaFactorId=selected.factorId;
+  pendingMfaEnrollment=false;
+  setAuthError('');
+  showDashboardMfaPanel({factorLabel:selected.label});
+}
+
+async function prepareDashboardMfa(bootstrap){
+  if(!bootstrap||bootstrap.role!=='owner'||bootstrap.mfaRequired!==true)throw authResponseError(null,'Owner MFA routing is invalid',403,true);
+  pendingMfaBootstrap=bootstrap;
+  pendingMfaFactorId=null;
+  pendingMfaEnrollment=false;
+  pendingMfaFactors=[];
+  pendingMfaUnverifiedFactorIds=[];
+  showDashboardMfaPanel({checking:true});
+  setAuthError('Checking authenticator setup...');
+  const user=await getCurrentAuthUser();
+  const verified=dashboardTotpFactors(user);
+  if(verified.length>1){
+    pendingMfaFactors=verified;
+    renderDashboardMfaFactorChoices();
+    showDashboardMfaPanel({selection:true});
+    setAuthError('');
+    return;
+  }
+  if(verified.length===1){
+    pendingMfaFactors=verified;
+    selectDashboardMfaFactor(verified[0].factorId);
+    return;
+  }
+  const unverified=dashboardUnverifiedTotpFactorIds(user);
+  if(unverified.length){
+    pendingMfaUnverifiedFactorIds=unverified;
+    showDashboardMfaPanel({restart:true});
+    setAuthError('');
+    return;
+  }
+  await enrollDashboardTotp();
+  setAuthError('');
+}
+
+async function restartDashboardMfaEnrollment(){
+  if(pendingMfaAction||!pendingMfaBootstrap)return;
+  const expectedIds=new Set(pendingMfaUnverifiedFactorIds.filter(id=>UUID_RE.test(String(id||''))));
+  pendingMfaAction=true;
+  const retry=document.getElementById('auth-mfa-retry-btn');
+  if(retry)retry.disabled=true;
+  setAuthError('Restarting authenticator setup...');
+  try{
+    let user=await getCurrentAuthUser();
+    let removable=dashboardUnverifiedTotpFactorIds(user).filter(id=>expectedIds.has(id));
+    for(const factorId of removable){
+      user=await getCurrentAuthUser();
+      if(!dashboardUnverifiedTotpFactorIds(user).includes(factorId))continue;
+      const resp=await authApiFetch('factors/'+encodeURIComponent(factorId),{method:'DELETE'});
+      const responseIdentity=captureSessionIdentity();
+      const data=await resp.json().catch(()=>null);
+      requireCurrentSessionIdentity(responseIdentity);
+      if(!resp.ok){
+        const latestUser=await getCurrentAuthUser();
+        if(dashboardTotpFactors(latestUser).some(factor=>factor.factorId===factorId))continue;
+        throw authResponseError(data,'Could not remove the unfinished authenticator setup',resp.status,[401,403].includes(resp.status));
       }
     }
-  });
-  client.requestAccessToken();
+    await prepareDashboardMfa(pendingMfaBootstrap);
+  }catch(err){
+    if(err.staleSession)return;
+    if(accessErrorIsDefinitive(err)){
+      clearDashboardSession();
+      setAuthError('Your secure session is no longer authorized. Sign in again.');
+    }else{
+      pendingMfaUnverifiedFactorIds=Array.from(expectedIds);
+      showDashboardMfaPanel({restart:true});
+      setAuthError(err.message||'Could not restart the unfinished setup. Check your connection and retry.');
+    }
+  }finally{
+    pendingMfaAction=false;
+    if(retry)retry.disabled=false;
+  }
 }
 
-function activateSession(){
+async function completeDashboardAuthentication(){
+  const bootstrap=await claimAuthBootstrap();
+  if(bootstrap.role==='owner'){
+    if(bootstrap.mfaRequired!==true)throw authResponseError(null,'Owner MFA policy is unavailable',403,true);
+    if(signedSessionAal()!=='aal2'){
+      lockDashboardForMfa(bootstrap);
+      await prepareDashboardMfa(bootstrap);
+      return false;
+    }
+  }else if(bootstrap.mfaRequired){
+    throw authResponseError(null,'Field account MFA routing is invalid',403,true);
+  }
+  const profile=await claimDashboardProfile();
+  if(profile.userId!==bootstrap.userId||profile.role!==bootstrap.role){
+    throw authResponseError(null,'Your roster access changed. Sign in again.',403,true);
+  }
+  pendingLoginEmail='';
+  await activateSession(profile);
+  return true;
+}
+
+async function verifyDashboardMfa(ev){
+  ev?.preventDefault();
+  const btn=document.getElementById('auth-mfa-verify-btn');
+  const code=String(document.getElementById('auth-mfa-code')?.value||'').replace(/\D/g,'');
+  if(!pendingMfaBootstrap||!UUID_RE.test(String(pendingMfaFactorId||''))||!/^\d{6}$/.test(code)){
+    setAuthError('Enter the six-digit code from your authenticator app.');
+    return;
+  }
+  btn.disabled=true;btn.textContent='Verifying...';setAuthError('');
+  try{
+    const challengeResp=await authApiFetch('factors/'+encodeURIComponent(pendingMfaFactorId)+'/challenge',{
+      method:'POST',body:'{}'
+    });
+    const challengeIdentity=captureSessionIdentity();
+    const challenge=await challengeResp.json().catch(()=>null);
+    requireCurrentSessionIdentity(challengeIdentity);
+    if(!challengeResp.ok)throw authResponseError(challenge,'Could not start authenticator verification',challengeResp.status,[401,403].includes(challengeResp.status));
+    const challengeId=String(challenge?.id||'').toLowerCase();
+    if(!UUID_RE.test(challengeId))throw new Error('Authenticator challenge returned incomplete data');
+
+    const verifyResp=await authApiFetch('factors/'+encodeURIComponent(pendingMfaFactorId)+'/verify',{
+      method:'POST',body:JSON.stringify({challenge_id:challengeId,code})
+    });
+    const verifyIdentity=captureSessionIdentity();
+    const verifiedSession=await verifyResp.json().catch(()=>null);
+    requireCurrentSessionIdentity(verifyIdentity);
+    if(!verifyResp.ok)throw authResponseError(verifiedSession,'The authenticator code is invalid or expired',verifyResp.status,[401,403].includes(verifyResp.status));
+    saveSupabaseSession(verifiedSession);
+    if(signedSessionAal()!=='aal2')throw authResponseError(null,'Supabase did not confirm owner AAL2',403,true);
+    await completeDashboardAuthentication();
+  }catch(err){
+    if(err.staleSession)return;
+    if(err.authRejected){
+      clearDashboardSession();
+      setAuthError('Your secure session is no longer authorized. Sign in again.');
+    }else{
+      setAuthError(err.message||'Authenticator verification failed. Try a new code.');
+      const codeEl=document.getElementById('auth-mfa-code');
+      if(codeEl){codeEl.value='';codeEl.focus();}
+    }
+  }finally{btn.disabled=false;btn.textContent='Verify authenticator';}
+}
+
+async function retryDashboardMfa(){
+  if(pendingMfaAction||!pendingMfaBootstrap)return;
+  if(pendingMfaUnverifiedFactorIds.length){await restartDashboardMfaEnrollment();return;}
+  if(pendingMfaFactorId&&pendingMfaFactors.length>1){
+    pendingMfaFactorId=null;
+    renderDashboardMfaFactorChoices();
+    showDashboardMfaPanel({selection:true});
+    setAuthError('');
+    return;
+  }
+  if(pendingMfaFactorId){setAuthError('Enter a new current code, then verify again.');document.getElementById('auth-mfa-code')?.focus();return;}
+  setAuthError('Retrying authenticator setup...');
+  try{await prepareDashboardMfa(pendingMfaBootstrap);}
+  catch(err){
+    if(err.authRejected){clearDashboardSession();setAuthError('Your secure session is no longer authorized. Sign in again.');}
+    else setAuthError(err.message||'Authenticator setup is temporarily unavailable.');
+  }
+}
+
+function signOutDashboardMfa(){
+  const accessToken=sbSession?.access_token||null;
+  clearDashboardSession();
+  if(accessToken){
+    fetch(SUPABASE_URL+'/auth/v1/logout',{
+      method:'POST',headers:{apikey:SUPABASE_ANON_KEY,Authorization:'Bearer '+accessToken},keepalive:true
+    }).catch(()=>{});
+  }
+}
+
+async function requestLoginCode(ev){
+  ev?.preventDefault();
+  const emailInput=document.getElementById('auth-email');
+  const btn=document.getElementById('auth-send-btn');
+  const email=String(emailInput?.value||'').trim().toLowerCase();
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){setAuthError('Enter a valid work email.');return;}
+  btn.disabled=true;btn.textContent='Sending code...';setAuthError('');
+  try{
+    const resp=await fetch(SUPABASE_URL+'/auth/v1/otp',{
+      method:'POST',
+      headers:{apikey:SUPABASE_ANON_KEY,'Content-Type':'application/json'},
+      body:JSON.stringify({email,create_user:false})
+    });
+    const data=await resp.json().catch(()=>null);
+    if(!resp.ok)throw new Error(authErrorMessage(data,'Could not send a sign-in code'));
+    pendingLoginEmail=email;
+    document.getElementById('auth-email-form').style.display='none';
+    document.getElementById('auth-code-form').classList.add('show');
+    document.getElementById('auth-code-hint').textContent='Enter the one-time code sent to '+email+'.';
+    document.getElementById('auth-code').focus();
+  }catch(err){setAuthError(err.message||'Could not send a sign-in code.');}
+  finally{btn.disabled=false;btn.textContent='Email me a sign-in code';}
+}
+
+async function verifyLoginCode(ev){
+  ev?.preventDefault();
+  const btn=document.getElementById('auth-verify-btn');
+  const token=String(document.getElementById('auth-code')?.value||'').replace(/\s/g,'');
+  if(!pendingLoginEmail||!/^\d{6,8}$/.test(token)){setAuthError('Enter the code from your email.');return;}
+  btn.disabled=true;btn.textContent='Verifying...';setAuthError('');
+  let sessionEstablished=false;
+  try{
+    const resp=await fetch(SUPABASE_URL+'/auth/v1/verify',{
+      method:'POST',
+      headers:{apikey:SUPABASE_ANON_KEY,'Content-Type':'application/json'},
+      body:JSON.stringify({type:'email',email:pendingLoginEmail,token})
+    });
+    const data=await resp.json().catch(()=>null);
+    if(!resp.ok)throw new Error(authErrorMessage(data,'The code is invalid or expired'));
+    saveSupabaseSession(data);
+    sessionEstablished=true;
+    await completeDashboardAuthentication();
+  }catch(err){
+    if(err.staleSession)return;
+    if(err.authRejected){
+      clearDashboardSession();
+      setAuthError(err.message||'Sign-in failed.');
+    }else if(!sessionEstablished){
+      sbSession=null;
+      localStorage.removeItem(SB_SESSION_KEY);
+      setAuthError(err.message||'Sign-in failed.');
+    }else{
+      setAuthError('Signed in, but the secure profile check could not connect. Check your connection and reload.');
+    }
+  }finally{btn.disabled=false;btn.textContent='Verify and sign in';}
+}
+
+function setRoleBadge(){
+  const el=document.getElementById('owner-status');
+  if(!el)return;
+  el.replaceChildren();
+  if(!currentRole)return;
+  const span=document.createElement('span');
+  span.className='owner-badge';
+  span.textContent=currentRole==='owner'?'✓ OWNER VIEW':currentRole==='manager'?'✓ MANAGER VIEW':'✓ '+String(currentMarket||'FIELD').toUpperCase()+' TEAM';
+  el.appendChild(span);
+}
+
+async function activateSession(profile){
+  dashboardSessionGeneration+=1;
+  currentUserId=profile.userId;
+  currentUserEmail=profile.email;
+  currentRole=profile.role;
+  currentMarket=profile.market;
+  resetMfaForm();
+  setAuthError('');
+  if(hasQuarantinedPendingQueue()){
+    console.warn('An older unverified delivery queue remains preserved on this device and will not be submitted automatically.');
+  }
+  loadEvents();
   applyRole();
+  setRoleBadge();
   document.getElementById('pin-overlay').classList.add('hidden');
+  if(currentRole==='owner')setView('list');else setView('deliv');
   render();
-  // Field team's home screen is Deliveries; owners stay on the Dashboard.
-  if(currentRole&&currentRole!=='owner')setView('deliv');
-  jbPull();
-  // Background sync
+  await jbPull();
   if(!window._jbSyncInterval){
     window._jbSyncInterval=setInterval(()=>{
-      if(currentRole&&jbBinId&&jbMasterKey&&!jbSyncing)jbPull();
+      if(currentRole&&sbSession?.access_token&&!jbSyncing)jbPull();
     },30000);
   }
-  // Gmail is already connected from the sign-in token
-  if(gmailToken){
-    const btn=document.getElementById('gmail-btn');
-    btn.textContent='📧 Connected';
-    btn.classList.add('connected');
-    btn.onclick=gmailDisconnect;
-    gmailCheckInbox();
-    if(gmailPollTimer)clearInterval(gmailPollTimer);
-    gmailPollTimer=setInterval(gmailCheckInbox,300000);
-  }
-  // Role badge
-  const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
-  document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
+  if(loadQueue().length)syncPendingDeliveries();
 }
 
 function applyRole(){
@@ -2205,52 +2847,182 @@ function applyRole(){
   document.querySelectorAll('.owner-lock,.icon-btn[onclick*="exportData"],[onclick*="importData"]').forEach(el=>{
     el.style.display=currentRole==='owner'?'':'none';
   });
+  const gmailBtn=document.getElementById('gmail-btn');
+  if(gmailBtn)gmailBtn.style.display=currentRole==='owner'?'':'none';
   const ob=document.getElementById('owner-banner');
   if(ob)ob.style.display='none';
 }
 
-function initOwner(){
-  const savedEmail=localStorage.getItem('hc_auth_email');
-  const savedRole=localStorage.getItem('hc_role');
-  const savedMarket=localStorage.getItem('hc_market');
-  if(savedEmail&&AUTH_USERS[savedEmail]){
-    const authEntry=AUTH_USERS[savedEmail];
-    currentUserEmail=savedEmail;
-    currentRole=authEntry.role;
-    currentMarket=authEntry.market;
-    applyRole();
-    document.getElementById('pin-overlay').classList.add('hidden');
-    const badges={owner:'<span class="owner-badge">✓ OWNER VIEW</span>',ny:'<span class="owner-badge" style="background:#3b82f6;color:#fff">🗽 NY TEAM</span>',miami:'<span class="owner-badge" style="background:#f43f5e;color:#fff">🌴 MIAMI TEAM</span>'};
-    document.getElementById('owner-status').innerHTML=badges[currentRole]||'';
-    if(currentRole&&currentRole!=='owner')setView('deliv');
-    jbPull();
-    if(!window._jbSyncInterval){
-      window._jbSyncInterval=setInterval(()=>{
-        if(currentRole&&jbBinId&&jbMasterKey&&!jbSyncing)jbPull();
-      },30000);
+async function initOwner(){
+  clearLegacyAuthState();
+  clearLegacyTelegramCredentials();
+  sbSession=readSupabaseSession();
+  if(!sbSession){clearCachedOrders();setSyncStatus('Sign in to sync','');return;}
+  setAuthError('Restoring your secure session...');
+  try{
+    await completeDashboardAuthentication();
+  }catch(err){
+    if(err.staleSession)return;
+    if(err.authRejected||!sbSession){
+      clearDashboardSession();
+      setAuthError('Your session expired or is not authorized. Sign in again.');
+    }else{
+      setAuthError('Could not verify your secure profile. Check your connection and reload.');
+      setSyncStatus('Secure profile check unavailable','err');
     }
-    // Auto-connect Gmail on session restore
-    setTimeout(()=>{if(!gmailToken&&typeof google!=='undefined')gmailConnect();},1500);
   }
 }
 
-function lockOwner(){
+function clearSensitiveDashboardState(){
+  dashboardSessionGeneration+=1;
   currentRole=null;
   currentMarket=null;
   currentUserEmail=null;
+  currentUserId=null;
+  sbRefreshPromise=null;
+  sbRefreshContext=null;
   gmailToken=null;
+  pendingImports=[];
   if(gmailPollTimer){clearInterval(gmailPollTimer);gmailPollTimer=null;}
-  localStorage.removeItem('hc_auth_email');
-  localStorage.removeItem('hc_role');
-  localStorage.removeItem('hc_market');
+  clearCachedOrders();
+  events=[];
   document.body.classList.remove('owner-unlocked','market-ny-only','market-miami-only','team-view-only');
   document.getElementById('pin-overlay').classList.remove('hidden');
   document.getElementById('owner-status').textContent='';
-  document.getElementById('pin-error').textContent='';
+  const importPanel=document.getElementById('import-panel');
+  const importItems=document.getElementById('import-items');
+  if(importPanel)importPanel.style.display='none';
+  if(importItems)importItems.replaceChildren();
+  document.getElementById('modal-overlay')?.remove();
+  document.getElementById('sig-overlay')?.remove();
+  document.body.style.overflow='';
+  render();
   const gBtn=document.getElementById('gmail-btn');
-  gBtn.textContent='📧 Connect Gmail';
-  gBtn.classList.remove('connected');
-  gBtn.onclick=gmailConnect;
+  if(gBtn){
+    gBtn.textContent='📧 Connect Gmail';
+    gBtn.classList.remove('connected');
+    gBtn.onclick=gmailConnect;
+  }
+}
+
+function lockDashboardForMfa(bootstrap){
+  clearSensitiveDashboardState();
+  pendingLoginEmail='';
+  pendingMfaBootstrap=bootstrap;
+  pendingMfaFactorId=null;
+  pendingMfaEnrollment=false;
+  pendingMfaFactors=[];
+  pendingMfaUnverifiedFactorIds=[];
+  document.getElementById('pin-overlay')?.classList.remove('hidden');
+  showDashboardMfaPanel();
+  setSyncStatus('Owner authenticator required','err');
+}
+
+function clearDashboardSession(){
+  clearSensitiveDashboardState();
+  sbSession=null;
+  sbRefreshPromise=null;
+  sbRefreshContext=null;
+  localStorage.removeItem(SB_SESSION_KEY);
+  clearLegacyAuthState();
+  clearLegacyTelegramCredentials();
+  resetLoginForm();
+  setSyncStatus('Sign in to sync','');
+}
+
+function accessErrorIsDefinitive(err){
+  return !!err&&(err.authRejected===true||err.status===401||err.status===403);
+}
+
+async function revalidateDashboardAccess(){
+  if(accessRecheckPromise)return accessRecheckPromise;
+  if(!sbSession?.access_token||(!currentRole&&!pendingMfaBootstrap))return false;
+  const expected={
+    generation:dashboardSessionGeneration,
+    userId:currentUserId||pendingMfaBootstrap?.userId||null,
+    email:currentUserEmail,
+    role:currentRole||pendingMfaBootstrap?.role||null,
+    market:currentMarket
+  };
+  const isCurrent=()=>
+    expected.generation===dashboardSessionGeneration&&
+    expected.userId===(currentUserId||pendingMfaBootstrap?.userId||null)&&
+    expected.role===(currentRole||pendingMfaBootstrap?.role||null);
+  const work=(async()=>{
+    try{
+      const bootstrap=await claimAuthBootstrap();
+      if(!isCurrent())return false;
+      if(bootstrap.userId!==expected.userId){
+        throw authResponseError(null,'The signed-in account changed',403,true);
+      }
+      if(bootstrap.role==='owner'){
+        if(bootstrap.mfaRequired!==true)throw authResponseError(null,'Owner MFA policy is unavailable',403,true);
+        if(signedSessionAal()!=='aal2'){
+          lockDashboardForMfa(bootstrap);
+          try{await prepareDashboardMfa(bootstrap);}
+          catch(err){
+            if(accessErrorIsDefinitive(err))throw err;
+            setAuthError(err.message||'Authenticator check is temporarily unavailable. Retry when connected.');
+          }
+          return false;
+        }
+      }else if(bootstrap.mfaRequired){
+        throw authResponseError(null,'Field account MFA routing is invalid',403,true);
+      }
+      if(!currentRole){
+        const unlockedProfile=await claimDashboardProfile();
+        if(unlockedProfile.userId!==bootstrap.userId||unlockedProfile.role!==bootstrap.role){
+          throw authResponseError(null,'Your roster access changed. Sign in again.',403,true);
+        }
+        await activateSession(unlockedProfile);
+        return true;
+      }
+      if(bootstrap.role!==expected.role){
+        throw authResponseError(null,'Your roster role changed. Sign in again.',403,true);
+      }
+      const profile=await claimDashboardProfile();
+      if(!isCurrent())return false;
+      if(profile.userId!==expected.userId||profile.role!==expected.role||
+         profile.email!==expected.email||profile.market!==expected.market){
+        throw authResponseError(null,'Your roster access changed. Sign in again.',403,true);
+      }
+      setSyncStatus('✓ Cloud sync active','ok');
+      return true;
+    }catch(err){
+      if(err.staleSession)return false;
+      if(accessErrorIsDefinitive(err)){
+        clearDashboardSession();
+        setAuthError('Your secure access expired or was revoked. Sign in again.');
+        return false;
+      }
+      if(currentRole){
+        setSyncStatus('Secure access check unavailable, existing session preserved','err');
+      }else if(pendingMfaBootstrap){
+        setAuthError('Secure access check is temporarily unavailable. Your session is preserved.');
+      }
+      return false;
+    }
+  })();
+  let tracked;
+  tracked=work.finally(()=>{if(accessRecheckPromise===tracked)accessRecheckPromise=null;});
+  accessRecheckPromise=tracked;
+  return accessRecheckPromise;
+}
+
+async function lockOwner(){
+  const pendingCount=loadQueue().length;
+  if(pendingCount)alert(pendingCount+' delivery signature'+(pendingCount===1?' is':'s are')+' saved securely on this device. It will retry when this account signs in again.');
+  const reviewCount=loadReviewQueue().length;
+  if(reviewCount)alert(reviewCount+' delivery signature'+(reviewCount===1?' needs':'s need')+' review. It will remain securely saved for this account.');
+  const accessToken=sbSession?.access_token||null;
+  clearDashboardSession();
+  if(accessToken){
+    fetch(SUPABASE_URL+'/auth/v1/logout',{
+      method:'POST',
+      headers:{apikey:SUPABASE_ANON_KEY,Authorization:'Bearer '+accessToken},
+      keepalive:true
+    }).catch(()=>{});
+  }
 }
 
 // ── PROFIT CALC
@@ -2274,7 +3046,6 @@ function hasProfit(e){return !!(e.cost_per_box||e.cost_labor||e.cost_other);}
 // ══════════════════════════════════════════════
 const SUPABASE_URL='https://omdcfphbwuwsrffdszlg.supabase.co';
 const SUPABASE_ANON_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9tZGNmcGhid3V3c3JmZmRzemxnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU5NTYwNjEsImV4cCI6MjA5MTUzMjA2MX0.lXrH9KPTSxVpW81ph__HlsyeP0Ln7fOpu60317tqKXA';
-const SB_HEADERS={'apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY};
 
 // Legacy JSONBin vars kept truthy so the auto-sync gate in saveEvents() still fires.
 let jbMasterKey='supabase';
@@ -2339,7 +3110,7 @@ function supabaseRowToEvent(o){
     delivery_signed_at:o.delivery_signed_at||'',
     delivery_signed_by:o.delivery_signed_by||'',
     invoice_name:'',
-    invoice_url:o.external_invoice_url||'',
+    invoice_url:safeHttpUrl(o.external_invoice_url),
     cost_per_box:'',
     cost_labor:'',
     cost_other:'',
@@ -2375,7 +3146,7 @@ function eventToSupabaseRow(e){
     deposit_cents:cents(e.deposit_amount)??0,
     balance_cents:cents(e.balance_amount),
     pay_notes:e.pay_notes||null,
-    external_invoice_url:e.invoice_url||null,
+    external_invoice_url:safeHttpUrl(e.invoice_url)||null,
     stage:UI_STAGE_TO_SB[e.stage]||'inquiry',
     market:e.market||null,
     source:e.source?(UI_SOURCE_TO_SB[e.source]||'other'):null,
@@ -2393,15 +3164,12 @@ function eventToSupabaseRow(e){
   return row;
 }
 
-// Boot the UI and restore the saved session. This must run AFTER the Supabase
-// config and vocab maps above are initialized, because initOwner() calls jbPull(),
-// which reads SUPABASE_URL/SB_HEADERS. (Previously this ran above the config and
-// threw a harmless "Cannot access 'SUPABASE_URL' before initialization" on load.)
-initKeyUI();initOwner();loadEvents();render();
-
-// Auto-connect on load
-(function(){
-  // Hide the legacy JSONBin key input bar entirely (Supabase config is hardcoded)
+// Wait until the whole script is initialized before restoring a saved token.
+// No cached or cloud order data is loaded until the server confirms the user.
+window.addEventListener('DOMContentLoaded',()=>{
+  initKeyUI();
+  events=[];
+  render();
   const bar=document.getElementById('sync-bar');
   if(bar){
     const inp=document.getElementById('jb-key-input');
@@ -2409,14 +3177,20 @@ initKeyUI();initOwner();loadEvents();render();
     if(inp)inp.style.display='none';
     if(connectBtn)connectBtn.style.display='none';
   }
-  updateJbUI(true);
-  jbPull();
-})();
+  updateJbUI(false);
+  initOwner();
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='visible')revalidateDashboardAccess();
+  });
+  if(!accessRecheckTimer){
+    accessRecheckTimer=setInterval(revalidateDashboardAccess,ACCESS_RECHECK_MS);
+  }
+});
 
 function setSyncStatus(msg,type){
   const el=document.getElementById('sync-status');
   if(!el)return;
-  el.innerHTML=msg;
+  el.textContent=msg;
   el.className='sync-status'+(type==='ok'?' sync-ok':type==='err'?' sync-err':'');
 }
 
@@ -2434,22 +3208,30 @@ async function jbConnect(){
 }
 
 async function jbPush(silent=false){
-  if(jbSyncing)return;
+  if(jbSyncing||currentRole!=='owner'||!sbSession?.access_token)return;
+  const sessionGeneration=dashboardSessionGeneration;
+  const sessionEmail=currentUserEmail;
   jbSyncing=true;
   try{
     const rows=events.map(eventToSupabaseRow);
-    const resp=await fetch(SUPABASE_URL+'/rest/v1/orders?on_conflict=id',{
+    const resp=await supabaseFetch('orders?on_conflict=id',{
       method:'POST',
-      headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=representation'},
+      headers:{'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=representation'},
       body:JSON.stringify(rows)
     });
+    const responseIdentity=captureSessionIdentity();
+    if(sessionGeneration!==dashboardSessionGeneration||sessionEmail!==currentUserEmail)return;
     if(!resp.ok){
       const txt=await resp.text();
+      requireCurrentSessionIdentity(responseIdentity);
+      if(sessionGeneration!==dashboardSessionGeneration||sessionEmail!==currentUserEmail)return;
       throw new Error('Push failed ('+resp.status+'): '+txt);
     }
     // For new rows (no UUID sent), Supabase generated UUIDs. Map them back to local events.
     try{
       const returned=await resp.json();
+      requireCurrentSessionIdentity(responseIdentity);
+      if(sessionGeneration!==dashboardSessionGeneration||sessionEmail!==currentUserEmail)return;
       if(Array.isArray(returned)){
         const idMap={};
         returned.forEach(r=>{const k=(r.client_name||'')+'|'+(r.event_start_at||'')+'|'+(r.total_cents??'');idMap[k]=r.id;});
@@ -2462,7 +3244,8 @@ async function jbPush(silent=false){
           if(idMap[k]){dirty=true;return{...e,id:idMap[k]};}
           return e;
         });
-        if(dirty)localStorage.setItem('hc_events',JSON.stringify(events));
+        const key=eventsCacheKey();
+        if(dirty&&key)localStorage.setItem(key,JSON.stringify(events));
       }
     }catch(e){console.warn('id remap skipped:',e);}
     if(!silent){
@@ -2470,7 +3253,7 @@ async function jbPush(silent=false){
       setSyncStatus('✓ Saved to cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
     }
   }catch(err){
-    if(!silent)setSyncStatus('Sync failed: '+err.message,'err');
+    if(!silent&&sessionGeneration===dashboardSessionGeneration&&sessionEmail===currentUserEmail)setSyncStatus('Sync failed: '+err.message,'err');
     console.error('jbPush error:',err);
   }finally{
     jbSyncing=false;
@@ -2478,34 +3261,52 @@ async function jbPush(silent=false){
 }
 
 async function jbPull(){
-  setSyncStatus('<span class="sync-spinner"></span> Loading from cloud...','');
+  if(!currentRole||!sbSession?.access_token)return;
+  const sessionGeneration=dashboardSessionGeneration;
+  const sessionEmail=currentUserEmail;
+  const sessionRole=currentRole;
+  const sessionMarket=currentMarket;
+  const sessionIsCurrent=()=>sessionGeneration===dashboardSessionGeneration&&sessionEmail===currentUserEmail&&sessionRole===currentRole&&sessionMarket===currentMarket;
+  setSyncStatus('Loading from cloud...','');
+  let timeout=null;
   try{
     const controller=new AbortController();
-    const timeout=setTimeout(()=>controller.abort(),15000);
-    const resp=await fetch(SUPABASE_URL+'/rest/v1/orders?select=*',{
-      headers:SB_HEADERS,
-      signal:controller.signal
-    });
-    clearTimeout(timeout);
-    if(!resp.ok)throw new Error('Pull failed ('+resp.status+')');
-    const rows=await resp.json();
-    if(Array.isArray(rows)){
-      events=rows.map(supabaseRowToEvent);
-      applyPendingToEvents();
-      localStorage.setItem('hc_events',JSON.stringify(events));
-      render();
-      const now=new Date();
-      setSyncStatus('✓ Loaded '+events.length+' events from cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
-    } else {
-      setSyncStatus('Cloud data looks empty — using local data','');
-      render();
+    timeout=setTimeout(()=>controller.abort(),15000);
+    const rows=[];
+    let offset=0;
+    for(;;){
+      if(!sessionIsCurrent())return;
+      const resp=await supabaseFetch('rpc/hc_list_orders_for_current_user',{
+        method:'POST',
+        body:JSON.stringify({p_delivery_from:null,p_delivery_before:null,p_stages:null,p_offset:offset,p_limit:500}),
+        signal:controller.signal
+      });
+      if(!sessionIsCurrent())return;
+      const responseIdentity=captureSessionIdentity();
+      if(!resp.ok)throw new Error('Pull failed ('+resp.status+')');
+      const batch=await resp.json();
+      requireCurrentSessionIdentity(responseIdentity);
+      if(!sessionIsCurrent())return;
+      if(!Array.isArray(batch))throw new Error('Cloud returned an invalid order list');
+      rows.push(...batch);
+      if(batch.length<500)break;
+      offset+=batch.length;
     }
+    if(!sessionIsCurrent())return;
+    events=rows.map(supabaseRowToEvent).filter(e=>safeEventId(e.id));
+    applyPendingToEvents();
+    const key=eventsCacheKey();
+    if(key)localStorage.setItem(key,JSON.stringify(events));
+    render();
+    const now=new Date();
+    setSyncStatus('✓ Loaded '+events.length+' events from cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
   }catch(err){
+    if(!sessionIsCurrent())return;
     const msg=err.name==='AbortError'?'Cloud sync timed out — using local data':('Pull failed: '+err.message);
     setSyncStatus(msg,'err');
     console.error('jbPull error:',err);
     render();
-  }
+  }finally{if(timeout)clearTimeout(timeout);}
 }
 
 function jbDisconnect(){
@@ -2528,11 +3329,14 @@ function getProcessedIds(){try{return JSON.parse(localStorage.getItem('hc_gmail_
 function saveProcessedIds(ids){localStorage.setItem('hc_gmail_processed',JSON.stringify(ids));}
 
 function gmailConnect(){
+  if(currentRole!=='owner')return;
+  const sessionGeneration=dashboardSessionGeneration;
   // API key checked later during parsing, not at connect time
   const tokenClient=google.accounts.oauth2.initTokenClient({
     client_id:GMAIL_CLIENT_ID,
     scope:GMAIL_SCOPES,
     callback:(resp)=>{
+      if(currentRole!=='owner'||sessionGeneration!==dashboardSessionGeneration)return;
       if(resp.error){
         console.error('Gmail auth error:',resp);
         setGmailStatus('Auth failed','err');
@@ -2575,15 +3379,20 @@ const GMAIL_SKIP_WORDS=/^(re:|fw:|fwd:)?\s*(welcome|unsubscribe|verify|confirm y
 const GMAIL_MUST_PARSE=/invoice|coconut|event|booking|order|quote|proposal|wedding|party|catering|venue|deposit|payment request|hampton/i;
 
 async function gmailCheckInbox(){
-  if(!gmailToken)return;
+  if(currentRole!=='owner'||!gmailToken)return;
+  const sessionGeneration=dashboardSessionGeneration;
+  const sessionGmailToken=gmailToken;
+  const sessionIsCurrent=()=>currentRole==='owner'&&sessionGeneration===dashboardSessionGeneration&&gmailToken===sessionGmailToken;
   try{
     setGmailStatus('Checking inbox...','');
     const listResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?q=is:unread+newer_than:7d&maxResults=10',{
-      headers:{'Authorization':'Bearer '+gmailToken}
+      headers:{'Authorization':'Bearer '+sessionGmailToken}
     });
+    if(!sessionIsCurrent())return;
     if(listResp.status===401){gmailDisconnect();setGmailStatus('Session expired — reconnect','err');return;}
     if(!listResp.ok)throw new Error('List failed ('+listResp.status+')');
     const listData=await listResp.json();
+    if(!sessionIsCurrent())return;
     const messages=listData.messages||[];
     if(!messages.length){setGmailStatus('Inbox synced — no new emails','ok');return;}
 
@@ -2596,19 +3405,23 @@ async function gmailCheckInbox(){
     const candidates=[];
     let paymentUpdates=0;
     for(const msg of newMsgs){
+      if(!sessionIsCurrent())return;
       try{
         const hResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+msg.id+'?format=metadata&metadataHeaders=Subject&metadataHeaders=From',{
-          headers:{'Authorization':'Bearer '+gmailToken}
+          headers:{'Authorization':'Bearer '+sessionGmailToken}
         });
+        if(!sessionIsCurrent())return;
         if(!hResp.ok){processed.push(msg.id);continue;}
         const hData=await hResp.json();
+        if(!sessionIsCurrent())return;
         const hdrs=hData.payload?.headers||[];
         const subj=(hdrs.find(h=>h.name==='Subject')||{}).value||'';
         const from=(hdrs.find(h=>h.name==='From')||{}).value||'';
 
         // QB Payment detection — no AI needed!
         if(isQBPaymentEmail(subj,from)){
-          const detail=await gmailGetMessage(msg.id);
+          const detail=await gmailGetMessage(msg.id,sessionGmailToken);
+          if(!sessionIsCurrent())return;
           if(detail){
             const payInfo=extractPaymentInfo(detail.subject,detail.body);
             if(payInfo){
@@ -2648,8 +3461,10 @@ async function gmailCheckInbox(){
     const emailTexts=[];
     const candidateMap=[];
     for(const c of candidates){
+      if(!sessionIsCurrent())return;
       try{
-        const detail=await gmailGetMessage(c.id);
+        const detail=await gmailGetMessage(c.id,sessionGmailToken);
+        if(!sessionIsCurrent())return;
         if(!detail){processed.push(c.id);continue;}
         emailTexts.push(`--- EMAIL ${emailTexts.length+1} ---\nSubject: ${detail.subject}\nFrom: ${detail.from}\nDate: ${detail.date}\n\n${detail.body}`);
         candidateMap.push({id:c.id,subject:detail.subject,attachment:detail.attachment});
@@ -2664,6 +3479,7 @@ async function gmailCheckInbox(){
 
     // Phase 3: Single batched API call for all text-only emails
     const batchResult=await gmailBatchParse(emailTexts,candidateMap);
+    if(!sessionIsCurrent())return;
     let parsed=0;
     batchResult.forEach((eventData,i)=>{
       const c=candidateMap[i];
@@ -2685,14 +3501,16 @@ async function gmailCheckInbox(){
       setGmailStatus('Inbox synced — no event emails found','ok');
     }
   }catch(err){
+    if(!sessionIsCurrent())return;
     console.error('Gmail check error:',err);
     setGmailStatus('Check failed: '+err.message,'err');
   }
 }
 
-async function gmailGetMessage(id){
+async function gmailGetMessage(id,accessToken){
+  if(!accessToken)return null;
   const resp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+id+'?format=full',{
-    headers:{'Authorization':'Bearer '+gmailToken}
+    headers:{'Authorization':'Bearer '+accessToken}
   });
   if(!resp.ok)return null;
   const data=await resp.json();
@@ -2734,7 +3552,7 @@ async function gmailGetMessage(id){
       const att=attachments[0];
       try{
         const attResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+id+'/attachments/'+att.attachmentId,{
-          headers:{'Authorization':'Bearer '+gmailToken}
+          headers:{'Authorization':'Bearer '+accessToken}
         });
         if(attResp.ok){
           const attJson=await attResp.json();
@@ -2800,6 +3618,12 @@ Leave unknown fields empty. is_event=false for spam/newsletters/unrelated. Marke
 function renderImportPanel(){
   const panel=document.getElementById('import-panel');
   const items=document.getElementById('import-items');
+  if(currentRole!=='owner'){
+    pendingImports=[];
+    if(panel)panel.style.display='none';
+    if(items)items.replaceChildren();
+    return;
+  }
   if(!pendingImports.length){panel.style.display='none';return;}
   panel.style.display='block';
   items.innerHTML=pendingImports.map((e,i)=>{
@@ -2811,7 +3635,7 @@ function renderImportPanel(){
       <div class="import-item-details">
         <span>${dateStr}</span>
         ${e.venue?'<span>📍 '+esc(e.venue)+'</span>':''}
-        ${e.coconuts?'<span>🥥 '+e.coconuts+'</span>':''}
+        ${e.coconuts?'<span>🥥 '+esc(e.coconuts)+'</span>':''}
         ${e.total_amount?'<span>💰 $'+parseFloat(e.total_amount).toLocaleString()+'</span>':''}
         <span>${market}</span>
         ${e.event_type?'<span>'+esc(e.event_type)+'</span>':''}
@@ -2821,18 +3645,21 @@ function renderImportPanel(){
 }
 
 function dismissImport(idx){
+  if(currentRole!=='owner')return;
   pendingImports.splice(idx,1);
   renderImportPanel();
   updateGmailBadge();
 }
 
 function dismissAllImports(){
+  if(currentRole!=='owner')return;
   pendingImports=[];
   renderImportPanel();
   updateGmailBadge();
 }
 
 function confirmAllImports(){
+  if(currentRole!=='owner')return;
   try{
     let count=0;
     const gmailIds=[];
@@ -2899,7 +3726,7 @@ function confirmAllImports(){
 
 function updateGmailBadge(){
   const btn=document.getElementById('gmail-btn');
-  if(!gmailToken)return;
+  if(currentRole!=='owner'||!gmailToken)return;
   if(pendingImports.length>0){
     btn.innerHTML='📧 Connected<span class="gmail-badge">'+pendingImports.length+'</span>';
   } else {
@@ -2996,111 +3823,7 @@ function applyPaymentUpdate(event,payInfo){
     event.balance_amount=String(Math.max(0,total-paid-existingBal));
     event.pay_notes=(event.pay_notes?event.pay_notes+' | ':'')+'QB deposit $'+paid.toLocaleString()+' (auto-synced)';
   }
-  // Trigger stamp alert if needed
-  if(event.stamp_status==='Not ordered'&&event.stage!=='lead'&&event.stage!=='passed'){
-    sendTelegramStampAlert(event,paid);
-  }
   console.log('Payment auto-synced:',event.name,'$'+paid,'→',event.stage);
-}
-
-// ══════════════════════════════════════════════
-// 📲  TELEGRAM STAMP BOT
-// ══════════════════════════════════════════════
-const TG_BOT_TOKEN=localStorage.getItem('hc_tg_bot_token')||'';
-const TG_CHAT_ID=localStorage.getItem('hc_tg_chat_id')||'';
-
-function getTgConfig(){
-  return {
-    token:localStorage.getItem('hc_tg_bot_token')||'',
-    chatId:localStorage.getItem('hc_tg_chat_id')||''
-  };
-}
-
-function saveTgConfig(){
-  const token=document.getElementById('tg-bot-token')?.value?.trim();
-  const chatId=document.getElementById('tg-chat-id')?.value?.trim();
-  if(!token||!chatId){alert('Enter both bot token and chat ID');return;}
-  localStorage.setItem('hc_tg_bot_token',token);
-  localStorage.setItem('hc_tg_chat_id',chatId);
-  document.getElementById('tg-setup').style.display='none';
-  showImportToast('Telegram bot connected');
-  // Send test message
-  sendTelegram('✅ Hamptons Coconuts dashboard connected! You will receive stamp ordering alerts here.');
-}
-
-async function sendTelegram(text){
-  const cfg=getTgConfig();
-  if(!cfg.token||!cfg.chatId)return false;
-  try{
-    const resp=await fetch(`https://api.telegram.org/bot${cfg.token}/sendMessage`,{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({chat_id:cfg.chatId,text:text,parse_mode:'Markdown'})
-    });
-    return resp.ok;
-  }catch(e){console.error('Telegram error:',e);return false;}
-}
-
-function sendTelegramStampAlert(event,paymentAmount){
-  const nuts=parseInt(event.coconuts)||0;
-  const boxes=nuts>0?Math.ceil(nuts/9):0;
-  const evDate=event.event_date?new Date(event.event_date+'T12:00:00').toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}):'TBD';
-  const market=event.market==='ny'?'NY':event.market==='miami'?'Miami':'';
-
-  let msg=`🥥 *STAMP ALERT — Hamptons Coconuts*\n\n`;
-  if(paymentAmount>0)msg+=`💰 Payment received: $${paymentAmount.toLocaleString()}\n`;
-  msg+=`👤 ${event.name||'Unknown'}`;
-  if(event.venue)msg+=` — ${event.venue}`;
-  msg+=`\n📅 Event: ${evDate}`;
-  if(market)msg+=` (${market})`;
-  msg+=`\n🥥 ${nuts} coconuts`;
-  if(boxes)msg+=` (${boxes} boxes)`;
-  msg+=`\n\n⚠️ *Stamp not yet ordered!*`;
-  if(event.stamp_design)msg+=`\n🎨 Design: ${event.stamp_design}`;
-  msg+=`\nPlease send the logo/design for this event.`;
-
-  sendTelegram(msg);
-}
-
-// Check for confirmed events with unordered stamps on load
-function checkPendingStamps(){
-  const cfg=getTgConfig();
-  if(!cfg.token||!cfg.chatId)return;
-  const today=new Date();today.setHours(0,0,0,0);
-  const lastCheck=localStorage.getItem('hc_stamp_check_date');
-  const todayStr=today.toISOString().split('T')[0];
-  if(lastCheck===todayStr)return; // Only once per day
-  localStorage.setItem('hc_stamp_check_date',todayStr);
-
-  const urgent=events.filter(e=>{
-    if(e.type==='recurring')return false;
-    if(e.stage==='lead'||e.stage==='passed'||e.stage==='completed')return false;
-    if(e.stamp_status!=='Not ordered')return false;
-    const d=parseLocalDate(e.event_date);
-    if(!d)return false;
-    const days=Math.round((d-today)/(1000*60*60*24));
-    return days>=0&&days<=14;
-  });
-
-  if(urgent.length>0){
-    let msg=`🚨 *DAILY STAMP REMINDER*\n\n${urgent.length} event${urgent.length>1?'s':''} need stamps ordered:\n`;
-    urgent.forEach(e=>{
-      const d=parseLocalDate(e.event_date);
-      const days=Math.round((d-today)/(1000*60*60*24));
-      msg+=`\n• *${e.name}* — ${days===0?'TODAY':days+'d away'} (${parseInt(e.coconuts)||'?'} nuts)`;
-    });
-    sendTelegram(msg);
-  }
-}
-
-// Run stamp check after session activates
-setTimeout(()=>{if(currentRole)checkPendingStamps();},5000);
-
-// ── TELEGRAM SETUP UI INIT
-function initTgUI(){
-  const cfg=getTgConfig();
-  const el=document.getElementById('tg-setup');
-  if(el&&cfg.token&&cfg.chatId)el.style.display='none';
 }
 
 // ══════════════════════════════════════════════
@@ -3110,24 +3833,139 @@ function initTgUI(){
 // Built to NEVER get stuck: signing saves to the phone first (works with no
 // internet), then a background job pushes it to the cloud and retries on its own.
 
-const PENDING_KEY='hc_pending_deliveries';        // offline queue (holds signature images until they reach the cloud)
-function loadQueue(){try{return JSON.parse(localStorage.getItem(PENDING_KEY)||'[]');}catch(_){return [];}}
-function saveQueue(q){try{localStorage.setItem(PENDING_KEY,JSON.stringify(q));}catch(_){}}
-function saveEventsLocalOnly(){try{localStorage.setItem('hc_events',JSON.stringify(events));}catch(_){}}
+const LEGACY_PENDING_KEY='hc_pending_deliveries';
+const UNVERIFIED_PENDING_KEY_PREFIX='hc_pending_deliveries_v2_';
+const PENDING_KEY_PREFIX='hc_pending_deliveries_v3_';
+const REVIEW_KEY_PREFIX='hc_pending_deliveries_review_v1_';
+
+function scopedDeliveryKey(prefix){
+  const userId=String(currentUserId||'').trim().toLowerCase();
+  if(!UUID_RE.test(userId))return null;
+  return prefix+userId;
+}
+function pendingQueueKey(){return scopedDeliveryKey(PENDING_KEY_PREFIX);}
+function reviewQueueKey(){return scopedDeliveryKey(REVIEW_KEY_PREFIX);}
+
+function hasQuarantinedPendingQueue(){
+  for(let i=0;i<localStorage.length;i++){
+    const key=localStorage.key(i);
+    if(key===LEGACY_PENDING_KEY||key?.startsWith(UNVERIFIED_PENDING_KEY_PREFIX))return true;
+  }
+  return false;
+}
+
+function createDeliveryRequestId(){
+  const requestId=globalThis.crypto?.randomUUID?.().toLowerCase()||'';
+  if(!UUID_RE.test(requestId))throw new Error('Secure request identity is unavailable');
+  return requestId;
+}
+
+function normalizeQueueItem(item){
+  if(!item||typeof item!=='object')return null;
+  const deliveryRequestId=String(item.deliveryRequestId||'').toLowerCase();
+  const orderId=String(item.orderId||'').toLowerCase();
+  if(!UUID_RE.test(deliveryRequestId)||!UUID_RE.test(orderId))return null;
+  const signedAt=String(item.signedAt||'').slice(0,64);
+  if(!signedAt||!Number.isFinite(Date.parse(signedAt)))return null;
+  const dataUrl=safeImageDataUrl(item.dataUrl);
+  if(!dataUrl)return null;
+  return{
+    localKey:deliveryRequestId,
+    deliveryRequestId,
+    orderId,
+    signedBy:String(item.signedBy||'Customer').trim().slice(0,160)||'Customer',
+    signedAt,
+    dataUrl
+  };
+}
+
+function normalizeQueue(value){
+  if(!Array.isArray(value))return[];
+  const seen=new Set();
+  return value.map(normalizeQueueItem).filter(item=>{
+    if(!item||seen.has(item.localKey))return false;
+    seen.add(item.localKey);
+    return true;
+  });
+}
+
+function loadQueue(){
+  const key=pendingQueueKey();
+  if(!key)return[];
+  try{return normalizeQueue(JSON.parse(localStorage.getItem(key)||'[]'));}
+  catch(_){return[];}
+}
+
+function saveQueue(q){
+  const key=pendingQueueKey();
+  if(!key)return false;
+  try{localStorage.setItem(key,JSON.stringify(normalizeQueue(q)));return true;}
+  catch(_){return false;}
+}
+
+function normalizeReviewItem(item){
+  const clean=normalizeQueueItem(item);
+  if(!clean)return null;
+  return{
+    ...clean,
+    reviewReason:String(item.reviewReason||'server-rejected').slice(0,80),
+    quarantinedAt:String(item.quarantinedAt||'').slice(0,64)
+  };
+}
+
+function loadReviewQueue(){
+  const key=reviewQueueKey();
+  if(!key)return[];
+  try{
+    const value=JSON.parse(localStorage.getItem(key)||'[]');
+    if(!Array.isArray(value))return[];
+    const seen=new Set();
+    return value.map(normalizeReviewItem).filter(item=>{
+      if(!item||seen.has(item.localKey))return false;
+      seen.add(item.localKey);
+      return true;
+    });
+  }catch(_){return[];}
+}
+
+function saveReviewQueue(q){
+  const key=reviewQueueKey();
+  if(!key)return false;
+  try{
+    const clean=Array.isArray(q)?q.map(normalizeReviewItem).filter(Boolean):[];
+    localStorage.setItem(key,JSON.stringify(clean));
+    return true;
+  }catch(_){return false;}
+}
+
+function quarantineDeliveryItem(item,status){
+  const existing=loadReviewQueue();
+  if(!existing.some(saved=>saved.localKey===item.localKey)){
+    existing.push({
+      ...item,
+      reviewReason:'server-'+String(status||'rejected').slice(0,40),
+      quarantinedAt:new Date().toISOString()
+    });
+  }
+  return saveReviewQueue(existing);
+}
+
+function saveEventsLocalOnly(){try{const key=eventsCacheKey();if(key)localStorage.setItem(key,JSON.stringify(events));}catch(_){}}
 
 // Re-apply locally-confirmed (not-yet-synced) deliveries after a cloud refresh,
 // so a delivery the employee just signed doesn't visually "un-deliver" itself.
 function applyPendingToEvents(){
-  const q=loadQueue();
-  if(!q.length)return;
-  q.forEach(item=>{
+  const applyLocal=(item,needsReview)=>{
     const ev=events.find(e=>e.id===item.orderId);
     if(ev){
       if(!ev.delivery_signed_at)ev.delivery_signed_at=item.signedAt;
       if(!ev.delivery_signed_by)ev.delivery_signed_by=item.signedBy;
-      ev._sig_pending=true;
+      ev._sig_pending=!needsReview;
+      ev._sig_review=needsReview;
     }
-  });
+  };
+  loadQueue().forEach(item=>applyLocal(item,false));
+  loadReviewQueue().forEach(item=>applyLocal(item,true));
 }
 
 // ── DELIVERIES SCREEN ──
@@ -3161,15 +3999,16 @@ function delivCard(e){
   if(total>0)amount=owed>0
     ?`<div class="deliv-amount">Balance due <span class="owed">$${owed.toLocaleString()}</span></div>`
     :`<div class="deliv-amount">Paid in full ✓</div>`;
-  const invoice=e.invoice_url?`<a class="deliv-invoice-link" href="${esc(e.invoice_url)}" target="_blank" rel="noopener">📄 View invoice</a>`:'';
+  const invoiceUrl=safeHttpUrl(e.invoice_url);
+  const invoice=invoiceUrl?`<a class="deliv-invoice-link" href="${esc(invoiceUrl)}" target="_blank" rel="noopener noreferrer">📄 View invoice</a>`:'';
   let action;
   if(done){
     const when=new Date(e.delivery_signed_at);
     const wt=isNaN(when.getTime())?'':when.toLocaleDateString('en-US',{month:'short',day:'numeric'})+' '+when.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-    const chip=e._sig_pending?'<span class="pending">☁️ saving…</span>':'<span class="synced">✓ saved</span>';
+    const chip=e._sig_review?'<span class="pending">⚠️ needs review</span>':e._sig_pending?'<span class="pending">☁️ saving…</span>':'<span class="synced">✓ saved</span>';
     action=`<div class="deliv-done-badge"><span>✓ Delivered${e.delivery_signed_by?' · signed by '+esc(e.delivery_signed_by):''}${wt?' · '+wt:''}</span>${chip}</div>`;
   } else {
-    action=`<button class="deliv-confirm" onclick="openDeliveryConfirm('${e.id}')">✍️ Confirm Delivery</button>`;
+    action=`<button class="deliv-confirm" onclick="openDeliveryConfirm('${safeEventId(e.id)}')">✍️ Confirm Delivery</button>`;
   }
   return `<div class="deliv-card${done?' done':''}">
     <div class="deliv-card-top"><div class="deliv-name">${esc(e.name||'Unnamed')}</div><span class="deliv-when ${w.cls}">${w.txt}</span></div>
@@ -3199,7 +4038,7 @@ function renderDeliveries(){
 
   let html=`<div class="deliv-head"><h2>🚚 Deliveries</h2><span class="deliv-sync-chip" id="deliv-sync-chip"></span></div>`;
   if(!deliveries.length){
-    html+=`<div class="deliv-empty"><span class="big">🌴</span>No deliveries scheduled${currentMarket?' for '+currentMarket.toUpperCase():''} yet.<br>Booked events with a delivery date show up here.</div>`;
+    html+=`<div class="deliv-empty"><span class="big">🌴</span>No deliveries scheduled${currentMarket?' for '+esc(currentMarket.toUpperCase()):''} yet.<br>Booked events with a delivery date show up here.</div>`;
     wrap.innerHTML=html;updateDelivSyncChip();return;
   }
   if(todayGroup.length)html+=`<div class="deliv-group-label">Today &amp; overdue</div>`+todayGroup.map(delivCard).join('');
@@ -3213,9 +4052,11 @@ function updateDelivSyncChip(){
   const chip=document.getElementById('deliv-sync-chip');
   if(!chip)return;
   const n=loadQueue().length;
+  const review=loadReviewQueue().length;
   if(n>0){chip.textContent='☁️ '+n+' saving…';chip.className='deliv-sync-chip show';}
+  else if(review>0){chip.textContent='⚠️ '+review+' need'+(review===1?'s':'')+' review';chip.className='deliv-sync-chip show';}
   else{chip.textContent='✓ All synced';chip.className='deliv-sync-chip show allsynced';
-    setTimeout(()=>{const c=document.getElementById('deliv-sync-chip');if(c&&!loadQueue().length)c.className='deliv-sync-chip';},2500);}
+    setTimeout(()=>{const c=document.getElementById('deliv-sync-chip');if(c&&!loadQueue().length&&!loadReviewQueue().length)c.className='deliv-sync-chip';},2500);}
 }
 
 // ── SIGNATURE CONFIRM SHEET ──
@@ -3237,7 +4078,8 @@ function openDeliveryConfirm(id){
   if(dateTxt)rows.push(`<div class="sig-detail-row"><span class="lbl">Delivery</span><span class="val">${esc(dateTxt)}${e.delivery_time?' · '+esc(e.delivery_time):''}</span></div>`);
   if(e.coconuts)rows.push(`<div class="sig-detail-row"><span class="lbl">Coconuts</span><span class="val">${esc(e.coconuts)}</span></div>`);
   if(total>0)rows.push(`<div class="sig-detail-row amt"><span class="lbl">${owed>0?'Balance due':'Total (paid)'}</span><span class="val">$${(owed>0?owed:total).toLocaleString()}</span></div>`);
-  const invoiceLink=e.invoice_url?`<a class="sig-invoice-link" href="${esc(e.invoice_url)}" target="_blank" rel="noopener">📄 View invoice</a>`:'';
+  const invoiceUrl=safeHttpUrl(e.invoice_url);
+  const invoiceLink=invoiceUrl?`<a class="sig-invoice-link" href="${esc(invoiceUrl)}" target="_blank" rel="noopener noreferrer">📄 View invoice</a>`:'';
 
   const ov=document.createElement('div');
   ov.className='sig-overlay';ov.id='sig-overlay';
@@ -3250,7 +4092,7 @@ function openDeliveryConfirm(id){
     <div class="sig-pad-wrap"><canvas class="sig-canvas" id="sig-canvas"></canvas><div class="sig-baseline"></div><div class="sig-hint">✍️ Sign here with your finger</div></div>
     <div class="sig-actions">
       <button type="button" class="sig-cancel-btn" onclick="closeDeliveryConfirm()">Cancel</button>
-      <button type="button" class="sig-confirm-btn" id="sig-confirm-btn" disabled onclick="confirmDelivery('${e.id}')">Confirm delivery ✓</button>
+      <button type="button" class="sig-confirm-btn" id="sig-confirm-btn" disabled onclick="confirmDelivery('${safeEventId(e.id)}')">Confirm delivery ✓</button>
     </div>
   </div>`;
   document.body.appendChild(ov);
@@ -3312,21 +4154,25 @@ function initSigPad(canvas){
 }
 
 function confirmDelivery(id){
+  if(!currentUserId||!currentUserEmail||!sbSession?.access_token){alert('Sign in again before confirming this delivery.');return;}
   const e=events.find(x=>x.id===id);
   if(!e){closeDeliveryConfirm();return;}
   if(!_sig||_sig.isEmpty()){alert('Please have the customer sign first.');return;}
   const signedBy=((document.getElementById('sig-name')||{}).value||'').trim()||e.name||'Customer';
   const signedAt=new Date().toISOString();
   const dataUrl=_sig.png();
-  // 1) Save on the device FIRST. This is what lets it work with no internet.
+  let deliveryRequestId;
+  try{deliveryRequestId=createDeliveryRequestId();}
+  catch(_){alert('This browser could not create a secure delivery request. Reload and try again.');return;}
+  // 1) Queue on the device FIRST. Do not show success unless this durable save works.
+  const q=loadQueue();
+  q.push({localKey:deliveryRequestId,deliveryRequestId,orderId:id,signedBy,signedAt,dataUrl});
+  if(!saveQueue(q)){alert('The signature could not be saved on this device. Free some storage and try again.');return;}
+  // 2) Reflect the queued confirmation in the local delivery list.
   e.delivery_signed_at=signedAt;
   e.delivery_signed_by=signedBy;
   e._sig_pending=true;
   saveEventsLocalOnly();
-  // 2) Queue it for the cloud (the queue holds the signature image until it lands).
-  const q=loadQueue();
-  q.push({localKey:id+'|'+signedAt,orderId:id,signedBy,signedAt,dataUrl});
-  saveQueue(q);
   // 3) From the employee's point of view: instantly done.
   closeDeliveryConfirm();
   showSigToast('✓ Delivery confirmed — '+(e.name||'customer'));
@@ -3339,6 +4185,13 @@ function confirmDelivery(id){
 let _delivSyncing=false;
 async function syncPendingDeliveries(){
   if(_delivSyncing)return;
+  if(!currentUserId||!currentUserEmail||!sbSession?.access_token)return;
+  const sessionGeneration=dashboardSessionGeneration;
+  const sessionUserId=currentUserId;
+  const sessionEmail=currentUserEmail;
+  const queueKey=pendingQueueKey();
+  const sessionIsCurrent=()=>sessionGeneration===dashboardSessionGeneration&&sessionUserId===currentUserId&&sessionEmail===currentUserEmail&&queueKey===pendingQueueKey();
+  if(!queueKey)return;
   let q=loadQueue();
   updateDelivSyncChip();
   if(!q.length)return;
@@ -3347,23 +4200,36 @@ async function syncPendingDeliveries(){
   try{
     for(const item of [...q]){
       try{
-        if(!UUID_RE.test(item.orderId))continue; // can't target an unsynced order yet
-        // a) store the signature image + who/when in the delivery_signatures table
-        const sigRow={order_id:item.orderId,signed_by:item.signedBy||null,signed_at:item.signedAt,signature_data_url:item.dataUrl,signed_via:currentUserEmail||'field-app'};
-        const r1=await fetch(SUPABASE_URL+'/rest/v1/delivery_signatures',{
+        if(!sessionIsCurrent())return;
+        if(!UUID_RE.test(item.deliveryRequestId)||!UUID_RE.test(item.orderId))continue; // can't target an invalid request or unsynced order
+        const resp=await supabaseFetch('rpc/hc_confirm_order_delivery_v2',{
           method:'POST',
-          headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'return=minimal'},
-          body:JSON.stringify(sigRow)
+          body:JSON.stringify({
+            p_delivery_request_id:item.deliveryRequestId,
+            p_order_id:item.orderId,
+            p_signed_at:item.signedAt,
+            p_signed_by:item.signedBy||null,
+            p_signature_data_url:item.dataUrl,
+            p_signed_via:'dashboard'
+          })
         });
-        if(!r1.ok)throw new Error('signature save HTTP '+r1.status);
-        // b) stamp the order itself as delivered
-        const patch={delivery_signed_at:item.signedAt,delivery_signed_by:item.signedBy||null};
-        const r2=await fetch(SUPABASE_URL+'/rest/v1/orders?id=eq.'+item.orderId,{
-          method:'PATCH',
-          headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'return=minimal'},
-          body:JSON.stringify(patch)
-        });
-        if(!r2.ok)throw new Error('order update HTTP '+r2.status);
+        if(!sessionIsCurrent())return;
+        const responseIdentity=captureSessionIdentity();
+        const responseBody=await resp.json().catch(()=>null);
+        requireCurrentSessionIdentity(responseIdentity);
+        if(!sessionIsCurrent())return;
+        if(!resp.ok||responseBody!==true){
+          const permanent=[400,403,409,422].includes(resp.status)||(resp.ok&&responseBody!==true);
+          if(permanent&&quarantineDeliveryItem(item,resp.status||'contract')){
+            q=q.filter(x=>x.localKey!==item.localKey);
+            saveQueue(q);
+            const rejectedEvent=events.find(x=>x.id===item.orderId);
+            if(rejectedEvent){rejectedEvent._sig_pending=false;rejectedEvent._sig_review=true;}
+            saveEventsLocalOnly();
+            continue;
+          }
+          throw new Error('delivery confirmation HTTP '+resp.status);
+        }
         // success → remove from queue + clear the "saving" flag
         q=q.filter(x=>x.localKey!==item.localKey);
         saveQueue(q);
@@ -3377,8 +4243,10 @@ async function syncPendingDeliveries(){
     }
   }finally{
     _delivSyncing=false;
-    updateDelivSyncChip();
-    if(currentView==='deliv')renderDeliveries();
+    if(sessionIsCurrent()){
+      updateDelivSyncChip();
+      if(currentView==='deliv')renderDeliveries();
+    }
   }
 }
 

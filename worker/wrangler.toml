@@ -10,16 +10,34 @@ crons = [
 ]
 
 # Secrets (set via `wrangler secret put <NAME>`):
+# SAFE WEBHOOK ROLLOUT: apply migrations 024 and 027 first. Then configure the
+# droplet's TELEGRAM_BOT_TOKEN and current outbox key, restart and verify the new
+# pushdrain, and only then deploy this Worker and enable provider delivery.
+# The new drainer requires migration 027 columns. The old drainer cannot read
+# encrypted webhook_telegram rows.
 # ANTHROPIC_API_KEY - Claude API key for natural language processing
 # SUPABASE_URL - https://omdcfphbwuwsrffdszlg.supabase.co
 # SUPABASE_SERVICE_KEY - service_role key (bypasses RLS, set via wrangler secret put)
 # TG_BOT_TOKEN - Telegram bot token from @BotFather
 # ALLOWED_CHAT_IDS - Comma-separated Telegram chat IDs allowed to use the bot
+# FORMSPREE_WEBHOOK_SIGNING_SECRET - Required signing_secret from the
+#   Formspree webhook settings. The Worker rejects Formspree requests without it.
+# QUO_WEBHOOK_SIGNING_KEY - Required base64 signing key from Quo's
+#   "Reveal signing secret" action. The Worker rejects Quo requests without it.
+# MS_GRAPH_CLIENT_STATE - Required secret value also supplied when the Microsoft
+#   Graph subscription is created. Every notification must contain this value.
+# MS_GRAPH_ALLOWED_SUBSCRIPTION_IDS - Optional comma-separated subscription IDs.
+# MS_GRAPH_ALLOWED_TENANT_IDS - Optional comma-separated Microsoft tenant IDs.
+# WEBHOOK_OUTBOX_ID_KEY - Required base64-encoded 32-byte HMAC key. Keep this
+#   stable across encryption-key rotation because it creates durable queue IDs.
+# WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT - Required `<version>:<base64>` value,
+#   where the decoded key is exactly 32 bytes. The Worker encrypts new rows with
+#   this version. pushdrain must have the same current key before Worker rollout.
+# WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS - Optional pushdrain-only value in the
+#   same format. Keep it during rotation until every old queue row is finished.
 # TG_WEBHOOK_SECRET - REQUIRED (2026-07-25 security review). Any long
-#   random string. Without it the worker verifies nothing, so a stranger
-#   who knows this worker's URL and the allowed chat id could forge a
-#   button tap and bury a real lead (it cannot reach QuickBooks - Jarvis
-#   still needs Sidd's typed yes twice). Once set, the worker requires
+#   random string. The root webhook now returns 503 before parsing when this
+#   secret is missing. Once set, the worker requires
 #   Telegram's X-Telegram-Bot-Api-Secret-Token header on every delivery
 #   (chat messages AND button taps), so IMMEDIATELY after the deploy
 #   register it with Telegram, header not query string:

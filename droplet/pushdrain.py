@@ -40,12 +40,22 @@ RUN (systemd): installed as pushdrain.service (same conventions as
 outlook-poller.service). Manual test run:
     sudo -u jarvis /opt/jarvis-invoice-bot/.venv/bin/python /opt/jarvis-invoice-bot/pushdrain.py
 
+SAFE ROLLOUT ORDER: apply migrations 024 and 027 first, configure the current
+outbox key and Telegram token on the droplet, install/restart this drainer,
+verify its startup log, then deploy the compatible Worker and enable providers.
+This version filters on columns created by 027 and must not run before 027.
+
 ENV (loaded from /opt/jarvis-invoice-bot/.env, then optionally
 overridden by /opt/jarvis-invoice-bot/.pushdrain.env if that exists):
     SUPABASE_URL, SUPABASE_SERVICE_KEY   (already in the Jarvis .env)
-    TELEGRAM_BOT_TOKEN                   (already there; fallback sender)
+    TELEGRAM_BOT_TOKEN                   (already there; Telegram sender only)
     TELEGRAM_OWNER_ID                    (already there; daemon-health alerts,
                                           comma-separated)
+    WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT
+                      required `<version>:<base64-32-byte-key>` for provider
+                      alert rows
+    WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS
+                      optional prior version during a key rotation
     APNS_P8_PATH      path to the .p8 key file
                       (default /opt/jarvis-invoice-bot/apns-authkey.p8)
     APNS_KEY_ID       10-char key id from the .p8 filename
@@ -56,8 +66,10 @@ overridden by /opt/jarvis-invoice-bot/.pushdrain.env if that exists):
 DEPS: requests, python-dotenv, cryptography (all in requirements.txt),
 plus the system curl binary (HTTP/2 capable, stock on this droplet).
 Without the three APNS_* vars the daemon still runs in
-Telegram-fallback-only mode: alert rows skip straight to their
-telegram_text, Live Activity rows just close. Restart after adding them.
+Telegram-fallback-only mode: alert rows skip straight to Telegram. Legacy
+rows carry plaintext fallback fields; provider-webhook rows carry one
+AES-GCM-encrypted destination and message. Live Activity rows just close.
+Restart after adding the APNs settings.
 """
 
 import base64
@@ -78,9 +90,11 @@ load_dotenv(os.path.join(_HERE, ".env"), override=True)
 load_dotenv(os.path.join(_HERE, ".pushdrain.env"), override=True)  # optional; missing file is a no-op
 
 import requests  # noqa: E402  (kept after load_dotenv to match house import order)
+from cryptography.exceptions import InvalidTag  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature  # noqa: E402
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,6 +106,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_OWNER_ID = os.environ.get("TELEGRAM_OWNER_ID", "").strip()
+WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT = os.environ.get(
+    "WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT", "").strip()
+WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS = os.environ.get(
+    "WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS", "").strip()
 APNS_P8_PATH = os.environ.get("APNS_P8_PATH", os.path.join(_HERE, "apns-authkey.p8"))
 APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "").strip()
 APPLE_TEAM_ID = os.environ.get("APPLE_TEAM_ID", "").strip()
@@ -557,6 +575,174 @@ def _release_live_activity_end(row, token) -> bool:
                            "end_queue_id": None}))
 
 
+class _TerminalWebhookOutboxError(ValueError):
+    """The encrypted row cannot become deliverable by retrying it."""
+
+
+class _RetryableWebhookOutboxError(RuntimeError):
+    """Delivery can recover after the droplet configuration is corrected."""
+
+
+_WEBHOOK_CONFIG_WARNING_AT = 0.0
+
+
+def _warn_webhook_outbox_configuration(reason):
+    """Rate-limit one generic operator warning without exposing key material."""
+    global _WEBHOOK_CONFIG_WARNING_AT
+    now = time.time()
+    if now - _WEBHOOK_CONFIG_WARNING_AT < _ALERT_COOLDOWN_SECONDS:
+        return
+    _WEBHOOK_CONFIG_WARNING_AT = now
+    safe_reason = str(reason or "provider alert delivery is not configured")[:160]
+    log.error("webhook Telegram outbox configuration problem: %s", safe_reason)
+    _alert_owner(
+        "webhook_outbox_config",
+        "pushdrain: provider alerts are waiting because " + safe_reason
+        + ". Repair the droplet Telegram/outbox settings and restart pushdrain. "
+        + "Queued rows will retry automatically.",
+    )
+
+
+def _versioned_outbox_keys():
+    keys = {}
+    for label, configured in (
+            ("current", WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT),
+            ("previous", WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS)):
+        if not configured:
+            continue
+        try:
+            version, encoded = configured.split(":", 1)
+            if (not version or len(version) > 32
+                    or any(not (ch.isascii()
+                                and (ch.isalnum() or ch in "._-"))
+                           for ch in version)):
+                raise ValueError("invalid version")
+            key = base64.b64decode(encoded, validate=True)
+            if len(key) != 32 or version in keys:
+                raise ValueError("invalid or duplicate key")
+            keys[version] = key
+        except (ValueError, TypeError) as exc:
+            raise _RetryableWebhookOutboxError(
+                "invalid outbox key configuration") from exc
+    return keys
+
+
+def _webhook_outbox_configuration_error():
+    """Return a generic startup problem, or None when new rows are deliverable."""
+    if not TELEGRAM_BOT_TOKEN:
+        return "the Telegram bot token is missing"
+    if not WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT:
+        return "the current webhook outbox encryption key is missing"
+    try:
+        keys = _versioned_outbox_keys()
+        current_version = WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT.split(":", 1)[0]
+        if current_version not in keys:
+            return "the current webhook outbox encryption key is invalid"
+    except _RetryableWebhookOutboxError:
+        return "the webhook outbox encryption key configuration is invalid"
+    return None
+
+
+def _decrypt_telegram_outbox(row):
+    """Decrypt one v2 row with its declared current or previous key."""
+    payload = row.get("payload") or {}
+    if not isinstance(payload, dict):
+        raise _TerminalWebhookOutboxError("invalid queue payload")
+    outbox = payload.get("telegram_outbox")
+    if not isinstance(outbox, dict):
+        raise _TerminalWebhookOutboxError("missing encrypted payload")
+    try:
+        if outbox.get("version") != 2:
+            raise ValueError("unsupported version")
+        key_version = str(outbox.get("key_version") or "")
+        key = _versioned_outbox_keys().get(key_version)
+        if key is None:
+            # A planned rotation can leave an older row waiting for the
+            # previous key. Keep it retryable so restoring that key delivers
+            # the alert instead of requiring a manual dead-letter rescue.
+            raise _RetryableWebhookOutboxError(
+                "configured keys do not include this row version")
+        nonce = base64.b64decode(str(outbox.get("nonce") or ""), validate=True)
+        ciphertext = base64.b64decode(
+            str(outbox.get("ciphertext") or ""), validate=True)
+        if len(nonce) != 12 or len(ciphertext) < 17:
+            raise ValueError("invalid encrypted fields")
+        aad = ("hc-telegram-outbox-v2\0" + key_version + "\0"
+               + str(row.get("id") or "")).encode("utf-8")
+        try:
+            plaintext = AESGCM(key).decrypt(nonce, ciphertext, aad)
+        except InvalidTag as exc:
+            # This can mean either a corrupt row or a same-version key was
+            # configured with the wrong bytes. Retrying is safer than losing a
+            # real provider alert while an operator repairs the key.
+            raise _RetryableWebhookOutboxError(
+                "configured key cannot decrypt this row") from exc
+        decoded = json.loads(plaintext.decode("utf-8"))
+        if not isinstance(decoded, dict):
+            raise ValueError("decrypted value is not an object")
+        if set(decoded) != {"chat_id", "text"}:
+            raise ValueError("unexpected plaintext fields")
+        chat_id = str(decoded.get("chat_id") or "").strip()
+        text = decoded.get("text")
+        if not chat_id or not isinstance(text, str) or not text:
+            raise ValueError("missing destination or text")
+        if len(chat_id) > 128 or len(text) > 4096:
+            raise ValueError("destination or text is too long")
+        return {
+            "chat_id": chat_id,
+            "text": text,
+        }
+    except _RetryableWebhookOutboxError as exc:
+        log.error("telegram outbox key unavailable for row %s: %s",
+                  row.get("id"), str(exc))
+        raise
+    except Exception as exc:
+        log.error("telegram outbox decrypt failed for row %s: %s",
+                  row.get("id"), type(exc).__name__)
+        if isinstance(exc, _TerminalWebhookOutboxError):
+            raise
+        raise _TerminalWebhookOutboxError(
+            "corrupt encrypted payload") from exc
+
+
+def _send_webhook_telegram(row):
+    """Return `sent`, `retryable`, or `terminal` plus a generic reason."""
+    try:
+        delivery = _decrypt_telegram_outbox(row)
+    except _RetryableWebhookOutboxError:
+        return ("retryable", "webhook outbox key unavailable")
+    except _TerminalWebhookOutboxError:
+        return ("terminal", "corrupt or undecryptable payload")
+    if not TELEGRAM_BOT_TOKEN:
+        return ("retryable", "telegram bot configuration unavailable")
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": delivery["chat_id"], "text": delivery["text"]},
+            timeout=10,
+        )
+    except Exception:
+        # Telegram may have accepted the request before the response was lost.
+        # It offers no idempotency key, so at-least-once retry can duplicate
+        # only this one destination in that narrow ambiguous-response window.
+        log.exception("telegram outbox send ambiguous for row %s", row.get("id"))
+        return ("retryable", "telegram response unavailable")
+
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if bool(getattr(resp, "ok", False)):
+        return ("sent", None)
+    log.error("telegram outbox row %s -> %s", row.get("id"), status)
+    if status in (401, 404):
+        # A missing, mistyped, or rotated bot token is repairable. Do not
+        # permanently discard queued provider alerts during that outage.
+        return ("retryable", "telegram bot configuration unavailable")
+    if status in (408, 409, 429) or status >= 500 or status <= 0:
+        return ("retryable", "telegram temporarily unavailable")
+    if 400 <= status < 500:
+        return ("terminal", "telegram permanently rejected delivery")
+    return ("retryable", "telegram unexpected response")
+
+
 def _send_fallback(row) -> bool:
     """The Telegram half the worker used to do inline. True when at
     least one chat accepted the message. Rows without telegram_text or
@@ -818,11 +1004,75 @@ def _park_for_retry(row, error):
     )
 
 
+def _webhook_outbox_backoff_seconds(attempts):
+    """Short independent schedule: 20s, 40s, 80s, 160s, then 5m."""
+    completed_attempts = max(1, int(attempts or 1))
+    return min(300, 20 * (2 ** min(4, completed_attempts - 1)))
+
+
+def _park_webhook_outbox_retry(row, reason):
+    new_attempts = int(row.get("attempts") or 0) + 1
+    retry_at = datetime.now(timezone.utc) + timedelta(
+        seconds=_webhook_outbox_backoff_seconds(new_attempts))
+    return _persist_queue_patch(
+        row,
+        {
+            "claimed_at": None,
+            "attempts": new_attempts,
+            "next_attempt_at": _iso(retry_at),
+            "last_error": str(reason or "telegram retryable failure")[:300],
+        },
+    )
+
+
+def _dead_letter_webhook_outbox(row, reason):
+    now = _now_iso()
+    safe_reason = str(reason or "terminal webhook outbox failure")[:300]
+    saved = _persist_queue_patch(
+        row,
+        {
+            "done_at": now,
+            "dead_lettered_at": now,
+            "dead_letter_reason": safe_reason,
+            "attempts": int(row.get("attempts") or 0) + 1,
+            "last_error": safe_reason,
+        },
+    )
+    if saved:
+        _alert_owner(
+            "webhook_outbox_dead_letter",
+            "pushdrain: provider alert queue row " + str(row.get("id"))
+            + " moved to dead letter. Reason: " + safe_reason
+            + ". Check Supabase push_queue and pushdrain logs.",
+        )
+    return saved
+
+
+def _process_webhook_outbox(row):
+    outcome, reason = _send_webhook_telegram(row)
+    if outcome == "sent":
+        _finish(row, None)
+        return (0, True)
+    if outcome == "terminal":
+        _dead_letter_webhook_outbox(row, reason)
+        return (0, False)
+    if reason in (
+            "webhook outbox key unavailable",
+            "telegram bot configuration unavailable"):
+        _warn_webhook_outbox_configuration(reason)
+    _park_webhook_outbox_retry(row, reason)
+    return (0, False)
+
+
 def _process_row(row):
     """Returns (delivered_count, fell_back_bool) for the heartbeat."""
     global _LA_BLOCKED_UNTIL
     kind = row.get("kind") or "alert"
     payload = row.get("payload") or {}
+    if (row.get("outbox_type") == "webhook_telegram"
+            or (isinstance(payload, dict)
+                and payload.get("telegram_outbox") is not None)):
+        return _process_webhook_outbox(row)
     if not isinstance(payload, dict):
         _finish(row, "bad payload (not an object)")
         return (0, False)
@@ -1074,8 +1324,12 @@ def _process_row(row):
 def _expire_claimed_row(row) -> bool:
     """Expire one row whose exact queue lease was just claimed. Returns whether
     Telegram fallback was accepted."""
+    payload = row.get("payload") or {}
+    if (row.get("outbox_type") == "webhook_telegram"
+            or (isinstance(payload, dict)
+                and payload.get("telegram_outbox") is not None)):
+        return _process_webhook_outbox(row)[1]
     if row.get("kind") == "la_start":
-        payload = row.get("payload") or {}
         tokens = payload.get("tokens") or []
         token = tokens[0] if isinstance(tokens, list) and len(tokens) == 1 else None
         if not token or not _live_activity_start_identity(row, token):
@@ -1102,7 +1356,6 @@ def _expire_claimed_row(row) -> bool:
             _finish(row, "expired before Live Activity START delivery")
         return False
     if row.get("kind") == "la_end":
-        payload = row.get("payload") or {}
         tokens = payload.get("tokens") or []
         token = tokens[0] if isinstance(tokens, list) and len(tokens) == 1 else None
         if token and _live_activity_end_identity(row, token):
@@ -1136,12 +1389,54 @@ def work_once():
     depth = _queue_depth()
     expired_n = claimed_n = delivered_n = fellback_n = 0
     stale_iso = _iso(now - timedelta(minutes=STALE_CLAIM_MINUTES))
+    now_iso = _iso(now)
+
+    # Provider alerts are durable, non-perishable rows. Their independent due
+    # time avoids the legacy five-attempt stop and 15-minute expiry blackout.
+    webhook_ids = _sb_select("push_queue", {
+        "select": "id",
+        "outbox_type": "eq.webhook_telegram",
+        "done_at": "is.null",
+        "dead_lettered_at": "is.null",
+        "next_attempt_at": "lte." + now_iso,
+        "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")",
+        "order": "next_attempt_at.asc,created_at.asc",
+        "limit": str(BATCH_LIMIT),
+    })
+    for candidate in (webhook_ids or []):
+        claim_stamp = _now_iso()
+        rows = _sb_patch(
+            "push_queue",
+            {
+                "id": "eq." + str(candidate["id"]),
+                "outbox_type": "eq.webhook_telegram",
+                "done_at": "is.null",
+                "dead_lettered_at": "is.null",
+                "next_attempt_at": "lte." + now_iso,
+                "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")",
+            },
+            {"claimed_at": claim_stamp},
+            want_rows=True,
+        )
+        for row in (rows or []):
+            claimed_n += 1
+            try:
+                _delivered, sent = _process_webhook_outbox(row)
+                if sent:
+                    fellback_n += 1
+            except Exception:
+                log.exception("webhook outbox row %s crashed", row.get("id"))
+                try:
+                    _park_webhook_outbox_retry(row, "drainer exception")
+                except Exception:
+                    pass
 
     # 1) perishable sweep: select IDs, then compare-and-set a fresh claim before
     # touching them. This prevents one drainer from expiring/falling back a row
     # while another drainer is actively sending it.
     old_ids = _sb_select("push_queue", {
         "select": "id",
+        "outbox_type": "eq.push",
         "done_at": "is.null",
         "created_at": "lt." + _iso(now - timedelta(minutes=EXPIRE_MINUTES)),
         "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")",
@@ -1153,6 +1448,7 @@ def work_once():
         old_rows = _sb_patch(
             "push_queue",
             {"id": "eq." + str(candidate["id"]),
+             "outbox_type": "eq.push",
              "done_at": "is.null",
              "created_at": "lt." + _iso(now - timedelta(minutes=EXPIRE_MINUTES)),
              "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")"},
@@ -1173,6 +1469,7 @@ def work_once():
     # claim-PATCH discipline the worker uses on shifts.
     ids = _sb_select("push_queue", {
         "select": "id",
+        "outbox_type": "eq.push",
         "done_at": "is.null",
         "attempts": "lt." + str(MAX_ATTEMPTS),
         "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")",
@@ -1195,6 +1492,7 @@ def work_once():
                 rows = _sb_patch(
                     "push_queue",
                     {"id": "eq." + str(candidate["id"]),
+                     "outbox_type": "eq.push",
                      "done_at": "is.null",
                      "attempts": "lt." + str(MAX_ATTEMPTS),
                      "or": "(claimed_at.is.null,claimed_at.lt." + stale_iso + ")"},
@@ -1238,6 +1536,11 @@ def main():
     if not _APNS_CONFIGURED:
         log.warning("APNs not fully configured (APNS_P8_PATH / APNS_KEY_ID / APPLE_TEAM_ID); "
                     "running in Telegram-fallback-only mode")
+    outbox_problem = _webhook_outbox_configuration_error()
+    if outbox_problem:
+        # Keep the daemon alive for legacy APNs work. Encrypted provider rows
+        # remain pending on their own backoff until this config is repaired.
+        _warn_webhook_outbox_configuration(outbox_problem)
     log.info("pushdrain starting: interval=%ss apns=%s queue=%s",
              INTERVAL_SECONDS, "on" if _APNS_CONFIGURED else "OFF",
              SUPABASE_URL + "/rest/v1/push_queue")

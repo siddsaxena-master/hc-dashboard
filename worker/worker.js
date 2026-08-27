@@ -5,6 +5,28 @@
 const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
 const TG_API = 'https://api.telegram.org/bot';
 
+// Dashboard AI routes are paid, owner-only operations. The browser supplies a
+// Supabase access token, and this Worker verifies that token against the roster
+// before it sends anything to Anthropic.
+const DASHBOARD_ORIGIN = 'https://siddsaxena-master.github.io';
+const DASHBOARD_AI_PATHS = new Set(['/parse-batch', '/parse-file']);
+const DASHBOARD_BODY_MAX_BYTES = 8 * 1024 * 1024;
+const DASHBOARD_SYSTEM_PROMPT_MAX_CHARS = 20000;
+const DASHBOARD_MESSAGE_MAX_COUNT = 20;
+const DASHBOARD_CONTENT_BLOCK_MAX_COUNT = 12;
+const DASHBOARD_TEXT_MAX_CHARS = 200000;
+const DASHBOARD_BASE64_MAX_CHARS = 7500000;
+const DASHBOARD_MAX_OUTPUT_TOKENS = 1600;
+const DASHBOARD_AI_RATE_LIMIT = 20;
+const DASHBOARD_AI_RATE_WINDOW_MS = 60 * 1000;
+const dashboardAiRateLimits = new Map();
+
+// Provider webhook bodies are intentionally much smaller than dashboard file
+// uploads. Reading them through a bounded stream prevents a forged request from
+// consuming unbounded Worker memory before authentication runs.
+const WEBHOOK_BODY_MAX_BYTES = 256 * 1024;
+const WEBHOOK_SIGNATURE_TOLERANCE_MS = 5 * 60 * 1000;
+
 // ── SYSTEM PROMPT FOR CLAUDE ──
 // Uses the dashboard's UI vocabulary; the storage layer translates to Supabase values.
 const SYSTEM_PROMPT = `You are Claudia, the Hamptons Coconuts dashboard assistant on Telegram. You manage events for a coconut catering business.
@@ -42,7 +64,8 @@ RULES:
 - When creating events, always set type:"event", stage:"lead", stamp_status:"Not ordered"
 - Use Telegram markdown in replies: *bold* for names, _italic_ for dates`;
 
-// CORS headers for dashboard proxy calls
+// Legacy non-credentialed responses use these headers. The paid dashboard AI
+// routes use the exact-origin headers created by dashboardCorsHeaders below.
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -73,16 +96,35 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') {
+      if (DASHBOARD_AI_PATHS.has(url.pathname)) {
+        return handleDashboardPreflight(request);
+      }
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // One-time OPTIONAL webhook hardening (adds Telegram's secret
-    // header to deliveries; the buttons work without it). Checked
-    // BEFORE the POST-only gate below so it also works from a browser
-    // address bar (a GET request). It requires
-    // ?secret=<TG_WEBHOOK_SECRET>, so it is safe to expose.
+    // One-time REQUIRED Telegram webhook registration. It is checked before
+    // the POST-only gate so an operator can call it with curl using GET, but
+    // authorization is accepted only in X-Setup-Secret. Never put the secret
+    // in a URL, browser history, or query string.
     if (url.pathname === '/setup-telegram-webhook') {
       return handleSetupTelegramWebhook(request, env, url);
+    }
+
+    // Microsoft Graph validates a notification URL by POSTing an opaque token.
+    // GET support allows the same exact echo to be checked manually in a browser.
+    if (url.pathname === '/webhooks/ms-graph' &&
+        (request.method === 'GET' || request.method === 'POST') &&
+        url.searchParams.has('validationToken')) {
+      return msGraphValidationResponse(url);
+    }
+
+    if (DASHBOARD_AI_PATHS.has(url.pathname) && request.method !== 'POST') {
+      return dashboardJsonResponse(
+        request,
+        { error: 'Method not allowed' },
+        405,
+        { 'Allow': 'POST, OPTIONS' },
+      );
     }
 
     if (request.method !== 'POST') {
@@ -90,8 +132,12 @@ export default {
     }
 
     // Dashboard proxy endpoints
-    if (url.pathname === '/parse-batch') return handleParseBatch(request, env);
-    if (url.pathname === '/parse-file') return handleParseFile(request, env);
+    if (url.pathname === '/parse-batch') {
+      return handleDashboardAiRequest(request, env, handleParseBatch);
+    }
+    if (url.pathname === '/parse-file') {
+      return handleDashboardAiRequest(request, env, handleParseFile);
+    }
 
     // Inbound webhooks (lead sources, phone events, etc.)
     if (url.pathname === '/webhooks/formspree') return handleFormspreeWebhook(request, env);
@@ -99,18 +145,22 @@ export default {
     if (url.pathname === '/webhooks/ms-graph') return handleMsGraphWebhook(request, env, url);
 
     try {
-      // Optional hardening (see /setup-telegram-webhook): if a webhook
-      // secret is configured, require the header Telegram echoes on
-      // every delivery. This gates BOTH plain chat messages and the
-      // intake-card button taps, because both arrive right here on the
-      // bot's one webhook. If no secret is configured, skip the check
-      // entirely, so deploying this worker before the secret exists
-      // changes nothing about today's behavior.
-      if (env.TG_WEBHOOK_SECRET) {
-        const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
-        if (got !== env.TG_WEBHOOK_SECRET) {
-          return new Response('unauthorized', { status: 401 });
-        }
+      // The root route is Telegram's webhook. Fail closed before JSON parsing
+      // or any downstream call when its required shared secret is absent.
+      const telegramWebhookSecret = String(env.TG_WEBHOOK_SECRET || '').trim();
+      if (!telegramWebhookSecret) {
+        console.error('Telegram webhook secret is not configured');
+        return new Response('unavailable', {
+          status: 503,
+          headers: { 'Cache-Control': 'no-store' },
+        });
+      }
+      const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+      if (!secureTextEquals(got, telegramWebhookSecret)) {
+        return new Response('unauthorized', {
+          status: 401,
+          headers: { 'Cache-Control': 'no-store' },
+        });
       }
 
       const update = await request.json();
@@ -503,7 +553,316 @@ async function callClaude(apiKey, userMessage, eventsContext, today) {
   }
 }
 
-// ── DASHBOARD PROXY HANDLERS (unchanged) ──
+// ── DASHBOARD PROXY HANDLERS ──
+
+class DashboardRequestError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function dashboardCorsHeaders(request) {
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Vary': 'Origin',
+  };
+  if (request.headers.get('Origin') === DASHBOARD_ORIGIN) {
+    headers['Access-Control-Allow-Origin'] = DASHBOARD_ORIGIN;
+  }
+  return headers;
+}
+
+function dashboardJsonResponse(request, obj, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { ...dashboardCorsHeaders(request), ...extraHeaders },
+  });
+}
+
+function handleDashboardPreflight(request) {
+  if (request.headers.get('Origin') !== DASHBOARD_ORIGIN) {
+    return dashboardJsonResponse(request, { error: 'Origin not allowed' }, 403);
+  }
+  return new Response(null, {
+    status: 204,
+    headers: {
+      ...dashboardCorsHeaders(request),
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      'Access-Control-Max-Age': '86400',
+    },
+  });
+}
+
+async function authenticateDashboardOwner(request, env) {
+  const authorization = request.headers.get('Authorization') || '';
+  const match = authorization.match(/^Bearer ([^\s]+)$/i);
+  if (!match || match[1].length > 8192) {
+    throw new DashboardRequestError(401, 'Authentication required');
+  }
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
+    console.error('dashboard AI auth is not configured');
+    throw new DashboardRequestError(503, 'Authentication service unavailable');
+  }
+
+  let response;
+  try {
+    response = await fetch(
+      env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/rpc/hc_claim_field_worker',
+      {
+        method: 'POST',
+        headers: {
+          'apikey': env.SUPABASE_SERVICE_KEY,
+          'Authorization': 'Bearer ' + match[1],
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      },
+    );
+  } catch (error) {
+    console.error('dashboard AI auth request failed:', error && error.message);
+    throw new DashboardRequestError(503, 'Authentication service unavailable');
+  }
+
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new DashboardRequestError(401, 'Authentication required');
+    }
+    console.error('dashboard AI auth returned status:', response.status);
+    throw new DashboardRequestError(503, 'Authentication service unavailable');
+  }
+
+  let rows;
+  try {
+    rows = await response.json();
+  } catch (error) {
+    console.error('dashboard AI auth returned invalid JSON');
+    throw new DashboardRequestError(503, 'Authentication service unavailable');
+  }
+  const profile = Array.isArray(rows) ? rows[0] : rows;
+  const email = String(profile && profile.email || '').trim().toLowerCase();
+  if (!email || profile.role !== 'owner') {
+    throw new DashboardRequestError(403, 'Owner access required');
+  }
+  return { email };
+}
+
+function consumeDashboardAiRateLimit(ownerEmail) {
+  const now = Date.now();
+  let bucket = dashboardAiRateLimits.get(ownerEmail);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + DASHBOARD_AI_RATE_WINDOW_MS };
+  }
+  if (bucket.count >= DASHBOARD_AI_RATE_LIMIT) {
+    return Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+  }
+  bucket.count++;
+  dashboardAiRateLimits.set(ownerEmail, bucket);
+
+  // Bound isolate memory even if many former owner identities appear over time.
+  if (dashboardAiRateLimits.size > 500) {
+    for (const [email, value] of dashboardAiRateLimits) {
+      if (now >= value.resetAt) dashboardAiRateLimits.delete(email);
+    }
+    if (dashboardAiRateLimits.size > 500) {
+      dashboardAiRateLimits.delete(dashboardAiRateLimits.keys().next().value);
+    }
+  }
+  return 0;
+}
+
+export function resetDashboardAiRateLimitsForTests() {
+  dashboardAiRateLimits.clear();
+}
+
+async function handleDashboardAiRequest(request, env, handler) {
+  try {
+    if (request.headers.get('Origin') !== DASHBOARD_ORIGIN) {
+      throw new DashboardRequestError(403, 'Origin not allowed');
+    }
+    const owner = await authenticateDashboardOwner(request, env);
+    const retryAfter = consumeDashboardAiRateLimit(owner.email);
+    if (retryAfter) {
+      return dashboardJsonResponse(
+        request,
+        { error: 'Too many AI requests. Try again shortly.' },
+        429,
+        { 'Retry-After': String(retryAfter) },
+      );
+    }
+    return await handler(request, env);
+  } catch (error) {
+    if (error instanceof DashboardRequestError) {
+      return dashboardJsonResponse(request, { error: error.message }, error.status);
+    }
+    console.error('dashboard AI request failed:', error && error.message);
+    return dashboardJsonResponse(request, { error: 'Request failed' }, 500);
+  }
+}
+
+async function readDashboardJson(request) {
+  const declaredLength = request.headers.get('Content-Length');
+  if (declaredLength && /^\d+$/.test(declaredLength) &&
+      Number(declaredLength) > DASHBOARD_BODY_MAX_BYTES) {
+    throw new DashboardRequestError(413, 'Request body is too large');
+  }
+  if (!request.body) {
+    throw new DashboardRequestError(400, 'JSON body required');
+  }
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let byteCount = 0;
+  let text = '';
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    byteCount += chunk.value.byteLength;
+    if (byteCount > DASHBOARD_BODY_MAX_BYTES) {
+      await reader.cancel();
+      throw new DashboardRequestError(413, 'Request body is too large');
+    }
+    text += decoder.decode(chunk.value, { stream: true });
+  }
+  text += decoder.decode();
+
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('body must be an object');
+    }
+    return parsed;
+  } catch (error) {
+    throw new DashboardRequestError(400, 'Invalid JSON body');
+  }
+}
+
+function validateSystemPrompt(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string' || value.length > DASHBOARD_SYSTEM_PROMPT_MAX_CHARS) {
+    throw new DashboardRequestError(400, 'Invalid system prompt');
+  }
+  return value;
+}
+
+function addTextLength(total, value) {
+  if (typeof value !== 'string') {
+    throw new DashboardRequestError(400, 'Invalid text content');
+  }
+  total.value += value.length;
+  if (total.value > DASHBOARD_TEXT_MAX_CHARS) {
+    throw new DashboardRequestError(400, 'Text content is too large');
+  }
+}
+
+function validateBatchMessages(messages) {
+  if (!Array.isArray(messages) || messages.length < 1 ||
+      messages.length > DASHBOARD_MESSAGE_MAX_COUNT) {
+    throw new DashboardRequestError(400, 'Invalid messages array');
+  }
+  const total = { value: 0 };
+  return messages.map((message) => {
+    if (!message || typeof message !== 'object' ||
+        !['user', 'assistant'].includes(message.role)) {
+      throw new DashboardRequestError(400, 'Invalid message');
+    }
+    if (typeof message.content === 'string') {
+      addTextLength(total, message.content);
+      return { role: message.role, content: message.content };
+    }
+    if (!Array.isArray(message.content) || message.content.length < 1 ||
+        message.content.length > DASHBOARD_CONTENT_BLOCK_MAX_COUNT) {
+      throw new DashboardRequestError(400, 'Invalid message content');
+    }
+    const content = message.content.map((block) => {
+      if (!block || block.type !== 'text') {
+        throw new DashboardRequestError(400, 'Batch messages accept text only');
+      }
+      addTextLength(total, block.text);
+      return { type: 'text', text: block.text };
+    });
+    return { role: message.role, content };
+  });
+}
+
+function validateFileContentBlocks(blocks) {
+  if (!Array.isArray(blocks) || blocks.length < 1 ||
+      blocks.length > DASHBOARD_CONTENT_BLOCK_MAX_COUNT) {
+    throw new DashboardRequestError(400, 'Invalid content blocks');
+  }
+  const total = { value: 0 };
+  return blocks.map((block) => {
+    if (!block || typeof block !== 'object') {
+      throw new DashboardRequestError(400, 'Invalid content block');
+    }
+    if (block.type === 'text') {
+      addTextLength(total, block.text);
+      return { type: 'text', text: block.text };
+    }
+    if (!['image', 'document'].includes(block.type) || !block.source ||
+        block.source.type !== 'base64' || typeof block.source.data !== 'string') {
+      throw new DashboardRequestError(400, 'Invalid attachment block');
+    }
+    const allowedMediaTypes = block.type === 'document'
+      ? ['application/pdf']
+      : ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    if (!allowedMediaTypes.includes(block.source.media_type) ||
+        block.source.data.length < 1 ||
+        block.source.data.length > DASHBOARD_BASE64_MAX_CHARS ||
+        !/^[A-Za-z0-9+/]*={0,2}$/.test(block.source.data)) {
+      throw new DashboardRequestError(400, 'Invalid attachment data');
+    }
+    return {
+      type: block.type,
+      source: {
+        type: 'base64',
+        media_type: block.source.media_type,
+        data: block.source.data,
+      },
+    };
+  });
+}
+
+function normalizeDashboardMaxTokens(value, fallback) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return Math.min(DASHBOARD_MAX_OUTPUT_TOKENS, Math.max(1, Math.floor(value)));
+}
+
+async function callDashboardClaude(request, env, body) {
+  let response;
+  try {
+    response = await fetch(CLAUDE_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    console.error('dashboard AI upstream request failed:', error && error.message);
+    throw new DashboardRequestError(502, 'AI service unavailable');
+  }
+  const raw = await response.text();
+  if (!response.ok) {
+    console.error('dashboard AI upstream returned status:', response.status);
+    throw new DashboardRequestError(502, 'AI service request failed');
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (error) {
+    throw new DashboardRequestError(502, 'AI service returned an invalid response');
+  }
+  const text = data.content?.find((block) => block.type === 'text')?.text || '';
+  return dashboardJsonResponse(request, { text });
+}
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -514,34 +873,20 @@ function jsonResponse(obj, status = 200) {
 
 async function handleParseBatch(request, env) {
   try {
-    const body = await request.json();
+    const body = await readDashboardJson(request);
     const { systemPrompt, messages, maxTokens } = body;
-    if (!messages || !Array.isArray(messages)) {
-      return jsonResponse({ error: 'Missing messages array' }, 400);
-    }
-    const resp = await fetch(CLAUDE_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: maxTokens || 1200,
-        system: systemPrompt || '',
-        messages,
-      }),
+    return await callDashboardClaude(request, env, {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: normalizeDashboardMaxTokens(maxTokens, 1200),
+      system: validateSystemPrompt(systemPrompt),
+      messages: validateBatchMessages(messages),
     });
-    const raw = await resp.text();
-    if (!resp.ok) {
-      return jsonResponse({ error: `Claude HTTP ${resp.status}: ${raw.slice(0, 200)}` }, 500);
-    }
-    const data = JSON.parse(raw);
-    const txt = data.content?.find(c => c.type === 'text')?.text || '';
-    return jsonResponse({ text: txt });
   } catch (e) {
-    return jsonResponse({ error: e.message }, 500);
+    if (e instanceof DashboardRequestError) {
+      return dashboardJsonResponse(request, { error: e.message }, e.status);
+    }
+    console.error('dashboard batch parse failed:', e && e.message);
+    return dashboardJsonResponse(request, { error: 'Request failed' }, 500);
   }
 }
 
@@ -585,9 +930,13 @@ async function runScheduled(event, env, alsoNotify = true) {
       // also fully wrapped inside, so they can never break intake or
       // summaries either.
       await runClockInAlertScan(env);
-      // Stillness watch rides the same tick, LAST, and is also fully
-      // wrapped inside, so it can never break the three scans above it.
+      // Stillness watch is the last field-ops scan and is fully wrapped.
       await runShiftStatusScan(env);
+      // Graph returns after durable enqueue. Classification and order creation
+      // run last and are bounded to two fresh leases, so slow provider work
+      // cannot delay the field-ops scans above.
+      try { await runWebhookIntakeScan(env, 2); }
+      catch (e) { console.error('runWebhookIntakeScan error:', e); }
     }
   } catch (e) {
     console.error('runScheduled error:', e);
@@ -1445,21 +1794,14 @@ async function handleIntakeCallback(cb, env) {
 // TG_WEBHOOK_SECRET, with the secret in a HEADER so it stays out of
 // browser history and Cloudflare logs:
 //   curl -H "X-Setup-Secret: <value>" https://<worker-url>/setup-telegram-webhook
-// Buttons themselves work without this call; the secret check does not.
 async function handleSetupTelegramWebhook(request, env, url) {
-  // Prefer the secret in a HEADER, not the query string: a URL with
-  // ?secret=... lands in Chrome history, in profile sync, and in
-  // Cloudflare's request logs (2026-07-25 security review). The query
-  // form still works so the route stays usable from a browser in a
-  // pinch, but the documented command uses the header.
-  const given = request.headers.get('X-Setup-Secret')
-    || url.searchParams.get('secret');
+  // URL secrets leak into browser history and request logs. Header only.
+  const given = request.headers.get('X-Setup-Secret');
   if (!env.TG_WEBHOOK_SECRET || given !== env.TG_WEBHOOK_SECRET) {
-    return new Response('unauthorized', { status: 401 });
-  }
-  if (!request.headers.get('X-Setup-Secret')) {
-    console.warn('setup-telegram-webhook: secret came in the query string; '
-      + 'prefer the X-Setup-Secret header (it stays out of logs and history)');
+    return new Response('unauthorized', {
+      status: 401,
+      headers: { 'Cache-Control': 'no-store' },
+    });
   }
   try {
     const resp = await fetch(`${TG_API}${env.TG_BOT_TOKEN}/setWebhook`, {
@@ -1491,6 +1833,832 @@ async function handleSetupTelegramWebhook(request, env, url) {
 
 // ── INBOUND WEBHOOK HANDLERS ──
 
+// Migration 024 owns a private durable receipt for each verified delivery. The
+// Worker never stores a raw payload, secret, or provider ID in that ledger.
+// One narrow external residual remains: Telegram has no idempotency key, so a
+// drainer retry after Telegram accepts but loses its response can repeat it.
+
+class WebhookRequestError extends Error {
+  constructor(status, publicMessage) {
+    super(publicMessage);
+    this.status = status;
+    this.publicMessage = publicMessage;
+  }
+}
+
+function webhookJsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+}
+
+function webhookFailureResponse(provider, error) {
+  if (error instanceof WebhookRequestError) {
+    return webhookJsonResponse(
+      { ok: false, error: error.publicMessage },
+      error.status,
+    );
+  }
+  console.error(provider + ' webhook failed:', error && error.message);
+  return webhookJsonResponse({ ok: false, error: 'Webhook failed' }, 500);
+}
+
+function msGraphValidationResponse(url) {
+  return new Response(url.searchParams.get('validationToken') || '', {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/plain',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+}
+
+async function readBoundedWebhookBody(request) {
+  const declaredLength = request.headers.get('Content-Length');
+  if (declaredLength && /^\d+$/.test(declaredLength) &&
+      Number(declaredLength) > WEBHOOK_BODY_MAX_BYTES) {
+    throw new WebhookRequestError(413, 'Payload too large');
+  }
+  if (!request.body) {
+    throw new WebhookRequestError(400, 'Invalid request');
+  }
+
+  const reader = request.body.getReader();
+  const chunks = [];
+  let byteCount = 0;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    byteCount += chunk.value.byteLength;
+    if (byteCount > WEBHOOK_BODY_MAX_BYTES) {
+      await reader.cancel();
+      throw new WebhookRequestError(413, 'Payload too large');
+    }
+    chunks.push(chunk.value);
+  }
+
+  const rawBytes = new Uint8Array(byteCount);
+  let offset = 0;
+  for (const chunk of chunks) {
+    rawBytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  let rawText;
+  try {
+    rawText = new TextDecoder('utf-8', { fatal: true }).decode(rawBytes);
+  } catch {
+    throw new WebhookRequestError(400, 'Invalid request');
+  }
+  return { rawBytes, rawText };
+}
+
+function parseWebhookJson(rawText) {
+  try {
+    const value = JSON.parse(rawText);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('JSON object required');
+    }
+    return value;
+  } catch {
+    throw new WebhookRequestError(400, 'Invalid request');
+  }
+}
+
+function requiredWebhookSecret(value, provider) {
+  if (typeof value !== 'string' || value.length < 1) {
+    console.error(provider + ' webhook authentication is not configured');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  return value;
+}
+
+function joinBytes(first, second) {
+  const joined = new Uint8Array(first.byteLength + second.byteLength);
+  joined.set(first, 0);
+  joined.set(second, first.byteLength);
+  return joined;
+}
+
+function hexToBytes(value) {
+  if (!/^[0-9a-f]{64}$/i.test(value || '')) return null;
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = Number.parseInt(value.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function base64ToBytes(value) {
+  if (typeof value !== 'string' || !value.length || value.length % 4 !== 0 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+    return null;
+  }
+  try {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+async function verifyHmacSha256(keyBytes, messageBytes, signatureBytes) {
+  if (!keyBytes || !signatureBytes || signatureBytes.byteLength !== 32) return false;
+  try {
+    const key = await crypto.subtle.importKey(
+      'raw',
+      keyBytes,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify'],
+    );
+    return await crypto.subtle.verify('HMAC', key, signatureBytes, messageBytes);
+  } catch {
+    return false;
+  }
+}
+
+function freshWebhookTimestamp(value) {
+  if (!/^\d{10,16}$/.test(value || '')) return false;
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric <= 0) return false;
+  const milliseconds = numeric >= 1e12 ? numeric : numeric * 1000;
+  return Math.abs(Date.now() - milliseconds) <= WEBHOOK_SIGNATURE_TOLERANCE_MS;
+}
+
+async function requireFormspreeSignature(request, secret, rawBytes) {
+  const header = request.headers.get('Formspree-Signature') || '';
+  let timestamp = null;
+  const signatures = [];
+  let malformed = false;
+  for (const field of header.split(',')) {
+    const separator = field.indexOf('=');
+    if (separator <= 0) {
+      malformed = true;
+      continue;
+    }
+    const name = field.slice(0, separator).trim();
+    const value = field.slice(separator + 1).trim();
+    if (name === 't' && timestamp === null && value) timestamp = value;
+    else if (name === 'v1') signatures.push(value);
+    else malformed = true;
+  }
+  if (malformed || !timestamp || !signatures.length ||
+      !freshWebhookTimestamp(timestamp)) {
+    throw new WebhookRequestError(401, 'Unauthorized');
+  }
+
+  const keyBytes = new TextEncoder().encode(secret);
+  const signedBytes = joinBytes(
+    new TextEncoder().encode(timestamp + '.'),
+    rawBytes,
+  );
+  for (const signature of signatures) {
+    if (await verifyHmacSha256(
+      keyBytes,
+      signedBytes,
+      hexToBytes(signature),
+    )) return;
+  }
+  throw new WebhookRequestError(401, 'Unauthorized');
+}
+
+async function requireQuoSignature(request, base64Secret, body) {
+  const keyBytes = base64ToBytes(base64Secret);
+  if (!keyBytes || !keyBytes.byteLength) {
+    console.error('Quo webhook signing key is not valid base64');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+
+  const header = request.headers.get('openphone-signature') || '';
+  for (const candidate of header.split(',')) {
+    const fields = candidate.trim().split(';');
+    if (fields.length !== 4 || fields[0] !== 'hmac' || fields[1] !== '1' ||
+        !freshWebhookTimestamp(fields[2])) continue;
+    const signedBytes = new TextEncoder().encode(
+      fields[2] + '.' + JSON.stringify(body),
+    );
+    if (await verifyHmacSha256(
+      keyBytes,
+      signedBytes,
+      base64ToBytes(fields[3]),
+    )) return;
+  }
+  throw new WebhookRequestError(401, 'Unauthorized');
+}
+
+function secureTextEquals(actual, expected) {
+  if (typeof actual !== 'string' || typeof expected !== 'string') return false;
+  const actualBytes = new TextEncoder().encode(actual);
+  const expectedBytes = new TextEncoder().encode(expected);
+  const length = Math.max(actualBytes.length, expectedBytes.length);
+  let difference = actualBytes.length ^ expectedBytes.length;
+  for (let i = 0; i < length; i++) {
+    difference |= (actualBytes[i] || 0) ^ (expectedBytes[i] || 0);
+  }
+  return difference === 0;
+}
+
+function optionalConfiguredAllowlist(value, providerLabel) {
+  if (value === undefined || value === null || value === '') return null;
+  const values = String(value).split(',').map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  if (!values.length) {
+    console.error(providerLabel + ' allowlist is empty');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  return new Set(values);
+}
+
+function requireMsGraphNotifications(body, env) {
+  const expectedClientState = requiredWebhookSecret(
+    env.MS_GRAPH_CLIENT_STATE,
+    'Microsoft Graph',
+  );
+  const notifications = Array.isArray(body.value) ? body.value : [body];
+  if (!notifications.length || notifications.length > 100) {
+    throw new WebhookRequestError(401, 'Unauthorized');
+  }
+
+  const subscriptionIds = optionalConfiguredAllowlist(
+    env.MS_GRAPH_ALLOWED_SUBSCRIPTION_IDS,
+    'Microsoft Graph subscription',
+  );
+  const tenantIds = optionalConfiguredAllowlist(
+    env.MS_GRAPH_ALLOWED_TENANT_IDS,
+    'Microsoft Graph tenant',
+  );
+
+  for (const notification of notifications) {
+    if (!notification || typeof notification !== 'object' ||
+        !secureTextEquals(notification.clientState, expectedClientState)) {
+      throw new WebhookRequestError(401, 'Unauthorized');
+    }
+    const subscriptionId = String(notification.subscriptionId || '').toLowerCase();
+    const tenantId = String(notification.tenantId || '').toLowerCase();
+    if ((subscriptionIds && !subscriptionIds.has(subscriptionId)) ||
+        (tenantIds && !tenantIds.has(tenantId))) {
+      throw new WebhookRequestError(401, 'Unauthorized');
+    }
+  }
+  return notifications;
+}
+
+function webhookProviderEventId(body, candidateNames) {
+  for (const name of candidateNames) {
+    const value = body && body[name];
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    const normalized = String(value).trim();
+    if (normalized && normalized.length <= 2048) return normalized;
+  }
+  return null;
+}
+
+function joinByteParts(parts) {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    joined.set(part, offset);
+    offset += part.byteLength;
+  }
+  return joined;
+}
+
+async function sha256Hex(bytes) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return [...digest]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function webhookEventKey(
+  provider,
+  rawBytes,
+  providerEventId = null,
+  fallbackItemIndex = null,
+) {
+  const encoder = new TextEncoder();
+  if (providerEventId) {
+    return sha256Hex(encoder.encode(
+      provider + '\0provider-id\0' + providerEventId,
+    ));
+  }
+  const suffix = fallbackItemIndex === null
+    ? new Uint8Array()
+    : encoder.encode('\0item-index\0' + fallbackItemIndex);
+  return sha256Hex(joinByteParts([
+    encoder.encode(provider + '\0verified-raw-body\0'),
+    rawBytes,
+    suffix,
+  ]));
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return '[' + value.map((item) => canonicalJson(item)).join(',') + ']';
+  }
+  return '{' + Object.keys(value).sort().map((key) =>
+    JSON.stringify(key) + ':' + canonicalJson(value[key])
+  ).join(',') + '}';
+}
+
+async function formspreeEventKey(body, rawBytes) {
+  const submission = body && body.submission;
+  const nestedId = webhookProviderEventId(
+    submission,
+    ['id', '_id', 'submission_id', 'submissionId'],
+  );
+  const topLevelId = webhookProviderEventId(
+    body,
+    ['id', '_id', 'submission_id', 'submissionId'],
+  );
+  if (nestedId || topLevelId) {
+    return webhookEventKey(
+      'formspree',
+      rawBytes,
+      nestedId || topLevelId,
+    );
+  }
+
+  // Formspree's production webhook shape is { form, keys, submission }.
+  // `keys` only repeats object ordering, so omit it. Sorting every object key
+  // makes the same signed submission stable across whitespace/key reordering.
+  if (submission && typeof submission === 'object' &&
+      !Array.isArray(submission)) {
+    return sha256Hex(new TextEncoder().encode(
+      'formspree\0canonical-submission-v1\0' + canonicalJson({
+        form: body.form ?? null,
+        submission,
+      }),
+    ));
+  }
+  return webhookEventKey('formspree', rawBytes);
+}
+
+async function graphNotificationEventKey(notification) {
+  const providerId = webhookProviderEventId(notification, ['id']) ||
+    webhookProviderEventId(notification && notification.resourceData, ['id']);
+  const encoder = new TextEncoder();
+  if (providerId) {
+    return sha256Hex(encoder.encode(
+      'ms_graph\0namespaced-provider-id-v2\0' + canonicalJson({
+        tenant_id: String(notification && notification.tenantId || '')
+          .trim().toLowerCase() || null,
+        subscription_id: String(notification && notification.subscriptionId || '')
+          .trim().toLowerCase() || null,
+        resource: String(notification && notification.resource || '').trim() || null,
+        change_type: String(notification && notification.changeType || '')
+          .trim().toLowerCase() || null,
+        provider_id: providerId,
+      }),
+    ));
+  }
+  return sha256Hex(encoder.encode(
+    'ms_graph\0canonical-notification-v1\0' + canonicalJson(notification),
+  ));
+}
+
+function sanitizedGraphNotification(notification) {
+  const serialized = JSON.stringify(notification, (key, value) =>
+    key === 'clientState' || key === 'validationTokens' ? undefined : value,
+  );
+  const encoded = new TextEncoder().encode(serialized);
+  if (encoded.byteLength > 65536) {
+    throw new WebhookRequestError(413, 'Payload too large');
+  }
+  return JSON.parse(serialized);
+}
+
+async function webhookFetch(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function callWebhookIntakeRpc(env, name, body, timeoutMs = 15000) {
+  let response;
+  try {
+    response = await webhookFetch(
+      env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/rpc/' + name,
+      {
+        method: 'POST',
+        headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify(body),
+      },
+      timeoutMs,
+    );
+  } catch {
+    console.error('webhook intake RPC request failed:', name);
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  if (!response.ok) {
+    console.error('webhook intake RPC returned status:', name, response.status);
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  try {
+    return await response.json();
+  } catch {
+    console.error('webhook intake RPC returned invalid JSON:', name);
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+}
+
+async function callWebhookReceiptRpc(env, name, body) {
+  let response;
+  try {
+    response = await webhookFetch(
+      env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/rpc/' + name,
+      {
+        method: 'POST',
+        headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify(body),
+      },
+    );
+  } catch {
+    console.error('webhook receipt RPC request failed:', name);
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  if (!response.ok) {
+    console.error('webhook receipt RPC returned status:', name, response.status);
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  try {
+    return await response.json();
+  } catch {
+    console.error('webhook receipt RPC returned invalid JSON:', name);
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+}
+
+async function claimWebhookDelivery(env, provider, eventKey) {
+  const payload = await callWebhookReceiptRpc(
+    env,
+    'hc_claim_webhook_delivery',
+    {
+      p_provider: provider,
+      p_event_key: eventKey,
+      p_lease_seconds: 300,
+    },
+  );
+  const receipt = Array.isArray(payload) ? payload[0] : payload;
+  if (!receipt || !UUID_RE.test(receipt.receipt_id || '') ||
+      !['claimed', 'completed', 'busy'].includes(receipt.claim_state)) {
+    console.error('webhook receipt claim returned an invalid contract');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  if (receipt.claim_state === 'busy') {
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  if (receipt.claim_state === 'claimed' &&
+      !UUID_RE.test(receipt.claim_token || '')) {
+    console.error('webhook receipt claim omitted its lease token');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  return {
+    state: receipt.claim_state,
+    receiptId: receipt.receipt_id,
+    claimToken: receipt.claim_token || null,
+  };
+}
+
+async function finishWebhookDelivery(env, provider, eventKey, claimToken) {
+  const finished = await callWebhookReceiptRpc(
+    env,
+    'hc_finish_webhook_delivery',
+    {
+      p_provider: provider,
+      p_event_key: eventKey,
+      p_claim_token: claimToken,
+    },
+  );
+  if (finished !== true) {
+    console.error('webhook receipt finish lost its exact lease');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+}
+
+async function renewWebhookDelivery(env, provider, eventKey, claimToken) {
+  const renewed = await callWebhookReceiptRpc(
+    env,
+    'hc_renew_webhook_delivery',
+    {
+      p_provider: provider,
+      p_event_key: eventKey,
+      p_claim_token: claimToken,
+      p_lease_seconds: 300,
+    },
+  );
+  if (renewed !== true) {
+    console.error('webhook receipt renewal lost its exact lease');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+}
+
+async function releaseWebhookDelivery(env, provider, eventKey, claimToken) {
+  try {
+    const released = await callWebhookReceiptRpc(
+      env,
+      'hc_release_webhook_delivery',
+      {
+        p_provider: provider,
+        p_event_key: eventKey,
+        p_claim_token: claimToken,
+      },
+    );
+    if (released !== true) {
+      console.error('webhook receipt release did not own the current lease');
+    }
+  } catch {
+    // The original failure remains the response. An unreleased lease becomes
+    // retryable automatically after five minutes.
+    console.error('webhook receipt release failed; lease will expire');
+  }
+}
+
+async function processWebhookDelivery(env, provider, eventKey, processor) {
+  const receipt = await claimWebhookDelivery(env, provider, eventKey);
+  if (receipt.state === 'completed') {
+    return { duplicate: true, receiptId: receipt.receiptId, value: null };
+  }
+  try {
+    const renewLease = () => renewWebhookDelivery(
+      env,
+      provider,
+      eventKey,
+      receipt.claimToken,
+    );
+    const value = await processor(receipt.receiptId, renewLease);
+    await finishWebhookDelivery(
+      env,
+      provider,
+      eventKey,
+      receipt.claimToken,
+    );
+    return { duplicate: false, receiptId: receipt.receiptId, value };
+  } catch (error) {
+    await releaseWebhookDelivery(
+      env,
+      provider,
+      eventKey,
+      receipt.claimToken,
+    );
+    throw error;
+  }
+}
+
+async function parseWebhookClaudeResponse(response, provider) {
+  if (!response.ok) {
+    console.error(provider + ' webhook AI returned status:', response.status);
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    console.error(provider + ' webhook AI returned invalid JSON');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  const text = data.content?.find((block) => block.type === 'text')?.text || '';
+  const cleaned = text.replace(/```json|```/g, '').trim();
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  try {
+    const parsed = match ? JSON.parse(match[0]) : null;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('object required');
+    }
+    return parsed;
+  } catch {
+    console.error(provider + ' webhook AI returned an invalid classification');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+}
+
+async function insertWebhookOrder(env, orderRow, provider) {
+  let response;
+  try {
+    response = await webhookFetch(
+      env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/orders?on_conflict=id',
+      {
+        method: 'POST',
+        headers: sbHeaders(env, {
+          'Content-Type': 'application/json',
+          'Prefer': 'resolution=ignore-duplicates,return=minimal',
+        }),
+        body: JSON.stringify(orderRow),
+      },
+    );
+  } catch {
+    console.error(provider + ' webhook order insert request failed');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  if (!response.ok) {
+    console.error(provider + ' webhook order insert returned status:', response.status);
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+}
+
+function webhookAlertChatIds(env) {
+  const chatIds = [...new Set(
+    String(env.ALLOWED_CHAT_IDS || '').split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+  )];
+  if (chatIds.length > 8) {
+    console.error('Webhook alert destination limit exceeded');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  if (chatIds.some((chatId) => chatId.length > 128)) {
+    console.error('Webhook alert destination is too long');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  return chatIds;
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function requiredBase64WebhookKey(value, label) {
+  const encoded = requiredWebhookSecret(value, label);
+  const bytes = base64ToBytes(encoded);
+  if (!bytes || bytes.byteLength !== 32) {
+    console.error(label + ' is not a base64-encoded 32-byte key');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  return bytes;
+}
+
+function currentWebhookOutboxEncryptionKey(env) {
+  const configured = requiredWebhookSecret(
+    env.WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT,
+    'Webhook outbox encryption',
+  );
+  const separator = configured.indexOf(':');
+  const version = configured.slice(0, separator);
+  const encoded = configured.slice(separator + 1);
+  if (separator <= 0 || !/^[A-Za-z0-9._-]{1,32}$/.test(version)) {
+    console.error('Webhook outbox encryption key version is invalid');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  const keyBytes = base64ToBytes(encoded);
+  if (!keyBytes || keyBytes.byteLength !== 32) {
+    console.error('Webhook outbox encryption key is not 32 bytes');
+    throw new WebhookRequestError(503, 'Webhook unavailable');
+  }
+  return { version, keyBytes };
+}
+
+function boundedWebhookPlainText(value) {
+  const normalized = String(value || '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .trim();
+  return [...normalized].slice(0, 4096).join('');
+}
+
+function uuidFromDigest(digest) {
+  const bytes = new Uint8Array(digest.slice(0, 16));
+  // RFC 4122 variant plus a version-5 marker. The source digest is an HMAC,
+  // not a namespace UUID, but this produces a valid stable database UUID.
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join('-');
+}
+
+async function webhookTelegramQueueId(
+  idKeyBytes,
+  provider,
+  parentEventKey,
+  chatId,
+) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    idKeyBytes,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const digest = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    encoder.encode(
+      'hc-webhook-telegram-queue-v2\0' + provider + '\0' +
+      parentEventKey + '\0' + chatId,
+    ),
+  );
+  return uuidFromDigest(new Uint8Array(digest));
+}
+
+async function encryptedWebhookTelegramPayload(
+  encryptionKey,
+  queueId,
+  chatId,
+  alertText,
+) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encryptionKey.keyBytes,
+    'AES-GCM',
+    false,
+    ['encrypt'],
+  );
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const additionalData = encoder.encode(
+    'hc-telegram-outbox-v2\0' + encryptionKey.version + '\0' + queueId,
+  );
+  const plaintext = encoder.encode(JSON.stringify({
+    chat_id: chatId,
+    text: boundedWebhookPlainText(alertText),
+  }));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: nonce, additionalData },
+    key,
+    plaintext,
+  );
+  return {
+    version: 2,
+    key_version: encryptionKey.version,
+    nonce: bytesToBase64(nonce),
+    ciphertext: bytesToBase64(new Uint8Array(ciphertext)),
+  };
+}
+
+async function enqueueWebhookTelegramAlerts(
+  env,
+  provider,
+  parentEventKey,
+  alertText,
+  providerLabel,
+  renewLease = null,
+) {
+  const chatIds = webhookAlertChatIds(env);
+  if (!chatIds.length) return;
+  const idKeyBytes = requiredBase64WebhookKey(
+    env.WEBHOOK_OUTBOX_ID_KEY,
+    'Webhook outbox stable ID key',
+  );
+  const encryptionKey = currentWebhookOutboxEncryptionKey(env);
+
+  for (const chatId of chatIds) {
+    const queueId = await webhookTelegramQueueId(
+      idKeyBytes,
+      provider,
+      parentEventKey,
+      chatId,
+    );
+    const telegramOutbox = await encryptedWebhookTelegramPayload(
+      encryptionKey,
+      queueId,
+      chatId,
+      alertText,
+    );
+    if (renewLease) await renewLease();
+    const queued = await enqueuePush(
+      env,
+      'alert',
+      {
+        tokens: [],
+        headers: {},
+        aps: {},
+        telegram_outbox: telegramOutbox,
+      },
+      queueId,
+    );
+    if (queued !== true) {
+      console.error(providerLabel + ' webhook Telegram outbox enqueue failed');
+      throw new WebhookRequestError(503, 'Webhook unavailable');
+    }
+  }
+}
+
 const FORMSPREE_EXTRACTION_PROMPT = `You receive a JSON object from a Formspree contact form for Hamptons Coconuts (a premium coconut catering business).
 
 Extract structured booking info. Respond with ONLY valid JSON, no markdown:
@@ -1510,85 +2678,97 @@ Extract structured booking info. Respond with ONLY valid JSON, no markdown:
 
 async function handleFormspreeWebhook(request, env) {
   try {
-    const body = await request.json();
+    const signingSecret = requiredWebhookSecret(
+      env.FORMSPREE_WEBHOOK_SIGNING_SECRET,
+      'Formspree',
+    );
+    const { rawBytes, rawText } = await readBoundedWebhookBody(request);
+    await requireFormspreeSignature(request, signingSecret, rawBytes);
+    const body = parseWebhookJson(rawText);
+    const eventKey = await formspreeEventKey(body, rawBytes);
+    const delivery = await processWebhookDelivery(
+      env,
+      'formspree',
+      eventKey,
+      async (receiptId, renewLease) => {
+        const submission = body && body.submission &&
+          typeof body.submission === 'object' &&
+          !Array.isArray(body.submission)
+          ? body.submission
+          : body;
+        const extractResp = await webhookFetch(CLAUDE_API, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 800,
+            system: FORMSPREE_EXTRACTION_PROMPT,
+            messages: [{
+              role: 'user',
+              content: 'Form submission:\n' + JSON.stringify(body, null, 2),
+            }],
+          }),
+        }, 60000);
+        const extracted = await parseWebhookClaudeResponse(
+          extractResp,
+          'Formspree',
+        );
 
-    // Step 1: ask Claude to extract structured fields
-    const extractResp = await fetch(CLAUDE_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
+        const orderRow = {
+          id: receiptId,
+          client_name: extracted.client_name || submission.name || 'Unknown',
+          client_email: extracted.client_email || submission.email || null,
+          client_phone: extracted.client_phone || submission.phone || null,
+          company: extracted.company || null,
+          event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(extracted.event_type) ? extracted.event_type : 'other',
+          event_start_at: extracted.event_date ? extracted.event_date + 'T12:00:00Z' : null,
+          event_tz: 'America/New_York',
+          headcount: parseInt(extracted.headcount) || null,
+          venue: extracted.venue || null,
+          market: ['ny','miami','other'].includes(extracted.market) ? extracted.market : 'ny',
+          stage: 'inquiry',
+          source: 'website',
+          notes: extracted.notes || null,
+          stamp_status: 'not_ordered',
+          logo_received: false,
+          deposit_cents: 0,
+          coi_required: false,
+          coi_submitted: false,
+          is_recurring: false,
+        };
+        await renewLease();
+        await insertWebhookOrder(env, orderRow, 'Formspree');
+
+        const alertText = '🌐 New website lead (Formspree)\n\n' +
+          orderRow.client_name +
+          (orderRow.client_email ? '\n📧 ' + orderRow.client_email : '') +
+          (orderRow.client_phone ? '\n📞 ' + orderRow.client_phone : '') +
+          (orderRow.event_start_at ? '\n📅 ' + orderRow.event_start_at.split('T')[0] : '') +
+          (orderRow.headcount ? '\n👥 ' + orderRow.headcount + ' guests' : '') +
+          (orderRow.venue ? '\n📍 ' + orderRow.venue : '') +
+          '\n\n' + (extracted.summary || 'Open dashboard to review.');
+        await enqueueWebhookTelegramAlerts(
+          env,
+          'formspree',
+          eventKey,
+          alertText,
+          'Formspree',
+          renewLease,
+        );
       },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 800,
-        system: FORMSPREE_EXTRACTION_PROMPT,
-        messages: [{ role: 'user', content: 'Form submission:\n' + JSON.stringify(body, null, 2) }],
-      }),
+    );
+
+    return webhookJsonResponse({
+      ok: true,
+      order_id: delivery.receiptId,
+      duplicate: delivery.duplicate,
     });
-    if (!extractResp.ok) {
-      console.error('Claude extract failed:', extractResp.status);
-      return jsonResponse({ ok: false, error: 'extraction failed' }, 200);
-    }
-    const extractData = await extractResp.json();
-    const txt = extractData.content?.find(c => c.type === 'text')?.text || '{}';
-    const cleaned = txt.replace(/```json|```/g, '').trim();
-    const m = cleaned.match(/\{[\s\S]*\}/);
-    let extracted = {};
-    try { extracted = m ? JSON.parse(m[0]) : {}; } catch (e) { extracted = {}; }
-
-    // Step 2: insert into orders as a new lead
-    const newId = crypto.randomUUID();
-    const orderRow = {
-      id: newId,
-      client_name: extracted.client_name || body.name || 'Unknown',
-      client_email: extracted.client_email || body.email || null,
-      client_phone: extracted.client_phone || body.phone || null,
-      company: extracted.company || null,
-      event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(extracted.event_type) ? extracted.event_type : 'other',
-      event_start_at: extracted.event_date ? extracted.event_date + 'T12:00:00Z' : null,
-      event_tz: 'America/New_York',
-      headcount: parseInt(extracted.headcount) || null,
-      venue: extracted.venue || null,
-      market: ['ny','miami','other'].includes(extracted.market) ? extracted.market : 'ny',
-      stage: 'inquiry',
-      source: 'website',
-      notes: extracted.notes || JSON.stringify(body).slice(0, 500),
-      stamp_status: 'not_ordered',
-      logo_received: false,
-      deposit_cents: 0,
-      coi_required: false,
-      coi_submitted: false,
-      is_recurring: false,
-    };
-    const insertResp = await fetch(env.SUPABASE_URL + '/rest/v1/orders', {
-      method: 'POST',
-      headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
-      body: JSON.stringify(orderRow),
-    });
-    if (!insertResp.ok) {
-      console.error('Formspree insert failed:', insertResp.status, await insertResp.text());
-    }
-
-    // Step 3: Telegram alert
-    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-    const alertText = '🌐 *New website lead* (Formspree)\n\n' +
-      '*' + (orderRow.client_name) + '*' +
-      (orderRow.client_email ? '\n📧 ' + orderRow.client_email : '') +
-      (orderRow.client_phone ? '\n📞 ' + orderRow.client_phone : '') +
-      (orderRow.event_start_at ? '\n📅 _' + orderRow.event_start_at.split('T')[0] + '_' : '') +
-      (orderRow.headcount ? '\n👥 ' + orderRow.headcount + ' guests' : '') +
-      (orderRow.venue ? '\n📍 ' + orderRow.venue : '') +
-      '\n\n' + (extracted.summary || 'Open dashboard to review.');
-    for (const cid of chatIds) {
-      await sendTelegram(env.TG_BOT_TOKEN, cid, alertText);
-    }
-
-    return jsonResponse({ ok: true, order_id: newId });
   } catch (e) {
-    console.error('Formspree webhook error:', e);
-    return jsonResponse({ ok: false, error: e.message }, 200);
+    return webhookFailureResponse('Formspree', e);
   }
 }
 
@@ -1607,77 +2787,89 @@ Classify the inbound event for Hamptons Coconuts (premium coconut catering). Res
 
 async function handleQuoWebhook(request, env) {
   try {
-    const body = await request.json();
+    const signingKey = requiredWebhookSecret(
+      env.QUO_WEBHOOK_SIGNING_KEY,
+      'Quo',
+    );
+    const { rawBytes, rawText } = await readBoundedWebhookBody(request);
+    const body = parseWebhookJson(rawText);
+    await requireQuoSignature(request, signingKey, body);
+    const eventKey = await webhookEventKey(
+      'quo',
+      rawBytes,
+      webhookProviderEventId(body, ['id']),
+    );
+    const delivery = await processWebhookDelivery(
+      env,
+      'quo',
+      eventKey,
+      async (receiptId, renewLease) => {
+        const cResp = await webhookFetch(CLAUDE_API, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 600,
+            system: QUO_EXTRACTION_PROMPT,
+            messages: [{
+              role: 'user',
+              content: 'Quo webhook payload:\n' + JSON.stringify(body, null, 2),
+            }],
+          }),
+        }, 60000);
+        const extracted = await parseWebhookClaudeResponse(cResp, 'Quo');
 
-    // Step 1: classify with Claude
-    const cResp = await fetch(CLAUDE_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
+        if (extracted.is_lead && extracted.lead_name) {
+          await renewLease();
+          await insertWebhookOrder(env, {
+            id: receiptId,
+            client_name: extracted.lead_name,
+            client_phone: extracted.from_number || null,
+            stage: 'inquiry',
+            source: 'direct',
+            market: 'ny',
+            notes: (extracted.lead_intent || '') + '\n\n' +
+              (extracted.body_text || ''),
+            stamp_status: 'not_ordered',
+            logo_received: false,
+            deposit_cents: 0,
+            coi_required: false,
+            coi_submitted: false,
+            is_recurring: false,
+          }, 'Quo');
+        }
+
+        const kindEmoji = {
+          inbound_sms: '💬',
+          inbound_call: '📞',
+          inbound_voicemail: '🎙️',
+          outbound_log: '➡️',
+          other: '📡',
+        }[extracted.kind] || '📡';
+        const alertText = kindEmoji + ' Quo: ' +
+          (extracted.kind || 'unknown') + '\n\n' +
+          (extracted.from_number ? 'From: ' + extracted.from_number + '\n' : '') +
+          (extracted.body_text ? '\n' +
+            extracted.body_text.slice(0, 400) + '\n' : '') +
+          '\n' + (extracted.summary || '');
+        await enqueueWebhookTelegramAlerts(
+          env,
+          'quo',
+          eventKey,
+          alertText,
+          'Quo',
+          renewLease,
+        );
       },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 600,
-        system: QUO_EXTRACTION_PROMPT,
-        messages: [{ role: 'user', content: 'Quo webhook payload:\n' + JSON.stringify(body, null, 2) }],
-      }),
-    });
-    let extracted = {};
-    if (cResp.ok) {
-      const d = await cResp.json();
-      const txt = d.content?.find(c => c.type === 'text')?.text || '{}';
-      const cleaned = txt.replace(/```json|```/g, '').trim();
-      const m = cleaned.match(/\{[\s\S]*\}/);
-      try { extracted = m ? JSON.parse(m[0]) : {}; } catch (e) {}
-    }
+    );
 
-    // Step 2: if lead, insert order row
-    if (extracted.is_lead && extracted.lead_name) {
-      const orderRow = {
-        id: crypto.randomUUID(),
-        client_name: extracted.lead_name,
-        client_phone: extracted.from_number || null,
-        stage: 'inquiry',
-        source: 'direct',  // phone inquiry
-        market: 'ny',
-        notes: (extracted.lead_intent || '') + '\n\n' + (extracted.body_text || ''),
-        stamp_status: 'not_ordered',
-        logo_received: false,
-        deposit_cents: 0,
-        coi_required: false,
-        coi_submitted: false,
-        is_recurring: false,
-      };
-      await fetch(env.SUPABASE_URL + '/rest/v1/orders', {
-        method: 'POST',
-        headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify(orderRow),
-      });
-    }
-
-    // Step 3: Telegram alert (always notify Sidd of inbound activity)
-    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-    const kindEmoji = {
-      inbound_sms: '💬',
-      inbound_call: '📞',
-      inbound_voicemail: '🎙️',
-      outbound_log: '➡️',
-      other: '📡',
-    }[extracted.kind] || '📡';
-    const alertText = kindEmoji + ' *Quo: ' + (extracted.kind || 'unknown') + '*\n\n' +
-      (extracted.from_number ? '*From:* ' + extracted.from_number + '\n' : '') +
-      (extracted.body_text ? '\n' + extracted.body_text.slice(0, 400) + '\n' : '') +
-      '\n' + (extracted.summary || '');
-    for (const cid of chatIds) {
-      await sendTelegram(env.TG_BOT_TOKEN, cid, alertText);
-    }
-
-    return jsonResponse({ ok: true });
+    return webhookJsonResponse({ ok: true, duplicate: delivery.duplicate });
   } catch (e) {
-    console.error('Quo webhook error:', e);
-    return jsonResponse({ ok: false, error: e.message }, 200);
+    return webhookFailureResponse('Quo', e);
   }
 }
 
@@ -1726,22 +2918,47 @@ function _scrubOperatorEmail(email) {
 
 async function handleMsGraphWebhook(request, env, url) {
   // Microsoft Graph subscriptions send a validationToken on creation; echo it back.
-  const validationToken = url.searchParams.get('validationToken');
-  if (validationToken) {
-    return new Response(validationToken, { status: 200, headers: { 'Content-Type': 'text/plain' } });
+  if (url.searchParams.has('validationToken')) {
+    return msGraphValidationResponse(url);
   }
 
   try {
-    const body = await request.json();
+    requiredWebhookSecret(env.MS_GRAPH_CLIENT_STATE, 'Microsoft Graph');
+    const { rawText } = await readBoundedWebhookBody(request);
+    const body = parseWebhookJson(rawText);
     // Graph batches notifications under body.value
-    const notifications = body.value || [body];
+    const notifications = requireMsGraphNotifications(body, env);
+    const intakeItems = [];
+    for (const notification of notifications) {
+      intakeItems.push({
+        provider: 'ms_graph',
+        event_key: await graphNotificationEventKey(notification),
+        payload: sanitizedGraphNotification(notification),
+      });
+    }
+    const queued = await callWebhookIntakeRpc(
+      env,
+      'hc_enqueue_webhook_intake',
+      { p_items: intakeItems },
+      2500,
+    );
+    if (queued !== intakeItems.length) {
+      console.error('Microsoft Graph intake enqueue returned an invalid count');
+      throw new WebhookRequestError(503, 'Webhook unavailable');
+    }
+    return webhookJsonResponse({ ok: true, queued }, 202);
+  } catch (e) {
+    return webhookFailureResponse('Microsoft Graph', e);
+  }
+}
 
-    for (const n of notifications) {
-      // Each notification has a resource URL (the email). For now we expect the
-      // caller (or a future step) to also POST the full email payload under
-      // n.resourceData or we'd fetch it via Graph here. Stub: classify the
-      // notification payload directly.
-      const cResp = await fetch(CLAUDE_API, {
+async function processMsGraphNotification(env, eventKey, notification) {
+  return processWebhookDelivery(
+    env,
+    'ms_graph',
+    eventKey,
+    async (receiptId, renewLease) => {
+      const cResp = await webhookFetch(CLAUDE_API, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1752,101 +2969,159 @@ async function handleMsGraphWebhook(request, env, url) {
           model: 'claude-haiku-4-5-20251001',
           max_tokens: 800,
           system: MS_GRAPH_CLASSIFIER_PROMPT,
-          messages: [{ role: 'user', content: 'Graph notification:\n' + JSON.stringify(n, null, 2) }],
+          messages: [{
+            role: 'user',
+            content: 'Graph notification:\n' +
+              JSON.stringify(notification, null, 2),
+          }],
         }),
-      });
-      if (!cResp.ok) continue;
-      const d = await cResp.json();
-      const txt = d.content?.find(c => c.type === 'text')?.text || '{}';
-      const cleaned = txt.replace(/```json|```/g, '').trim();
-      const m = cleaned.match(/\{[\s\S]*\}/);
-      let cls = {};
-      try { cls = m ? JSON.parse(m[0]) : {}; } catch (e) {}
+      }, 60000);
+      const cls = await parseWebhookClaudeResponse(cResp, 'Microsoft Graph');
 
-      // If classified as lead_inquiry, insert orders row
       if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
-        const e = cls.extracted_lead;
-        const orderRow = {
-          id: crypto.randomUUID(),
-          client_name: e.client_name || 'Unknown',
-          client_email: _scrubOperatorEmail(e.client_email) ||
+        const lead = cls.extracted_lead;
+        await renewLease();
+        await insertWebhookOrder(env, {
+          id: receiptId,
+          client_name: lead.client_name || 'Unknown',
+          client_email: _scrubOperatorEmail(lead.client_email) ||
                         _scrubOperatorEmail(cls.from_email) || null,
-          client_phone: e.client_phone || null,
-          event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(e.event_type) ? e.event_type : 'other',
-          event_start_at: e.event_date ? e.event_date + 'T12:00:00Z' : null,
+          client_phone: lead.client_phone || null,
+          event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(lead.event_type) ? lead.event_type : 'other',
+          event_start_at: lead.event_date ? lead.event_date + 'T12:00:00Z' : null,
           event_tz: 'America/New_York',
-          headcount: parseInt(e.headcount) || null,
-          venue: e.venue || null,
-          market: ['ny','miami','other'].includes(e.market) ? e.market : 'ny',
+          headcount: parseInt(lead.headcount) || null,
+          venue: lead.venue || null,
+          market: ['ny','miami','other'].includes(lead.market) ? lead.market : 'ny',
           stage: 'inquiry',
           source: 'website',
-          notes: 'Email lead via MS Graph: ' + (cls.subject || '') + '\n\n' + (e.notes || ''),
+          notes: 'Email lead via MS Graph: ' +
+            (cls.subject || '') + '\n\n' + (lead.notes || ''),
           stamp_status: 'not_ordered',
           logo_received: false,
           deposit_cents: 0,
           coi_required: false,
           coi_submitted: false,
           is_recurring: false,
-        };
-        await fetch(env.SUPABASE_URL + '/rest/v1/orders', {
-          method: 'POST',
-          headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-          body: JSON.stringify(orderRow),
-        });
+        }, 'Microsoft Graph');
       }
 
-      // Telegram alert if should_alert
       if (cls.should_alert) {
         const safeFromEmail = _scrubOperatorEmail(cls.from_email);
-        const emoji = { lead_inquiry: '🌱', customer_reply: '💬', vendor: '📦', noise: '🗑️' }[cls.category] || '📧';
-        const text = emoji + ' *Email: ' + (cls.category || 'unknown') + '*\n' +
-          '*From:* ' + (cls.from_name || safeFromEmail || 'unknown') + '\n' +
-          '*Subject:* ' + (cls.subject || '') + '\n\n' +
+        const emoji = {
+          lead_inquiry: '🌱',
+          customer_reply: '💬',
+          vendor: '📦',
+          noise: '🗑️',
+        }[cls.category] || '📧';
+        const alertText = emoji + ' Email: ' +
+          (cls.category || 'unknown') + '\n' +
+          'From: ' + (cls.from_name || safeFromEmail || 'unknown') + '\n' +
+          'Subject: ' + (cls.subject || '') + '\n\n' +
           (cls.summary || '');
-        const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-        for (const cid of chatIds) {
-          await sendTelegram(env.TG_BOT_TOKEN, cid, text);
-        }
+        await enqueueWebhookTelegramAlerts(
+          env,
+          'ms_graph',
+          eventKey,
+          alertText,
+          'Microsoft Graph',
+          renewLease,
+        );
+      }
+    },
+  );
+}
+
+function webhookIntakeRetrySeconds(attemptCount) {
+  return Math.min(3600, 15 * (2 ** Math.min(8,
+    Math.max(0, Number(attemptCount || 1) - 1))));
+}
+
+export async function runWebhookIntakeScan(env, maxItems = 10) {
+  let claimedCount = 0;
+  let completedCount = 0;
+  let releasedCount = 0;
+
+  while (claimedCount < Math.min(10, Math.max(1, maxItems))) {
+    const claimed = await callWebhookIntakeRpc(
+      env,
+      'hc_claim_webhook_intake',
+      { p_limit: 1, p_lease_seconds: 900 },
+    );
+    if (!Array.isArray(claimed)) {
+      console.error('webhook intake claim returned an invalid contract');
+      throw new WebhookRequestError(503, 'Webhook unavailable');
+    }
+    if (!claimed.length) break;
+    const row = claimed[0];
+    if (!row || !UUID_RE.test(row.intake_id || '') ||
+        !UUID_RE.test(row.claim_token || '') || row.provider !== 'ms_graph' ||
+        !/^[0-9a-f]{64}$/.test(row.event_key || '') ||
+        !row.payload || typeof row.payload !== 'object' ||
+        Array.isArray(row.payload)) {
+      console.error('webhook intake claim row is invalid');
+      throw new WebhookRequestError(503, 'Webhook unavailable');
+    }
+    claimedCount++;
+
+    try {
+      await processMsGraphNotification(env, row.event_key, row.payload);
+      const finished = await callWebhookIntakeRpc(
+        env,
+        'hc_finish_webhook_intake',
+        {
+          p_intake_id: row.intake_id,
+          p_claim_token: row.claim_token,
+        },
+      );
+      if (finished !== true) {
+        throw new WebhookRequestError(503, 'Webhook unavailable');
+      }
+      completedCount++;
+    } catch (error) {
+      try {
+        const released = await callWebhookIntakeRpc(
+          env,
+          'hc_release_webhook_intake',
+          {
+            p_intake_id: row.intake_id,
+            p_claim_token: row.claim_token,
+            p_retry_after_seconds: webhookIntakeRetrySeconds(
+              row.attempt_count,
+            ),
+            p_error: 'transient processing failure',
+          },
+        );
+        if (released === true) releasedCount++;
+      } catch {
+        console.error('webhook intake release failed; lease will expire');
       }
     }
-
-    return jsonResponse({ ok: true });
-  } catch (e) {
-    console.error('MS Graph webhook error:', e);
-    return jsonResponse({ ok: false, error: e.message }, 200);
   }
+
+  return {
+    claimed: claimedCount,
+    completed: completedCount,
+    released: releasedCount,
+  };
 }
 
 async function handleParseFile(request, env) {
   try {
-    const body = await request.json();
+    const body = await readDashboardJson(request);
     const { systemPrompt, contentBlocks, maxTokens } = body;
-    if (!contentBlocks || !Array.isArray(contentBlocks)) {
-      return jsonResponse({ error: 'Missing contentBlocks' }, 400);
-    }
-    const resp = await fetch(CLAUDE_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: maxTokens || 1000,
-        system: systemPrompt || '',
-        messages: [{ role: 'user', content: contentBlocks }],
-      }),
+    return await callDashboardClaude(request, env, {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: normalizeDashboardMaxTokens(maxTokens, 1000),
+      system: validateSystemPrompt(systemPrompt),
+      messages: [{ role: 'user', content: validateFileContentBlocks(contentBlocks) }],
     });
-    const raw = await resp.text();
-    if (!resp.ok) {
-      return jsonResponse({ error: `Claude HTTP ${resp.status}: ${raw.slice(0, 200)}` }, 500);
-    }
-    const data = JSON.parse(raw);
-    const txt = data.content?.find(c => c.type === 'text')?.text || '';
-    return jsonResponse({ text: txt });
   } catch (e) {
-    return jsonResponse({ error: e.message }, 500);
+    if (e instanceof DashboardRequestError) {
+      return dashboardJsonResponse(request, { error: e.message }, e.status);
+    }
+    console.error('dashboard file parse failed:', e && e.message);
+    return dashboardJsonResponse(request, { error: 'Request failed' }, 500);
   }
 }
 
@@ -2032,7 +3307,11 @@ async function runShiftSummaryScan(env) {
             // sees nothing (excludeEmail suppresses the self-echo).
             const bodies = clockOutBodies(mins, rate, built.touched);
             if (await sendPushToOwners(env, row.worker_name + ' clocked out', bodies.owner, null, [],
-                { managerBody: bodies.manager, excludeEmail: row.worker_email })) delivered++;
+                {
+                  managerBody: bodies.manager,
+                  excludeEmail: row.worker_email,
+                  market: row.market,
+                })) delivered++;
             // 40-hour week watch (2026-08-06): owners only, once per
             // crossing — fires on the shift that pushes the Mon-Sun ET
             // week total past 40h, so Sidd can rebalance schedules.
@@ -2118,7 +3397,7 @@ async function runClockInAlertScan(env) {
           const queued = await sendPushToOwners(env,
             '🟢 ' + row.worker_name + ' clocked in',
             etTimeStr(row.clock_in_at) + ' ET - ' + (row.market || 'ny').toUpperCase(),
-            text, chatIds, { excludeEmail: row.worker_email });
+            text, chatIds, { excludeEmail: row.worker_email, market: row.market });
           if (queued) {
             delivered++;
           } else {
@@ -2215,7 +3494,9 @@ async function runShiftStatusScan(env) {
             laStatus = 'Stopped';
             laMins = Math.floor(ageMin / 5) * 5; // bucket = what we render, "Stopped 15m", "Stopped 20m"...
           }
-          await updateShiftLiveActivity(env, row.id, laStatus, laMins, p.at);
+          await updateShiftLiveActivity(
+            env, row.id, laStatus, laMins, p.at, row.market,
+          );
         } catch (e) { console.error('la status hook:', e); }
 
         // AT_GARAGE: parked at base is normal. (Miami has no garage, so
@@ -2232,12 +3513,11 @@ async function runShiftStatusScan(env) {
 
         const mins = Math.floor(ageMin);
         const mkt = (row.market || 'ny').toUpperCase();
-        let text = '⚠️ ' + row.worker_name + ' has not moved for ' + mins +
-          ' min while enroute (' + mkt + ').';
+        let text = '⚠️ ' + row.worker_name + ': GPS has not reported for ' + mins +
+          ' min while en route (' + mkt + ').';
         if (p.lat != null && p.lng != null) {
-          text += '\nLast seen: https://www.google.com/maps/search/?api=1&query=' + p.lat + ',' + p.lng;
+          text += '\nLast reported location: https://www.google.com/maps/search/?api=1&query=' + p.lat + ',' + p.lng;
         }
-        text += '\n(or their phone stopped reporting GPS)';
 
         // ONE queue row: the droplet drainer pushes the banner and
         // sends this Telegram text ONLY if no device gets it, so push +
@@ -2246,9 +3526,9 @@ async function runShiftStatusScan(env) {
         // exists in exactly the complementary case, so no double-send.
         // The stateless windows above stay the once-only mechanism.
         const queued = await sendPushToOwners(env,
-          '⚠️ ' + row.worker_name + ' stopped ' + mins + ' min',
-          'Not moving while enroute (' + mkt + '). Open the live map.',
-          text, chatIds, { excludeEmail: row.worker_email });
+          '⚠️ ' + row.worker_name + ': GPS stale ' + mins + ' min',
+          'No fresh GPS report while en route (' + mkt + '). Open the live map.',
+          text, chatIds, { excludeEmail: row.worker_email, market: row.market });
         if (!queued) {
           // Plain mode: worker names must never break Telegram Markdown.
           for (const cid of chatIds) {
@@ -2572,7 +3852,9 @@ async function buildPayrollDigestLines(env) {
 // may treat a fully unknown outcome as owned because its token lease guarantees
 // a later recovery scan. Generic alerts return failure so their established
 // direct Telegram fallback protects the operator from silent loss. In the rare
-// commit-plus-unreadable-lookup case, that can duplicate an alert.
+// commit-plus-unreadable-lookup case, that can duplicate a legacy alert.
+// Verified provider webhooks use a stable encrypted queue row instead, so they
+// return a retryable error and never send Telegram inline.
 export async function enqueuePush(env, kind, payload, requestedQueueId = null) {
   const queueId = requestedQueueId || crypto.randomUUID();
   const queuePayload = {
@@ -2582,12 +3864,19 @@ export async function enqueuePush(env, kind, payload, requestedQueueId = null) {
       collapse_id: queueId,
     },
   };
-  const row = { id: queueId, kind: kind, payload: queuePayload };
+  const row = {
+    id: queueId,
+    kind: kind,
+    payload: queuePayload,
+    outbox_type: payload && payload.telegram_outbox
+      ? 'webhook_telegram'
+      : 'push',
+  };
   let lastLookup = null;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/push_queue', {
+      const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/push_queue', {
         method: 'POST',
         headers: sbHeaders(env, {
           'Content-Type': 'application/json',
@@ -2604,7 +3893,7 @@ export async function enqueuePush(env, kind, payload, requestedQueueId = null) {
     // A successful empty lookup proves the INSERT did not commit. A failed
     // lookup is unknown, not absent. Retry the same UUID once in either case.
     try {
-      const verify = await fetch(env.SUPABASE_URL + '/rest/v1/push_queue' +
+      const verify = await webhookFetch(env.SUPABASE_URL + '/rest/v1/push_queue' +
         '?id=eq.' + encodeURIComponent(queueId) + '&select=id,kind&limit=1', {
         headers: sbHeaders(env),
       });
@@ -2647,16 +3936,20 @@ export async function enqueuePush(env, kind, payload, requestedQueueId = null) {
 // over Telegram). Returns true when the row was queued; false when
 // there was nothing to queue or the INSERT failed. Never throws.
 // Pure: split a field_workers list into owner/manager email sets, minus the
-// excluded (the shift's own worker — nobody needs a banner about themselves).
+// excluded shift worker. Owners remain global. Managers fail closed unless
+// their normalized nonblank roster market exactly matches the shift market.
 // Exported for worker/test-manage-push.mjs.
-export function partitionRecipients(rows, excludeEmail) {
-  const ex = (excludeEmail || '').toLowerCase();
+export function partitionRecipients(rows, excludeEmail, targetMarket = null) {
+  const ex = String(excludeEmail || '').trim().toLowerCase();
+  const market = String(targetMarket || '').trim().toLowerCase();
   const owners = [], managers = [];
   for (const r of rows || []) {
-    const e = (r.email || '').toLowerCase();
+    const e = String(r.email || '').trim().toLowerCase();
     if (!e || e === ex) continue;
-    if (r.role === 'owner') owners.push(e);
-    else if (r.role === 'manager') managers.push(e);
+    const role = String(r.role || '').trim().toLowerCase();
+    if (role === 'owner') owners.push(e);
+    else if (role === 'manager' && market &&
+        String(r.market || '').trim().toLowerCase() === market) managers.push(e);
   }
   return { owners, managers };
 }
@@ -2716,11 +4009,12 @@ async function watch40Hours(env, row, minsJustClosed) {
 // sends stay ONE queue row (union of tokens); pay-bearing sends split into an
 // owner row (with telegram fallback) and a pay-free manager row (no fallback:
 // Telegram is Sidd's channel). opts.excludeEmail suppresses the self-echo;
+// opts.market is required for manager delivery and must match their roster;
 // opts.ownersOnly keeps scheduling/pay matters off manager phones entirely.
 async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds, opts = {}) {
   try {
-    const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&active=eq.true&select=email,role') || [];
-    const rec = partitionRecipients(staff, opts.excludeEmail);
+    const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&active=eq.true&select=email,role,market') || [];
+    const rec = partitionRecipients(staff, opts.excludeEmail, opts.market);
     if (opts.ownersOnly) rec.managers = [];
     const all = rec.owners.concat(rec.managers);
     const inList = all.map((e) => encodeURIComponent('"' + e + '"')).join(',');
@@ -2793,7 +4087,12 @@ let laLastSent = new Map();   // shiftId -> last pushed "status:minutes" (isolat
 // ContentState gained lastReportISO as an optional field. Old app builds ignore
 // the unknown JSON key, while the next widget can render the latest GPS report
 // time as a native relative label without one push per displayed minute.
-export function buildLiveActivityContentState(status, statusMinutes, lastReportISO = null) {
+export function buildLiveActivityContentState(
+  status,
+  statusMinutes,
+  lastReportISO = null,
+  market = null,
+) {
   const state = {
     status: status,
     statusMinutes: Number.isFinite(statusMinutes) ? statusMinutes : 0,
@@ -2802,6 +4101,9 @@ export function buildLiveActivityContentState(status, statusMinutes, lastReportI
   if (Number.isFinite(reportMs)) {
     state.lastReportISO = new Date(reportMs).toISOString();
   }
+  const marketKey = String(market || '').trim().toLowerCase();
+  if (marketKey === 'ny') state.marketLabel = 'NJ';
+  else if (marketKey === 'miami') state.marketLabel = 'Miami';
   return state;
 }
 
@@ -2853,18 +4155,20 @@ async function enqueueLiveActivityPush(env, tokens, event, contentState, opts = 
   }
 }
 
-// Owner + manager phones both carry the shift card (2026-08-06).
-async function laManageEmails(env) {
-  const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&active=eq.true&select=email');
+// Owner phones remain global. Manager phones receive updates only for their
+// exact normalized nonblank roster market.
+async function laManageEmails(env, market) {
+  const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&active=eq.true&select=email,role,market');
   if (staff === null) return null; // read FAILED — callers must not treat this as "nobody"
-  return staff.map((o) => (o.email || '').toLowerCase()).filter(Boolean);
+  const recipients = partitionRecipients(staff, null, market);
+  return recipients.owners.concat(recipients.managers);
 }
 
 // Update tokens for one shift, filtered to owner/manager emails so a rogue
 // anon insert with a random shift_id never receives pushes (same defense as
 // sendPushToOwners' role filter).
-async function laTokensForShift(env, shiftId) {
-  const emails = await laManageEmails(env);
+async function laTokensForShift(env, shiftId, market) {
+  const emails = await laManageEmails(env, market);
   if (emails === null) return null; // propagate the failed read
   if (!emails.length) return [];
   const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
@@ -2966,8 +4270,7 @@ export async function runLiveActivityStartScan(env) {
   const startedAfter = new Date(Date.now() - 48 * 3600000).toISOString();
   let claimedRows = null;
   try {
-    const response = await fetch(
-      env.SUPABASE_URL + '/rest/v1/rpc/hc_claim_live_activity_starts', {
+    const claimOptions = {
         method: 'POST',
         headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({
@@ -2976,7 +4279,27 @@ export async function runLiveActivityStartScan(env) {
           p_started_after: startedAfter,
           p_limit: 50,
         }),
-      });
+      };
+    let response = await fetch(
+      env.SUPABASE_URL + '/rest/v1/rpc/hc_claim_live_activity_starts_v2',
+      claimOptions,
+    );
+    if (!response.ok && response.status === 404) {
+      const missingText = await response.text();
+      let missingCode = '';
+      try { missingCode = JSON.parse(missingText).code || ''; } catch {}
+      if (missingCode === 'PGRST202') {
+        // Transition safety: the secured Worker may deploy before migration
+        // 022. The proven 018 claim returns the same rows without market.
+        response = await fetch(
+          env.SUPABASE_URL + '/rest/v1/rpc/hc_claim_live_activity_starts',
+          claimOptions,
+        );
+      } else {
+        console.error('Live Activity START claim failed:', response.status, missingText);
+        return 0;
+      }
+    }
     if (!response.ok) {
       console.error('Live Activity START claim failed:', response.status,
         await response.text());
@@ -3004,7 +4327,7 @@ export async function runLiveActivityStartScan(env) {
       const initial = liveActivityStartStatus(row);
       const name = row.worker_name || 'Team';
       const contentState = buildLiveActivityContentState(
-        initial.status, initial.minutes, reportISO,
+        initial.status, initial.minutes, reportISO, row.market,
       );
       const queued = await enqueueLiveActivityPush(
         env,
@@ -3057,13 +4380,23 @@ export async function runLiveActivityStartScan(env) {
 
 // event:update only when rendered status, its 5-minute stopped bucket, or the
 // latest GPS report timestamp changed. No tokens means retry on the next tick.
-async function updateShiftLiveActivity(env, shiftId, status, minutes, lastReportISO = null) {
+async function updateShiftLiveActivity(
+  env,
+  shiftId,
+  status,
+  minutes,
+  lastReportISO = null,
+  market = null,
+) {
   try {
     if (laLastSent.size > 200) laLastSent.clear(); // bound isolate memory
-    const contentState = buildLiveActivityContentState(status, minutes, lastReportISO);
-    const key = status + ':' + minutes + ':' + (contentState.lastReportISO || '');
+    const contentState = buildLiveActivityContentState(
+      status, minutes, lastReportISO, market,
+    );
+    const key = status + ':' + minutes + ':' + (contentState.lastReportISO || '') +
+      ':' + (contentState.marketLabel || '');
     if (laLastSent.get(shiftId) === key) return;
-    const tokens = await laTokensForShift(env, shiftId);
+    const tokens = await laTokensForShift(env, shiftId, market);
     if (!tokens || !tokens.length) return; // null (read failed) or none: do not mark sent, retry next tick
     const queued = await enqueueLiveActivityPush(env, tokens.map((t) => t.token), 'update',
       contentState);

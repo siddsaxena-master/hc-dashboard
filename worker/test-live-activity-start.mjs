@@ -67,6 +67,7 @@ const claimA = {
   report_lat: 40.586659,
   report_lng: -74.323824,
   generation: 1,
+  market: 'ny',
 };
 
 const claimB = {
@@ -78,7 +79,7 @@ const claimB = {
   token: 'b'.repeat(64),
 };
 
-function installFetchHarness(initialClaimBatches) {
+function installFetchHarness(initialClaimBatches, { v2Missing = false } = {}) {
   const claimBatches = [...initialClaimBatches];
   const calls = [];
   const queuePosts = [];
@@ -95,11 +96,19 @@ function installFetchHarness(initialClaimBatches) {
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ url, method, body });
 
-    if (method === 'POST' && url.endsWith('/rpc/hc_claim_live_activity_starts')) {
+    if (method === 'POST' && url.endsWith('/rpc/hc_claim_live_activity_starts_v2')) {
       assert.equal(typeof body.p_claimed_at, 'string');
       assert.equal(typeof body.p_stale_before, 'string');
       assert.equal(typeof body.p_started_after, 'string');
       assert.equal(body.p_limit, 50);
+      if (v2Missing) {
+        v2Missing = false;
+        return reply(404, { code: 'PGRST202', message: 'function not found' });
+      }
+      return reply(200, claimBatches.shift() || []);
+    }
+
+    if (method === 'POST' && url.endsWith('/rpc/hc_claim_live_activity_starts')) {
       return reply(200, claimBatches.shift() || []);
     }
 
@@ -155,13 +164,27 @@ const offlineEnv = {
   SUPABASE_SERVICE_KEY: 'offline-test-key',
 };
 
-await check('content state includes a normalized optional last report time', () => {
+await check('content state includes normalized GPS time and safe market labels', () => {
   assert.deepEqual(
-    buildLiveActivityContentState('At NJ Garage', 0, reportAt),
-    { status: 'At NJ Garage', statusMinutes: 0, lastReportISO: reportAt },
+    buildLiveActivityContentState('At NJ Garage', 0, reportAt, 'ny'),
+    {
+      status: 'At NJ Garage',
+      statusMinutes: 0,
+      lastReportISO: reportAt,
+      marketLabel: 'NJ',
+    },
   );
   assert.deepEqual(
-    buildLiveActivityContentState('Enroute', 0, 'not-a-date'),
+    buildLiveActivityContentState('Enroute', 0, reportAt, 'MIAMI'),
+    {
+      status: 'Enroute',
+      statusMinutes: 0,
+      lastReportISO: reportAt,
+      marketLabel: 'Miami',
+    },
+  );
+  assert.deepEqual(
+    buildLiveActivityContentState('Enroute', 0, 'not-a-date', 'unknown'),
     { status: 'Enroute', statusMinutes: 0 },
   );
 });
@@ -340,9 +363,10 @@ await check('normal clock-in alert scan contains no Live Activity START path', (
   assert.ok(workerSource.includes('await runLiveActivityStartScan(env);'));
   assert.ok(workerSource.indexOf('await runLiveActivityStartScan(env);') <
     workerSource.indexOf('await runClockInAlertScan(env);'));
-  assert.ok(workerSource.includes(
-    'updateShiftLiveActivity(env, row.id, laStatus, laMins, p.at)'
-  ));
+  assert.match(
+    workerSource,
+    /updateShiftLiveActivity\(\s*env,\s*row\.id,\s*laStatus,\s*laMins,\s*p\.at,\s*row\.market,?\s*\)/,
+  );
 });
 
 await check('unconfirmed stable START queue rows survive the seven-day purge', () => {
@@ -382,6 +406,7 @@ await check('one claimed phone queues one stable START and completes its exact l
     assert.equal(queued.payload.aps.event, 'start');
     assert.equal(queued.payload.headers.expiration, 0);
     assert.equal(queued.payload.aps['content-state'].lastReportISO, reportAt);
+    assert.equal(queued.payload.aps['content-state'].marketLabel, 'NJ');
     assert.equal(queued.payload.aps.attributes.shiftId, shiftId);
     assert.equal(queued.payload.live_activity_start_delivery_id, deliveryA);
     assert.equal(queued.payload.live_activity_start_generation, 1);
@@ -396,6 +421,25 @@ await check('one claimed phone queues one stable START and completes its exact l
     assert.ok(completions[0].url.includes('start_token=eq.' + claimA.token));
     assert.ok(completions[0].url.includes('claimed_at=eq.'));
     assert.equal(completions[0].body.claimed_at, null);
+  } finally {
+    h.restore();
+  }
+});
+
+await check('pre-022 Worker falls back once to the proven START claim', async () => {
+  const h = installFetchHarness([[{ ...claimA, market: undefined }]], { v2Missing: true });
+  try {
+    assert.equal(await runLiveActivityStartScan(offlineEnv), 1);
+    assert.equal(h.queueById.size, 1);
+    assert.deepEqual(
+      h.calls.filter((call) => call.url.includes('/rpc/hc_claim_live_activity_starts'))
+        .map((call) => call.url.split('/rpc/')[1]),
+      ['hc_claim_live_activity_starts_v2', 'hc_claim_live_activity_starts'],
+    );
+    assert.equal(
+      h.queueById.get(queueA).payload.aps['content-state'].marketLabel,
+      undefined,
+    );
   } finally {
     h.restore();
   }

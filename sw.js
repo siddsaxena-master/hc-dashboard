@@ -5,7 +5,7 @@
 //  - Cross-origin calls (Supabase, Google sign-in, fonts) always go to the network.
 //  - Writes (POST/PATCH) are never touched, so signing/saving works normally.
 
-const CACHE = 'hc-deliveries-v4';  // v4: 2026-07-07 pending-payment excludes cancelled — bump forces clients to fetch the new shell
+const CACHE = 'hc-deliveries-v6';  // v6: connected launches fetch the latest security-sensitive page first
 const SHELL = [
   './',
   './index.html',
@@ -36,6 +36,25 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;                 // leave writes alone
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;  // let Supabase/Google/fonts hit the network
+
+  // The HTML contains the authentication and authorization client. When online,
+  // always fetch its newest version before considering the offline copy.
+  if (req.mode === 'navigate' || url.pathname.endsWith('/index.html')) {
+    e.respondWith(
+      fetch(req)
+        .then((resp) => {
+          if (resp && resp.status === 200) {
+            const copy = resp.clone();
+            caches.open(CACHE).then((c) => c.put(req, copy));
+          }
+          return resp;
+        })
+        .catch(async () => (await caches.match(req)) || caches.match('./index.html'))
+    );
+    return;
+  }
+
+  // Static shell assets stay fast and refresh quietly in the background.
   e.respondWith(
     caches.match(req).then((cached) => {
       const fromNet = fetch(req).then((resp) => {
