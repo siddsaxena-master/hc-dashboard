@@ -56,6 +56,15 @@
   unfinished `la_end` rows, no blocked or exhausted END outcome, and visual
   confirmation that every owner or manager iPhone is clear. Then disable both
   temporary components.
+- The disposable-project database rehearsal is
+  `rehearsal/fake-apple-end-acceptance.mjs`. It is hard-locked to project
+  `gfbtxfwavninuapjzksk`, requires the matching
+  `HC_FAKE_APPLE_REHEARSAL_PROJECT` confirmation, invokes the real temporary
+  producer, and substitutes a local accepted response for Apple. It never
+  reads Apple credentials or contacts Apple. Run it only after rehearsal 013,
+  with the disposable project's URL and service key already loaded in the
+  process environment. It waits one full five-minute producer interval and
+  requires both reviewed zero-count gates to pass.
 - Deploy the normal current Worker and pushdrain only after migration 029.
 - The full reviewed sequence is in
   `../hc-field-app/PRODUCTION-ROLLOUT-2026-08-27.md`.
