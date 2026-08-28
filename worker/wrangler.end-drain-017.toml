@@ -1,0 +1,14 @@
+name = "hc-live-activity-end-drain-017"
+main = "end-drain-017.js"
+compatibility_date = "2024-01-01"
+workers_dev = false
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+END_DRAIN_MAX_BATCHES = "1"
+
+# Temporary recovery Worker for the migration-017 to migration-021 window.
+# It has no public route and its JavaScript exports no fetch handler.
+# Required secrets: SUPABASE_URL and SUPABASE_SERVICE_KEY.

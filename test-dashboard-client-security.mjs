@@ -71,6 +71,264 @@ const completeLock = completeAuthBlock.indexOf('lockDashboardForMfa(bootstrap)')
 const completeFullClaim = completeAuthBlock.indexOf('const profile=await claimDashboardProfile();');
 check(completeBootstrap >= 0 && completeAal > completeBootstrap && completeLock > completeAal && completeFullClaim > completeLock, 'owner bootstrap and AAL2 gate run before the full profile claim');
 
+const compatHelperStart = script.indexOf('function authErrorMessage(data,fallback)');
+const compatHelperEnd = script.indexOf('function staleSessionError()', compatHelperStart);
+const compatSessionStart = script.indexOf('function staleSessionError()', compatHelperEnd);
+const compatSessionEnd = script.indexOf('function normalizeSession(data)', compatSessionStart);
+const compatClaimsStart = script.indexOf('async function fetchVerifiedDashboardAuthUser()');
+const compatClaimsEnd = script.indexOf('function setAuthError(message)', compatClaimsStart);
+check(compatHelperStart >= 0 && compatHelperEnd > compatHelperStart && compatSessionStart >= 0 && compatSessionEnd > compatSessionStart && compatClaimsStart >= 0 && compatClaimsEnd > compatClaimsStart, 'transition compatibility functions are extractable for behavior tests');
+
+const compatStorage = new Map();
+let compatRpcCalls = [];
+let compatAuthCalls = 0;
+let compatRpcHandler = null;
+let compatAuthHandler = null;
+const compatResponse = (status, body) => ({
+  status,
+  ok: status >= 200 && status < 300,
+  json: async () => body,
+});
+const compatUserId = '11111111-1111-4111-8111-111111111111';
+const compatOtherUserId = '22222222-2222-4222-8222-222222222222';
+const compatEmail = 'owner@example.com';
+const compatMissing = (rpcName, overrides = {}) => compatResponse(404, {
+  code: 'PGRST202',
+  message: `Could not find the function public.${rpcName} in the schema cache`,
+  ...overrides,
+});
+const compatSandbox = {
+  UUID_RE: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  FINAL_AUTH_BOOTSTRAP_SEEN_KEY: 'hc_final_auth_bootstrap_seen_v1',
+  FINAL_PROFILE_V2_SEEN_KEY: 'hc_final_profile_v2_seen_v1',
+  localStorage: {
+    getItem(key) { return compatStorage.has(key) ? compatStorage.get(key) : null; },
+    setItem(key, value) { compatStorage.set(key, String(value)); },
+  },
+  dashboardSessionGeneration: 1,
+  sbSession: { refresh_token: 'refresh-a' },
+  currentUserId: compatUserId,
+  supabaseFetch: async (path, options) => {
+    compatRpcCalls.push(path);
+    return compatRpcHandler(path, options);
+  },
+  authApiFetch: async (path, options) => {
+    compatAuthCalls += 1;
+    return compatAuthHandler(path, options);
+  },
+};
+vm.runInNewContext(
+  `${script.slice(compatHelperStart, compatHelperEnd)}\n` +
+  `${script.slice(compatSessionStart, compatSessionEnd)}\n` +
+  `${script.slice(compatClaimsStart, compatClaimsEnd)}\n` +
+  'globalThis.compatApi={isExactMissingRpc,claimAuthBootstrap,claimDashboardProfile};',
+  compatSandbox,
+);
+const compatApi = compatSandbox.compatApi;
+const resetCompat = () => {
+  compatStorage.clear();
+  compatRpcCalls = [];
+  compatAuthCalls = 0;
+  compatSandbox.dashboardSessionGeneration = 1;
+  compatSandbox.sbSession = { refresh_token: 'refresh-a' };
+  compatSandbox.currentUserId = compatUserId;
+  compatAuthHandler = async () => compatResponse(200, {
+    id: compatUserId,
+    email: compatEmail,
+    email_confirmed_at: '2026-08-27T00:00:00Z',
+  });
+};
+const compatRejectsStatus = async (work, status, message) => {
+  await assert.rejects(work, (error) => Number(error?.status) === status, message);
+  checks += 1;
+};
+
+const exactMissingBody = {
+  code: 'PGRST202',
+  details: 'Searched for public.hc_get_auth_bootstrap without parameters',
+};
+check(compatApi.isExactMissingRpc(compatResponse(404, exactMissingBody), exactMissingBody, 'hc_get_auth_bootstrap') === true, 'exact target 404/PGRST202 is recognized');
+for (const [status, body] of [
+  [401, exactMissingBody],
+  [403, exactMissingBody],
+  [429, exactMissingBody],
+  [500, exactMissingBody],
+  [404, { ...exactMissingBody, code: 'PGRST203' }],
+  [404, { ...exactMissingBody, details: 'Searched for public.some_other_function' }],
+  [404, { ...exactMissingBody, details: 'Searched for public.hc_get_auth_bootstrap_v2' }],
+  [404, { ...exactMissingBody, details: 'Searched for xpublic.hc_get_auth_bootstrap' }],
+  [404, null],
+  [404, '<html>missing</html>'],
+]) {
+  check(compatApi.isExactMissingRpc(compatResponse(status, body), body, 'hc_get_auth_bootstrap') === false, `non-exact missing response ${status} fails closed`);
+}
+
+resetCompat();
+compatRpcHandler = async (path) => {
+  assert.equal(path, 'rpc/hc_get_auth_bootstrap');
+  return compatResponse(200, [{ auth_user_id: compatUserId, role: 'owner', mfa_required: true }]);
+};
+const finalCompatBootstrap = await compatApi.claimAuthBootstrap();
+check(finalCompatBootstrap.userId === compatUserId && finalCompatBootstrap.role === 'owner' && finalCompatBootstrap.mfaRequired === true && finalCompatBootstrap.transition === undefined, 'valid final bootstrap never enters transition mode');
+check(compatRpcCalls.length === 1 && compatAuthCalls === 0, 'valid final bootstrap never calls a profile fallback');
+check(compatStorage.get('hc_final_auth_bootstrap_seen_v1') === '1', 'valid final bootstrap permanently records the no-downgrade marker');
+
+compatRpcCalls = [];
+compatRpcHandler = async () => compatMissing('hc_get_auth_bootstrap');
+await compatRejectsStatus(() => compatApi.claimAuthBootstrap(), 503, 'seen final bootstrap cannot downgrade');
+check(compatRpcCalls.length === 1, 'a seen final bootstrap blocks before any legacy profile call');
+
+resetCompat();
+compatRpcHandler = async (path) => {
+  if (path === 'rpc/hc_get_auth_bootstrap') return compatMissing('hc_get_auth_bootstrap');
+  if (path === 'rpc/hc_claim_field_worker_v2') return compatMissing('hc_claim_field_worker_v2');
+  if (path === 'rpc/hc_claim_field_worker') return compatResponse(200, [{
+    email: compatEmail,
+    name: 'Transition Owner',
+    market: 'ny',
+    role: 'owner',
+  }]);
+  throw new Error(`unexpected RPC ${path}`);
+};
+const transitionOwnerBootstrap = await compatApi.claimAuthBootstrap();
+check(transitionOwnerBootstrap.userId === compatUserId && transitionOwnerBootstrap.role === 'owner' && transitionOwnerBootstrap.mfaRequired === true && transitionOwnerBootstrap.transition === true, 'transition owner is routed to MFA using only verified UUID and role');
+check(!('email' in transitionOwnerBootstrap) && !('name' in transitionOwnerBootstrap) && !('market' in transitionOwnerBootstrap), 'transition bootstrap discards profile fields before MFA');
+check(compatRpcCalls.join(',') === 'rpc/hc_get_auth_bootstrap,rpc/hc_claim_field_worker_v2,rpc/hc_claim_field_worker' && compatAuthCalls === 1, 'pre-026 dashboard uses the authenticated v1 claim plus server user verification');
+
+resetCompat();
+compatRpcHandler = async (path) => {
+  if (path === 'rpc/hc_get_auth_bootstrap') return compatMissing('hc_get_auth_bootstrap');
+  if (path === 'rpc/hc_claim_field_worker_v2') return compatMissing('hc_claim_field_worker_v2');
+  return compatResponse(200, [{ email: 'manager@example.com', name: 'Manager', market: ' NY ', role: 'Manager' }]);
+};
+compatSandbox.currentUserId = compatOtherUserId;
+compatAuthHandler = async () => compatResponse(200, {
+  id: compatOtherUserId,
+  email: 'manager@example.com',
+  email_confirmed_at: '2026-08-27T00:00:00Z',
+});
+const transitionManagerBootstrap = await compatApi.claimAuthBootstrap();
+check(transitionManagerBootstrap.userId === compatOtherUserId && transitionManagerBootstrap.role === 'manager' && transitionManagerBootstrap.mfaRequired === false, 'transition manager remains AAL1 with a server-derived normalized role');
+
+resetCompat();
+compatRpcHandler = async (path) => path.endsWith('_v2')
+  ? compatMissing('hc_claim_field_worker_v2')
+  : compatResponse(200, [{ email: compatEmail, name: 'Owner', market: 'ny', role: 'owner' }]);
+compatAuthHandler = async () => compatResponse(200, {
+  id: compatOtherUserId,
+  email: compatEmail,
+  email_confirmed_at: '2026-08-27T00:00:00Z',
+});
+await compatRejectsStatus(() => compatApi.claimDashboardProfile(), 403, 'server user ID must match the active session');
+
+resetCompat();
+compatRpcHandler = async (path) => {
+  assert.equal(path, 'rpc/hc_claim_field_worker_v2');
+  return compatResponse(200, [{
+    auth_user_id: compatUserId,
+    email: compatEmail,
+    name: 'Owner',
+    market: 'ny',
+    role: 'owner',
+  }]);
+};
+const finalCompatProfile = await compatApi.claimDashboardProfile();
+check(finalCompatProfile.userId === compatUserId && finalCompatProfile.transition === undefined && compatRpcCalls.length === 1 && compatAuthCalls === 0, 'valid v2 profile never calls the legacy claim or Auth user endpoint');
+check(compatStorage.get('hc_final_profile_v2_seen_v1') === '1', 'valid v2 profile permanently records its no-downgrade marker');
+
+compatRpcCalls = [];
+compatRpcHandler = async () => compatMissing('hc_claim_field_worker_v2');
+await compatRejectsStatus(() => compatApi.claimDashboardProfile(), 503, 'seen v2 profile cannot downgrade');
+check(compatRpcCalls.length === 1, 'a seen v2 profile blocks before the v1 profile call');
+
+resetCompat();
+compatRpcHandler = async (path) => path.endsWith('_v2')
+  ? compatMissing('hc_claim_field_worker_v2')
+  : compatResponse(200, [{ email: compatEmail, name: 'Owner', market: 'ny', role: 'owner' }]);
+compatAuthHandler = async () => compatResponse(200, {
+  id: compatUserId,
+  email: 'different@example.com',
+  email_confirmed_at: '2026-08-27T00:00:00Z',
+});
+await compatRejectsStatus(() => compatApi.claimDashboardProfile(), 403, 'transition email mismatch must reject');
+
+resetCompat();
+compatRpcHandler = async (path) => path.endsWith('_v2')
+  ? compatMissing('hc_claim_field_worker_v2')
+  : compatResponse(200, [{ email: compatEmail, name: 'Owner', market: 'ny', role: 'owner' }]);
+compatAuthHandler = async () => compatResponse(200, {
+  id: compatUserId,
+  email: compatEmail,
+  email_confirmed_at: null,
+});
+await compatRejectsStatus(() => compatApi.claimDashboardProfile(), 403, 'unconfirmed transition email must reject');
+
+resetCompat();
+compatRpcHandler = async (path) => {
+  if (path === 'rpc/hc_get_auth_bootstrap') return compatMissing('hc_get_auth_bootstrap');
+  if (path === 'rpc/hc_claim_field_worker_v2') return compatMissing('hc_claim_field_worker_v2');
+  return compatResponse(200, [{ email: compatEmail, name: 'Owner', market: 'ny', role: 'owner' }]);
+};
+compatAuthHandler = async () => ({
+  status: 200,
+  ok: true,
+  json: async () => {
+    compatSandbox.dashboardSessionGeneration += 1;
+    compatSandbox.currentUserId = compatOtherUserId;
+    return {
+      id: compatUserId,
+      email: compatEmail,
+      email_confirmed_at: '2026-08-27T00:00:00Z',
+    };
+  },
+});
+await assert.rejects(
+  () => compatApi.claimAuthBootstrap(),
+  (error) => error?.staleSession === true,
+  'transition Auth verification rejects an account change while its response is parsed',
+);
+checks += 1;
+
+resetCompat();
+compatRpcHandler = async (path) => path.endsWith('_v2')
+  ? compatMissing('hc_claim_field_worker_v2')
+  : compatResponse(200, [{ email: compatEmail, name: 'Owner', market: 'ny', role: 'admin' }]);
+await compatRejectsStatus(() => compatApi.claimDashboardProfile(), 403, 'unknown transition role must reject');
+check(compatAuthCalls === 0, 'invalid transition role is rejected before the Auth user lookup');
+
+for (const [status, body] of [
+  [401, exactMissingBody],
+  [403, exactMissingBody],
+  [500, exactMissingBody],
+  [404, { ...exactMissingBody, code: 'PGRST205' }],
+  [404, { code: 'PGRST202', message: 'Missing public.other_rpc' }],
+  [404, null],
+]) {
+  resetCompat();
+  compatRpcHandler = async () => compatResponse(status, body);
+  await assert.rejects(() => compatApi.claimAuthBootstrap());
+  checks += 1;
+  check(compatRpcCalls.length === 1, `bootstrap response ${status} cannot reach a profile fallback`);
+}
+
+resetCompat();
+compatRpcHandler = async () => compatResponse(200, { malformed: true });
+await compatRejectsStatus(() => compatApi.claimAuthBootstrap(), 403, 'malformed successful bootstrap must reject');
+check(compatRpcCalls.length === 1, 'malformed successful bootstrap never falls back');
+
+resetCompat();
+compatRpcHandler = async (path) => {
+  if (path === 'rpc/hc_get_auth_bootstrap') return compatMissing('hc_get_auth_bootstrap');
+  if (path === 'rpc/hc_claim_field_worker_v2') return compatMissing('hc_claim_field_worker_v2');
+  return compatResponse(403, { code: '42501', message: 'owner MFA required' });
+};
+await compatRejectsStatus(() => compatApi.claimAuthBootstrap(), 503, 'post-028 stale schema cache keeps an AAL1 owner locked');
+
+const clearSessionCompatStart = script.indexOf('function clearDashboardSession()');
+const clearSessionCompatEnd = script.indexOf('function accessErrorIsDefinitive', clearSessionCompatStart);
+const clearSessionCompatBlock = script.slice(clearSessionCompatStart, clearSessionCompatEnd);
+check(!clearSessionCompatBlock.includes('FINAL_AUTH_BOOTSTRAP_SEEN_KEY') && !clearSessionCompatBlock.includes('FINAL_PROFILE_V2_SEEN_KEY'), 'logout never clears no-downgrade markers');
+
 const sensitiveStart = script.indexOf('function clearSensitiveDashboardState()');
 const sensitiveEnd = script.indexOf('function lockDashboardForMfa', sensitiveStart);
 const sensitiveBlock = script.slice(sensitiveStart, sensitiveEnd);
@@ -270,7 +528,8 @@ check(queueSandbox.queueTest.quarantine(validQueueItem, 409) === true && queueSa
 queueSandbox.queueTest.setIdentity(userB, 'same-email@example.com', 'team');
 check(queueSandbox.queueTest.loadReview().length === 0, 'a recreated same-email user cannot read the prior Auth user review queue');
 
-check(/hc-deliveries-v6/.test(serviceWorker), 'service worker cache is bumped past the insecure shell');
+const cacheVersion = Number(serviceWorker.match(/hc-deliveries-v(\d+)/)?.[1] || 0);
+check(cacheVersion >= 7, 'service worker cache is bumped past the insecure shell');
 check(/req\.mode === 'navigate'[\s\S]+fetch\(req\)[\s\S]+catch\(async \(\) => \(await caches\.match\(req\)\) \|\| caches\.match\('\.\/index\.html'\)\)/.test(serviceWorker), 'navigation and index HTML use network-first with offline fallback');
 check(/return cached \|\| fromNet/.test(serviceWorker), 'static shell assets retain cache-first background refresh');
 

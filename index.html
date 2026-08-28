@@ -2183,6 +2183,8 @@ function renderReports(){
 // 🔐  SUPABASE AUTH + SERVER-DERIVED ROLE
 // ══════════════════════════════════════════════
 const SB_SESSION_KEY='hc_sb_session_v1';
+const FINAL_AUTH_BOOTSTRAP_SEEN_KEY='hc_final_auth_bootstrap_seen_v1';
+const FINAL_PROFILE_V2_SEEN_KEY='hc_final_profile_v2_seen_v1';
 const ACCESS_RECHECK_MS=5*60*1000;
 let currentRole=null;
 let currentMarket=null;
@@ -2211,7 +2213,41 @@ function authResponseError(data,fallback,status,authRejected=false){
   const err=new Error(authErrorMessage(data,fallback));
   err.status=status;
   err.authRejected=authRejected;
+  if(data&&typeof data==='object'&&!Array.isArray(data)){
+    if(typeof data.code==='string')err.code=data.code;
+    if(typeof data.message==='string')err.serverMessage=data.message;
+  }
   return err;
+}
+
+function isExactMissingRpc(response,data,rpcName){
+  if(!response||response.ok!==false||response.status!==404||!data||
+     typeof data!=='object'||Array.isArray(data)||data.code!=='PGRST202')return false;
+  const diagnostic=[data.message,data.details,data.hint]
+    .filter(value=>typeof value==='string').join(' ').toLowerCase();
+  const normalizedRpcName=String(rpcName||'').toLowerCase();
+  if(!/^[a-z][a-z0-9_]*$/.test(normalizedRpcName))return false;
+  const target='public.'+normalizedRpcName;
+  let index=diagnostic.indexOf(target);
+  while(index>=0){
+    const before=diagnostic[index-1]||'';
+    const after=diagnostic[index+target.length]||'';
+    if(!/[a-z0-9_]/.test(before)&&!/[a-z0-9_]/.test(after))return true;
+    index=diagnostic.indexOf(target,index+target.length);
+  }
+  return false;
+}
+
+function rolloutMarkerSeen(key){
+  try{return localStorage.getItem(key)!==null;}catch(_){return true;}
+}
+
+function rememberRolloutMarker(key){
+  try{localStorage.setItem(key,'1');return true;}catch(_){return false;}
+}
+
+function transitionRpcUnavailable(){
+  return authResponseError(null,'The security upgrade is temporarily unavailable. Reload shortly.',503,false);
 }
 
 function staleSessionError(){
@@ -2372,19 +2408,41 @@ async function authApiFetch(path,opts={},retry=true){
   return resp;
 }
 
-async function claimAuthBootstrap(){
-  const resp=await supabaseFetch('rpc/hc_get_auth_bootstrap',{method:'POST',body:'{}'});
+async function fetchVerifiedDashboardAuthUser(){
+  const resp=await authApiFetch('user',{method:'GET'});
+  const responseIdentity=captureSessionIdentity();
+  const data=await resp.json().catch(()=>null);
+  requireCurrentSessionIdentity(responseIdentity);
+  if(!resp.ok)throw authResponseError(data,'Could not verify the signed-in account',resp.status,[401,403].includes(resp.status));
+  const userId=String(data?.id||'').toLowerCase();
+  const email=String(data?.email||'').trim().toLowerCase();
+  const emailConfirmedAt=String(data?.email_confirmed_at||data?.confirmed_at||'').trim();
+  const sessionUserId=String(responseIdentity.userId||'').toLowerCase();
+  if(!UUID_RE.test(userId)||userId!==sessionUserId||!email||!emailConfirmedAt){
+    throw authResponseError(null,'The signed-in account could not be verified',403,true);
+  }
+  return{userId,email,user:data};
+}
+
+async function claimTransitionDashboardProfile(){
+  const resp=await supabaseFetch('rpc/hc_claim_field_worker',{method:'POST',body:'{}'});
   const responseIdentity=captureSessionIdentity();
   const data=await resp.json().catch(()=>null);
   requireCurrentSessionIdentity(responseIdentity);
   if(!resp.ok)throw authResponseError(data,'This account is not authorized',resp.status,[401,403].includes(resp.status));
   const row=Array.isArray(data)?data[0]:null;
-  const userId=String(row?.auth_user_id||'').toLowerCase();
   const role=String(row?.role||'').trim().toLowerCase();
-  if(!UUID_RE.test(userId)||!['owner','manager','team'].includes(role)){
+  const market=String(row?.market||'').trim().toLowerCase();
+  const email=String(row?.email||'').trim().toLowerCase();
+  if(!row?.name||!email||!['owner','manager','team'].includes(role)){
     throw authResponseError(null,'This account is not on the active field roster',403,true);
   }
-  return{userId,role,mfaRequired:row?.mfa_required===true};
+  if(role!=='owner'&&!market)throw authResponseError(null,'This field account does not have a market assigned',403,true);
+  const verified=await fetchVerifiedDashboardAuthUser();
+  if(verified.email!==email){
+    throw authResponseError(null,'The signed-in account does not match the field roster',403,true);
+  }
+  return{userId:verified.userId,email,name:String(row.name),role,market:role==='owner'?null:market,transition:true};
 }
 
 async function claimDashboardProfile(){
@@ -2392,14 +2450,52 @@ async function claimDashboardProfile(){
   const responseIdentity=captureSessionIdentity();
   const data=await resp.json().catch(()=>null);
   requireCurrentSessionIdentity(responseIdentity);
-  if(!resp.ok)throw authResponseError(data,'This account is not authorized',resp.status,[401,403].includes(resp.status));
+  if(!resp.ok){
+    if(!isExactMissingRpc(resp,data,'hc_claim_field_worker_v2')){
+      throw authResponseError(data,'This account is not authorized',resp.status,[401,403].includes(resp.status));
+    }
+    if(rolloutMarkerSeen(FINAL_PROFILE_V2_SEEN_KEY))throw transitionRpcUnavailable();
+    return claimTransitionDashboardProfile();
+  }
   const row=Array.isArray(data)?data[0]:null;
-  const role=String(row?.role||'').toLowerCase();
+  const role=String(row?.role||'').trim().toLowerCase();
   const market=String(row?.market||'').trim().toLowerCase();
   const userId=String(row?.auth_user_id||'').toLowerCase();
-  if(!UUID_RE.test(userId)||!row?.email||!row?.name||!['owner','manager','team'].includes(role))throw authResponseError(null,'This account is not on the active field roster',resp.status,true);
-  if(role!=='owner'&&!market)throw authResponseError(null,'This field account does not have a market assigned',resp.status,true);
-  return{userId,email:String(row.email).toLowerCase(),name:String(row.name),role,market:role==='owner'?null:market};
+  if(!UUID_RE.test(userId)||!row?.email||!row?.name||!['owner','manager','team'].includes(role))throw authResponseError(null,'This account is not on the active field roster',403,true);
+  if(role!=='owner'&&!market)throw authResponseError(null,'This field account does not have a market assigned',403,true);
+  if(!rememberRolloutMarker(FINAL_PROFILE_V2_SEEN_KEY))throw transitionRpcUnavailable();
+  return{userId,email:String(row.email).trim().toLowerCase(),name:String(row.name),role,market:role==='owner'?null:market};
+}
+
+async function claimAuthBootstrap(){
+  const resp=await supabaseFetch('rpc/hc_get_auth_bootstrap',{method:'POST',body:'{}'});
+  const responseIdentity=captureSessionIdentity();
+  const data=await resp.json().catch(()=>null);
+  requireCurrentSessionIdentity(responseIdentity);
+  if(!resp.ok){
+    if(!isExactMissingRpc(resp,data,'hc_get_auth_bootstrap')){
+      throw authResponseError(data,'This account is not authorized',resp.status,[401,403].includes(resp.status));
+    }
+    if(rolloutMarkerSeen(FINAL_AUTH_BOOTSTRAP_SEEN_KEY))throw transitionRpcUnavailable();
+    let profile;
+    try{profile=await claimDashboardProfile();}
+    catch(err){
+      if(err?.status===403&&err?.code==='42501'&&/owner mfa required/i.test(String(err?.serverMessage||''))){
+        throw transitionRpcUnavailable();
+      }
+      throw err;
+    }
+    return{userId:profile.userId,role:profile.role,mfaRequired:profile.role==='owner',transition:true};
+  }
+  const row=Array.isArray(data)?data[0]:null;
+  const userId=String(row?.auth_user_id||'').toLowerCase();
+  const role=String(row?.role||'').trim().toLowerCase();
+  const mfaRequired=row?.mfa_required===true;
+  if(!UUID_RE.test(userId)||!['owner','manager','team'].includes(role)||(role==='owner')!==mfaRequired){
+    throw authResponseError(null,'This account is not on the active field roster',403,true);
+  }
+  if(!rememberRolloutMarker(FINAL_AUTH_BOOTSTRAP_SEEN_KEY))throw transitionRpcUnavailable();
+  return{userId,role,mfaRequired};
 }
 function setAuthError(message){
   const el=document.getElementById('pin-error');
@@ -2527,16 +2623,11 @@ function showDashboardMfaPanel({enrollment=false,selection=false,restart=false,c
 }
 
 async function getCurrentAuthUser(){
-  const resp=await authApiFetch('user',{method:'GET'});
-  const responseIdentity=captureSessionIdentity();
-  const data=await resp.json().catch(()=>null);
-  requireCurrentSessionIdentity(responseIdentity);
-  if(!resp.ok)throw authResponseError(data,'Could not verify the authenticator account',resp.status,[401,403].includes(resp.status));
-  const userId=String(data?.id||'').toLowerCase();
-  if(!UUID_RE.test(userId)||userId!==pendingMfaBootstrap?.userId){
+  const verified=await fetchVerifiedDashboardAuthUser();
+  if(verified.userId!==pendingMfaBootstrap?.userId){
     throw authResponseError(null,'The signed-in account changed',403,true);
   }
-  return data;
+  return verified.user;
 }
 
 async function enrollDashboardTotp(){

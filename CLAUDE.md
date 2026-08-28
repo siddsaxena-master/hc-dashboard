@@ -35,6 +35,11 @@
 - Migration 015 is the temporary compatibility stage. Test it in a disposable
   Supabase clone, back up production, and get Sidd's exact `yes do it` before
   running it in production.
+- `migrations/015a_closed_live_activity_end_preservation.sql` runs after 015 and
+  immediately before 016. It preserves only eligible closed-shift Apple END
+  addresses with private rollback provenance. Freeze clock-ins, require zero
+  open shifts, close the field apps, and run 015a plus 016 as one watched
+  maintenance action. Do not edit migrations 015, 016, or 017.
 - Migration 016 is the final cutoff. Run it only after every active phone has
   the authenticated app, notification rows are reconciled, physical-phone and
   service-role tests pass, and Sidd gives a separate exact approval.
@@ -43,6 +48,17 @@
   access and cannot reconstruct notification tokens deleted by 016. Test it in
   a disposable clone before the cutover, and never run it without separate
   production review and Sidd's exact approval.
+- After 017, the normal Worker and normal pushdrain are not schema-compatible
+  yet. Use only `worker/end-drain-017.js` with
+  `worker/wrangler.end-drain-017.toml` and `droplet/enddrain017.py`. The Worker
+  has no public route, and the sender handles only `la_end`. Before 021, require
+  zero closed Activity Update rows, zero live `device_id = id` rows, zero
+  unfinished `la_end` rows, no blocked or exhausted END outcome, and visual
+  confirmation that every owner or manager iPhone is clear. Then disable both
+  temporary components.
+- Deploy the normal current Worker and pushdrain only after migration 029.
+- The full reviewed sequence is in
+  `../hc-field-app/PRODUCTION-ROLLOUT-2026-08-27.md`.
 
 ## Data flow (who writes what)
 

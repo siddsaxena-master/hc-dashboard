@@ -11,8 +11,10 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationDir = join(here, '..', 'migrations');
-const [transition, cutover, worker] = await Promise.all([
+const [transition, endPreservation, endPreservationRollback, cutover, worker] = await Promise.all([
   readFile(join(migrationDir, '015_field_auth_transition.sql'), 'utf8'),
+  readFile(join(migrationDir, '015a_closed_live_activity_end_preservation.sql'), 'utf8'),
+  readFile(join(migrationDir, '015a_closed_live_activity_end_preservation_rollback.sql'), 'utf8'),
   readFile(join(migrationDir, '016_field_auth_cutover.sql'), 'utf8'),
   readFile(join(here, 'worker.js'), 'utf8'),
 ]);
@@ -108,6 +110,55 @@ check('sign-out is device scoped and also removes legacy null-device rows', () =
     .split('-- --------------------------------------------------------------------------')[0];
   assert.equal(unregister.split('(device_id = p_device_id or device_id is null)').length - 1, 2);
   assert.ok(!unregister.includes('where lower(email) = v_email;'));
+});
+
+check('015a assigns recovery IDs only to existing closed-shift update tokens', () => {
+  includesAll(endPreservation, [
+    'begin;',
+    "set local lock_timeout = '15s'",
+    "set local statement_timeout = '2min'",
+    '015a requires migration 015',
+    '015a must run before migration 016',
+    '015a must run before migration 017',
+    'in share row exclusive mode',
+    'hc_migration_private.live_activity_end_015a',
+    'every shift must be clocked out for the maintenance cutover',
+    'an unrecorded self-equal device identity already exists',
+    'a closed-shift END address would not survive migration 016',
+    'a recovery ID collides with a physical phone ID',
+    'set device_id = token_row.id',
+    "token_row.token_type = 'activity_update'",
+    'token_row.device_id is null',
+    'token_row.shift_id = closed_shift.id',
+    'closed_shift.clock_out_at is not null',
+  ]);
+  const recoveryUpdate = endPreservation
+    .split('update public.live_activity_tokens as token_row')[1]
+    .split('do $assertions$')[0];
+  assert.ok(!/delete\s+from/i.test(endPreservation));
+  assert.ok(!/token_type\s*=\s*'push_to_start'/i.test(endPreservation));
+  assert.ok(!/clock_out_at\s+is\s+null/i.test(recoveryUpdate));
+});
+
+check('015a rollback is pre-cutover-only and never deletes an END address', () => {
+  includesAll(endPreservationRollback, [
+    'begin;',
+    'private provenance is missing',
+    '015a rollback blocked: migration 016 or 017 is already active',
+    'hc_migration_private.live_activity_end_015a as marker',
+    'provenance no longer matches the preserved rows',
+    'changed row count did not match provenance',
+    'private provenance cleanup was incomplete',
+    'set device_id = null',
+    'token_row.device_id = token_row.id',
+    "token_row.token_type = 'activity_update'",
+    'closed_shift.clock_out_at is not null',
+    'commit;',
+  ]);
+  assert.ok(!/delete\s+from\s+public\./i.test(endPreservationRollback));
+  assert.equal((endPreservationRollback.match(/delete\s+from/gi) || []).length, 1);
+  assert.ok(/delete\s+from\s+hc_migration_private\.live_activity_end_015a/i.test(endPreservationRollback));
+  assert.ok(!/drop\s+(?:table|schema|function)/i.test(endPreservationRollback));
 });
 
 check('cutover prunes only after locking and keeps malformed and duplicate blockers', () => {
