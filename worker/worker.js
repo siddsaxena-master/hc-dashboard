@@ -2916,6 +2916,34 @@ function _scrubOperatorEmail(email) {
   return lower.endsWith(OPERATOR_EMAIL_DOMAIN) ? null : email;
 }
 
+// Sidd's OWN cold-email sending domains (the Instantly lookalike
+// mailboxes, the "Emma Briggs" persona). Emma CCs Sidd on every cold
+// email she sends, so a copy of each send lands in his inbox, the
+// poller forwards it here, and the classifier used to alert Sidd about
+// his own outbound mail (2026-08-31 request: stop those updates).
+// Replies from prospects come from the PROSPECT's domain, so they are
+// untouched by this list and still classify and alert normally.
+// This mirrors OWN_SENDING_DOMAINS in hc-invoice-bot/outlook_poller.py;
+// keep both lists in sync when a sending domain is added or retired.
+// NEVER add @hamptonscoconuts.com here: GoDaddy website form
+// notifications arrive FROM the owner's own address and each one is a
+// real lead (same warning as the poller's LEAD_SENDER_PATTERNS note).
+const OWN_COLD_EMAIL_DOMAINS = [
+  '@freshhamptonscoconuts.com',
+  '@gethamptonscoconuts.com',
+  '@hamptonscoco.com',
+  '@hamptoncoconuts.com',
+  '@brandedcoco.com',
+];
+
+export function isOwnColdEmailNotification(notification) {
+  const address = String(
+    notification?.resourceData?.from?.emailAddress?.address || '',
+  ).trim().toLowerCase();
+  if (!address) return false;
+  return OWN_COLD_EMAIL_DOMAINS.some((domain) => address.endsWith(domain));
+}
+
 async function handleMsGraphWebhook(request, env, url) {
   // Microsoft Graph subscriptions send a validationToken on creation; echo it back.
   if (url.searchParams.has('validationToken')) {
@@ -2958,6 +2986,10 @@ async function processMsGraphNotification(env, eventKey, notification) {
     'ms_graph',
     eventKey,
     async (receiptId, renewLease) => {
+      // Emma's own cold-email CC copies stop here: no classifier call,
+      // no lead row, no Telegram alert. Returning early still marks
+      // the delivery completed, so the row is never retried.
+      if (isOwnColdEmailNotification(notification)) return;
       const cResp = await webhookFetch(CLAUDE_API, {
         method: 'POST',
         headers: {
