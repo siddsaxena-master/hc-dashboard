@@ -202,6 +202,7 @@ button{font-family:inherit}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.2px}
 .badge::before{content:'';width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.7}
 .b-lead{background:#f1e8ff;color:#6d28d9}
+.b-invoiced{background:#e0f2fe;color:#0369a1}
 .b-deposit{background:#fef9c3;color:#854d0e}
 .b-inkind{background:#e0f2fe;color:#0369a1}
 .b-partial{background:#ffedd5;color:#9a3412}
@@ -673,10 +674,11 @@ input.autofilled{border-color:var(--green-light)!important;background:var(--gree
 <script>
 const STAGES=[
   {id:'lead',label:'Lead'},
+  {id:'quoted',label:'Quoted'},
+  {id:'invoiced',label:'Invoiced'},
   {id:'deposit_paid',label:'Deposit Paid'},
-  {id:'in_kind',label:'In-Kind (Sponsored)'},
-  {id:'stamp_ordered',label:'Stamp Ordered'},
   {id:'payment_full',label:'Fully Paid'},
+  {id:'fulfilled',label:'Fulfilled'},
   {id:'completed',label:'Completed'},
   {id:'passed',label:'Customer Passed'},
 ];
@@ -688,10 +690,25 @@ const SOURCE_OPTIONS=['Google Search','Cold Email Outreach','Referral — Event'
 const VENUE_TYPES=['Beach Club','Nightclub','Restaurant','Hotel','Country Club','Rooftop Bar','Yacht Club','Private Residence','Other'];
 const EVENT_TYPES=['Wedding','Corporate Event','Wellness Event','Birthday Party','Holiday Party','Networking Event','Product Launch','Charity Event','Bachelor/Bachelorette','Other'];
 
-let events=[], currentView='list', editingId=null;
+let events=[], currentView='list', editingId=null, newEventDraftId=null, eventSaveInFlight=false;
 let searchQuery=''; // dashboard search filter (matches name/venue/contact)
 function setSearch(v){searchQuery=(v||'').toLowerCase().trim();renderLists();}
 let calYear=new Date().getFullYear(), calMonth=new Date().getMonth();
+
+function isLeadStage(stage){return !stage||stage==='lead'||stage==='quoted';}
+function isDoneStage(stage){return stage==='fulfilled'||stage==='completed';}
+function hasRecordedPayment(e){return (parseFloat(e.deposit_amount)||0)>0||(parseFloat(e.balance_amount)||0)>0;}
+function isStampAuthorized(e){return hasRecordedPayment(e);}
+function outstandingAmount(e){return Math.max(0,(parseFloat(e.total_amount)||0)-(parseFloat(e.deposit_amount)||0)-(parseFloat(e.balance_amount)||0));}
+function paymentCardClass(e){
+  const total=parseFloat(e.total_amount)||0;
+  const received=Math.max(0,(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0));
+  return total>0&&received>=total?'pay-full':received>0?'pay-deposit':'pay-none';
+}
+function isOutstandingReceivable(e){return e.stage!=='passed'&&outstandingAmount(e)>0;}
+function shouldCollectBalance(e,days){
+  return isOutstandingReceivable(e)&&(isDoneStage(e.stage)||(days!==null&&days<=14&&days>=0));
+}
 
 // ── AI PROXY (all Claude calls go through Cloudflare Worker — no keys in browser)
 const WORKER_URL='https://hc-telegram-bot.hamptonscoconutsdash.workers.dev';
@@ -748,9 +765,17 @@ function loadEvents(){
   events=SEED;saveEvents();
 }
 function saveEvents(){
-  localStorage.setItem('hc_events',JSON.stringify(events));
-  // Auto-sync to JSONBin if connected
-  if(jbBinId&&jbMasterKey){jbPush(true);}
+  try{localStorage.setItem('hc_events',JSON.stringify(events));}catch(e){console.error('saveEvents error:',e);}
+}
+
+function upsertLocalEventsById(changedEvents){
+  const replacements=new Map();
+  (Array.isArray(changedEvents)?changedEvents:[]).forEach(event=>{
+    if(event&&UUID_RE.test(event.id||''))replacements.set(event.id,event);
+  });
+  if(!replacements.size)return;
+  events=events.filter(event=>!replacements.has(event?.id));
+  events.push(...replacements.values());
 }
 
 // ── BACKUP / RESTORE
@@ -764,12 +789,42 @@ function importData(){
   inp.addEventListener('change',function(){
     if(!this.files||!this.files[0])return;
     const r=new FileReader();
-    r.onload=function(e){
+    r.onload=async function(e){
       try{
         const imp=JSON.parse(e.target.result);
         if(!Array.isArray(imp)){alert('Invalid backup file.');return;}
         if(!confirm(`Import ${imp.length} events? This will replace your current ${events.length} events.`))return;
-        events=imp;saveEvents();render();alert('✓ '+imp.length+' events restored!');
+        const currentById=new Map(events.filter(x=>UUID_RE.test(x.id||'')).map(x=>[x.id,x]));
+        const restoredNewIds=new Set();
+        const restored=imp.filter(x=>x&&typeof x==='object').map(raw=>{
+          const current=currentById.get(raw.id);
+          const next={...raw};
+          if(!UUID_RE.test(next.id||'')){
+            next.id=newEventId();
+            restoredNewIds.add(next.id);
+          }
+          // A backup is not proof that money was received. Keep verified cloud
+          // amounts and status for existing rows, and start new rows unpaid.
+          next.deposit_amount=current?.deposit_amount||'';
+          next.balance_amount=current?.balance_amount||'';
+          next.pay_notes=current?.pay_notes||'';
+          if(current)next.stage=current.stage;
+          else next.stage='lead';
+          return next;
+        });
+        const existing=restored.filter(x=>currentById.has(x.id));
+        const fresh=restored.filter(x=>restoredNewIds.has(x.id));
+        const heldForReview=restored.filter(x=>!currentById.has(x.id)&&!restoredNewIds.has(x.id));
+        events=restored;saveEvents();render();
+        const writes=existing.map(next=>{
+          const patch=eventToSupabasePatch(currentById.get(next.id),next);
+          return Object.keys(patch).length?jbPatch(next.id,patch,true):Promise.resolve(true);
+        });
+        if(fresh.length)writes.push(jbUpsert(fresh,true));
+        const results=await Promise.all(writes);
+        const failed=results.filter(ok=>!ok).length;
+        const held=heldForReview.length?' '+heldForReview.length+' unseen cloud-ID row'+(heldForReview.length===1?' was':'s were')+' kept local for review and not written.':'';
+        alert((failed?'Restored locally, but '+failed+' cloud update'+(failed===1?'':'s')+' failed.':'✓ '+restored.length+' events restored!')+' Recorded payments were preserved.'+held);
       }catch(err){alert('Could not read file: '+err.message);}
     };r.readAsText(this.files[0]);
   });inp.click();
@@ -784,7 +839,8 @@ function daysUntil(dateStr){
   return Math.round((d-today)/(1000*60*60*24));
 }
 function isStampUrgent(e){
-  if(e.stage==='completed')return false;
+  if(isDoneStage(e.stage)||isLeadStage(e.stage)||e.stage==='passed')return false;
+  if(!isStampAuthorized(e))return false;
   const d=daysUntil(e.event_date||e.delivery_date);
   return d!==null&&d>=0&&d<=7&&e.stamp_status==='Not ordered';
 }
@@ -833,7 +889,7 @@ function renderOps(){
   const mf=e=>!currentMarket||!e.market||e.market===currentMarket;
   const dOf=e=>e.delivery_date||e.event_date||'';
   const rows=events.filter(e=>mf(e)&&e.stage!=='passed'&&e.stage!=='dnb'&&dayKeys.includes(dOf(e)));
-  const isLead=e=>e.stage==='lead';
+  const isLead=e=>isLeadStage(e.stage);
   const fmt=ds=>new Date(ds+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'short',day:'numeric'});
 
   // Buy plan: order coconuts at least 2 days before each delivery day.
@@ -889,59 +945,60 @@ function renderTodos(){
   const today=new Date();today.setHours(0,0,0,0);
   const todos=[];
 
-  events.filter(e=>e.stage!=='completed'&&e.stage!=='passed').forEach(e=>{
+  events.filter(e=>e.stage!=='passed').forEach(e=>{
     const evDate=parseLocalDate(e.event_date);
     const days=evDate?Math.round((evDate-today)/(1000*60*60*24)):null;
     const dep=parseFloat(e.deposit_amount)||0;
     const tot=parseFloat(e.total_amount)||0;
     const bal=parseFloat(e.balance_amount)||0;
-    const paid=dep+bal;
-    const hasPaid=dep>0||bal>0;
+    const needsOps=!isDoneStage(e.stage);
+    const stampAuthorized=isStampAuthorized(e);
 
     // 1. Stamp needs ordering — deposit or full payment received, stamp not ordered
-    if(hasPaid && e.stage!=='lead' && e.stamp_status==='Not ordered' && e.logo_received!=='unbranded'){
+    if(needsOps&&stampAuthorized&&!isLeadStage(e.stage)&&e.stamp_status==='Not ordered'&&e.logo_received!=='unbranded'){
       const urgency=days!==null&&days<=7?'urgent':'warn';
-      todos.push({urgency,tag:'stamp',text:`<strong>Make stamp</strong> (laser; buy brass stock if low) for ${e.name}${days!==null?' — event in '+days+' day'+(days===1?'':'s'):''}`,id:e.id});
+      todos.push({urgency,tag:'stamp',text:`<strong>Make stamp</strong> (laser; buy brass stock if low) for ${esc(e.name)}${days!==null?' — event in '+days+' day'+(days===1?'':'s'):''}`,id:e.id});
     }
 
     // 2. Logo PNG not received but stamp not yet ordered
-    if(hasPaid && e.stage!=='lead' && e.logo_received==='No' && e.stamp_status==='Not ordered'){
-      todos.push({urgency:'warn',tag:'logo',text:`<strong>Chase logo PNG</strong> from ${e.name} — needed before the stamp can be made`,id:e.id});
+    if(needsOps&&stampAuthorized&&!isLeadStage(e.stage)&&e.logo_received==='No'&&e.stamp_status==='Not ordered'){
+      todos.push({urgency:'warn',tag:'logo',text:`<strong>Chase logo PNG</strong> from ${esc(e.name)} — needed before the stamp can be made`,id:e.id});
     }
 
     // 3. COI requested but not yet sent (stage not completed)
-    if(e.coi_requested){
-      todos.push({urgency:'info',tag:'coi',text:`<strong>Send COI</strong> to ${e.name}`,id:e.id});
+    if(needsOps&&e.coi_requested){
+      todos.push({urgency:'info',tag:'coi',text:`<strong>Send COI</strong> to ${esc(e.name)}`,id:e.id});
     }
 
-    // 4. Balance still owed and event is upcoming within 14 days
-    if(days!==null&&days<=14&&days>=0&&tot>0&&paid<tot){
-      const owed=tot-paid;
-      todos.push({urgency:'warn',tag:'payment',text:`<strong>Collect balance</strong> from ${e.name} — $${owed.toLocaleString()} outstanding, event in ${days} day${days===1?'':'s'}`,id:e.id});
+    // 4. Balance still owed. Fulfilled and completed orders stay visible until paid.
+    if(shouldCollectBalance(e,days)){
+      const owed=outstandingAmount(e);
+      const timing=e.stage==='fulfilled'?' — fulfilled, still unpaid':e.stage==='completed'?' — completed, still unpaid':`, event in ${days} day${days===1?'':'s'}`;
+      todos.push({urgency:'warn',tag:'payment',text:`<strong>Collect balance</strong> from ${esc(e.name)} — $${owed.toLocaleString()} outstanding${timing}`,id:e.id});
     }
 
     // 5. Delivery date set but no delivery time/address
-    if((e.delivery_date||e.event_date)&&(!e.delivery_time||!e.delivery_notes)){
+    if(needsOps&&(e.delivery_date||e.event_date)&&(!e.delivery_time||!e.delivery_notes)){
       const missing=[];
       if(!e.delivery_time)missing.push('delivery window');
       if(!e.delivery_notes)missing.push('delivery address');
       if(days!==null&&days<=14&&days>=0){
-        todos.push({urgency:days<=3?'urgent':'info',tag:'delivery',text:`<strong>Confirm ${missing.join(' & ')}</strong> for ${e.name}`,id:e.id});
+        todos.push({urgency:days<=3?'urgent':'info',tag:'delivery',text:`<strong>Confirm ${missing.join(' &amp; ')}</strong> for ${esc(e.name)}`,id:e.id});
       }
     }
 
     // 6. Lead with no follow-up activity and no recent contact
-    if(e.stage==='lead'&&e.followup_added){
+    if(isLeadStage(e.stage)&&e.followup_added){
       const added=parseLocalDate(e.followup_added);
       const daysSince=Math.round((today-added)/(1000*60*60*24));
       if(daysSince>=7){
-        todos.push({urgency:'info',tag:'lead',text:`<strong>Follow up</strong> with ${e.name} — lead added ${daysSince} days ago`,id:e.id});
+        todos.push({urgency:'info',tag:'lead',text:`<strong>Follow up</strong> with ${esc(e.name)} — lead added ${daysSince} days ago`,id:e.id});
       }
     }
 
     // 7. Event is tomorrow or today and stamp not received
-    if(days!==null&&days<=1&&days>=0&&e.stage!=='lead'&&e.stamp_status!=='Received'){
-      todos.push({urgency:'urgent',tag:'stamp',text:`<strong>${days===0?'TODAY':'TOMORROW'}: Stamp not ready</strong> for ${e.name}`,id:e.id});
+    if(needsOps&&stampAuthorized&&days!==null&&days<=1&&days>=0&&!isLeadStage(e.stage)&&e.stamp_status!=='Received'){
+      todos.push({urgency:'urgent',tag:'stamp',text:`<strong>${days===0?'TODAY':'TOMORROW'}: Stamp not ready</strong> for ${esc(e.name)}`,id:e.id});
     }
   });
 
@@ -975,7 +1032,7 @@ function renderUrgent(){
   const itemsEl=document.getElementById('urgent-items');
   const urgent=events.filter(e=>e.stage!=='passed'&&isStampUrgent(e)).sort((a,b)=>daysUntil(a.event_date||a.delivery_date)-daysUntil(b.event_date||b.delivery_date));
   const leads=events.filter(e=>{
-    if(e.stage!=='lead'||!e.followup_added)return false;
+    if(!isLeadStage(e.stage)||!e.followup_added)return false;
     const added=parseLocalDate(e.followup_added);const today=new Date();today.setHours(0,0,0,0);
     const days=Math.round((today-added)/(1000*60*60*24));
     return days>0&&days%7===0;
@@ -1014,7 +1071,7 @@ function renderStageStrip(){
   STAGES.forEach(function(st){
     if(st.id==='passed')return;
     var c=counts[st.id]||0,a=amts[st.id]||0;
-    var cls=hot[st.id]?' hot':(st.id==='lead'?' warm':'');
+    var cls=hot[st.id]?' hot':(isLeadStage(st.id)?' warm':'');
     html+='<div class="stage-seg'+cls+'" title="'+st.label+'">'
       +'<div class="ss-label">'+st.label+'</div>'
       +'<div class="ss-count">'+c+'</div>'
@@ -1032,7 +1089,7 @@ function renderStats(){renderStageStrip();
   const oneTime=filteredEvents.filter(e=>e.type!=='recurring'&&e.stage!=='passed');
   const nuts=filteredEvents.reduce((s,e)=>s+(parseInt(e.coconuts)||0),0);
   const coll=filteredEvents.reduce((s,e)=>s+(parseFloat(e.deposit_amount)||0)+(parseFloat(e.balance_amount)||0),0);
-  const pend=filteredEvents.filter(e=>e.stage!=='completed'&&e.stage!=='passed').reduce((s,e)=>s+Math.max(0,(parseFloat(e.total_amount)||0)-(parseFloat(e.deposit_amount)||0)-(parseFloat(e.balance_amount)||0)),0);
+  const pend=filteredEvents.filter(isOutstandingReceivable).reduce((s,e)=>s+outstandingAmount(e),0);
   const costedEvents=filteredEvents.filter(hasProfit);
   const totalProfit=costedEvents.reduce((s,e)=>{const p=calcProfit(e);return s+p.profit;},0);
   const ownerUnlocked=document.body.classList.contains('owner-unlocked');
@@ -1047,9 +1104,9 @@ function renderStats(){renderStageStrip();
 }
 
 function stageBadge(stage){
-  const map={lead:'b-lead',deposit_paid:'b-deposit',in_kind:'b-inkind',partial_paid:'b-partial',stamp_ordered:'b-stamp',payment_full:'b-paid',completed:'b-done',passed:'b-passed',dnb:'b-dnb'};
-  const labels={lead:'⚪ Lead',deposit_paid:'🟡 Deposit',in_kind:'🤝 In-Kind',partial_paid:'🟠 Partial',stamp_ordered:'🔵 Stamp Ordered',payment_full:'🟢 Fully Paid',completed:'✓ Done',passed:'✕ Passed',dnb:'🚫 DNB'};
-  return `<span class="badge ${map[stage]||'b-lead'}">${labels[stage]||stage}</span>`;
+  const map={lead:'b-lead',quoted:'b-lead',invoiced:'b-invoiced',deposit_paid:'b-deposit',payment_full:'b-paid',fulfilled:'b-done',completed:'b-done',passed:'b-passed',dnb:'b-dnb'};
+  const labels={lead:'⚪ Lead',quoted:'📝 Quoted',invoiced:'🧾 Invoiced',deposit_paid:'🟡 Deposit',payment_full:'🟢 Fully Paid',fulfilled:'✓ Fulfilled',completed:'✓ Done',passed:'✕ Passed',dnb:'🚫 DNB'};
+  return `<span class="badge ${map[stage]||'b-lead'}">${labels[stage]||esc(stage||'Lead')}</span>`;
 }
 function stampBadge(e,urgent){
   if(urgent)return`<span class="badge b-stamp-urgent">🚨 ORDER STAMP</span>`;
@@ -1254,7 +1311,7 @@ function renderLists(){
       const evEndDate=e.event_end_date?parseLocalDate(e.event_end_date):evDate;
       const isPast=evDate&&evEndDate<today;
       const isPassed=e.stage==='passed';
-      const payClass=e.stage==='payment_full'||e.stage==='completed'?'pay-full':e.stage==='partial_paid'?'pay-partial':e.stage==='deposit_paid'?'pay-deposit':e.stage==='stamp_ordered'?'pay-partial':'pay-none';
+      const payClass=paymentCardClass(e);
       return divider+`<div class="event-card market-${e.market||''} ${payClass}${urg?' urgent':''}${isPast?' past-event':''}${isPassed?' passed-event':''}${isDnbItem?' dnb-event':''}" onclick="openEdit('${e.id}')">
         <div class="event-card-top">
           <div>
@@ -1461,7 +1518,7 @@ function renderCal(){
       if(e._placeholder)return`<div class="cal-ev multi-slot-placeholder">&nbsp;</div>`;
       const urg=isStampUrgent(e);
       const typeClass=e.type==='recurring'?'type-recurring':'type-event market-'+(e.market||'');
-      const isLead=(e.stage==='lead'||!e.stage)&&e.stage!=='in_kind';
+      const isLead=isLeadStage(e.stage);
       const isPassed=e.stage==='passed';
       const stageClass=isPassed?' cal-passed':isLead?' cal-lead':' cal-confirmed';
       let multiClass='';
@@ -1502,8 +1559,8 @@ function calNext(){calMonth++;if(calMonth>11){calMonth=0;calYear++;}renderCal();
 function calToday(){calYear=new Date().getFullYear();calMonth=new Date().getMonth();renderCal();}
 
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function openNew(type){editingId=null;buildModal({type:type||'event'});}
-function openEdit(id){editingId=id;buildModal(events.find(x=>x.id===id)||{});}
+function openNew(type){editingId=null;newEventDraftId=null;buildModal({type:type||'event'});}
+function openEdit(id){editingId=id;newEventDraftId=null;buildModal(events.find(x=>x.id===id)||{});}
 
 // ── MODAL
 function buildModal(e){
@@ -1628,14 +1685,16 @@ function formBody(e){
       <input type="hidden" id="f-logo-data-url" value="">
     </div>
     <div class="sec-hdr">Pipeline</div>
-    <div class="field"><label class="flbl">Stage</label><select id="f-stage" onchange="onStageChange(this.value)">${STAGES.map(s=>`<option value="${s.id}"${e.stage===s.id?' selected':''}>${s.label}</option>`).join('')}</select></div>
+    <div class="field"><label class="flbl">Stage</label><select id="f-stage" disabled aria-describedby="stage-source-copy">${STAGES.map(s=>`<option value="${s.id}"${(e.stage||'lead')===s.id?' selected':''}>${s.label}</option>`).join('')}</select></div>
+    <div class="field full" id="stage-source-copy" style="font-size:11px;color:var(--text-muted);margin-top:-8px">Stage is managed by QuickBooks and operations. It is display-only here.</div>
     <div class="sec-hdr">Payment</div>
     <div class="field"><label class="flbl">Pre-tax total ($) <span style="font-weight:400;font-size:9px;color:var(--text-hint)">used for profit calc</span></label><input type="number" id="f-pretax" value="${e.pre_tax_amount||''}" placeholder="0.00" oninput="autoCalcTax()"></div>
     <div class="field"><label class="flbl">Tax ($)</label><input type="number" id="f-tax" value="${e.tax_amount||''}" placeholder="0.00" oninput="autoCalcTax()"></div>
     <div class="field"><label class="flbl">Total incl. tax ($)</label><input type="number" id="f-total" value="${e.total_amount||''}" placeholder="0.00" style="background:#f5f3ee;color:var(--text-muted)" readonly></div>
-    <div class="field"><label class="flbl">Deposit received ($)</label><input type="number" id="f-deposit" value="${e.deposit_amount||''}" placeholder="0.00"></div>
-    <div class="field"><label class="flbl">Balance received ($)</label><input type="number" id="f-balance" value="${e.balance_amount||''}" placeholder="0.00"></div>
-    <div class="field"><label class="flbl">Payment notes</label><input type="text" id="f-pay-notes" value="${esc(e.pay_notes||'')}" placeholder="Venmo, check #1024"></div>
+    <div class="field"><label class="flbl">Deposit received ($)</label><input type="number" id="f-deposit" value="${e.deposit_amount||''}" placeholder="0.00" readonly aria-describedby="payment-source-copy" style="background:#f5f3ee;color:var(--text-muted)"></div>
+    <div class="field"><label class="flbl">Balance received ($)</label><input type="number" id="f-balance" value="${e.balance_amount||''}" placeholder="0.00" readonly aria-describedby="payment-source-copy" style="background:#f5f3ee;color:var(--text-muted)"></div>
+    <div class="field"><label class="flbl">Payment notes</label><input type="text" id="f-pay-notes" value="${esc(e.pay_notes||'')}" readonly aria-describedby="payment-source-copy" style="background:#f5f3ee;color:var(--text-muted)"></div>
+    <div class="field full" id="payment-source-copy" style="font-size:11px;color:var(--text-muted);margin-top:-8px">Received payment amounts and payment status come from verified QuickBooks records. Legacy or manual payment notes are context only, not proof of payment. These fields are display-only here.</div>
     ${!isRecurring?`
     <div class="sec-hdr">Delivery</div>
     <div class="field"><label class="flbl">Delivery date</label><input type="date" id="f-delivery-date" value="${e.delivery_date||''}"></div>
@@ -1824,20 +1883,6 @@ function autoCalcTax(){
   const totalEl=document.getElementById('f-total');
   if(totalEl)totalEl.value=(pre+tax>0?(pre+tax).toFixed(2):'');
 }
-function onStageChange(val){
-  if(val!=='payment_full')return;
-  const total=parseFloat(document.getElementById('f-total')?.value)||0;
-  const deposit=parseFloat(document.getElementById('f-deposit')?.value)||0;
-  if(total<=0)return;
-  const bal=Math.max(0,total-deposit);
-  const balEl=document.getElementById('f-balance');
-  if(balEl&&(!balEl.value||parseFloat(balEl.value)===0)){
-    balEl.value=bal.toFixed(2);
-    balEl.style.borderColor='var(--green)';
-    balEl.style.background='#f0faf5';
-    setTimeout(()=>{balEl.style.borderColor='';balEl.style.background='';},2000);
-  }
-}
 function updateDebriefStyle(cb){
   const lbl=cb.closest('label');
   if(!lbl)return;
@@ -1859,34 +1904,60 @@ function updateCrackTotal(){
   if(el)el.value=(s+c+w)+(t?' / '+t:'');
 }
 
-function closeModal(){const o=document.getElementById('modal-overlay');if(o)o.remove();if(currentView==='cal')renderCal();}
+function closeModal(){const o=document.getElementById('modal-overlay');if(o)o.remove();newEventDraftId=null;if(currentView==='cal')renderCal();}
 
-function saveEvent(){
+async function saveEvent(){
+  if(eventSaveInFlight)return;
   const d=getCurrentFormData();
   const name=d.name.trim();
   if(!name){alert('Please enter a name.');return;}
-  const isRecurring=d.type==='recurring';
+  const oldEvent=editingId?events.find(x=>x.id===editingId):null;
+  if(oldEvent){
+    d.stage=oldEvent.stage;
+    d.deposit_amount=oldEvent.deposit_amount;
+    d.balance_amount=oldEvent.balance_amount;
+    d.pay_notes=oldEvent.pay_notes;
+  }else{
+    d.stage='lead';
+    d.deposit_amount='';
+    d.balance_amount='';
+    d.pay_notes='';
+  }
   const ev={
-    id:editingId||('ev_'+Date.now()),
+    id:editingId||(newEventDraftId||(newEventDraftId=newEventId())),
     ...d,
     name,
-    followup_added:d.stage==='lead'?(editingId?(events.find(x=>x.id===editingId)?.followup_added||new Date().toISOString().slice(0,10)):new Date().toISOString().slice(0,10)):'',
+    followup_added:isLeadStage(d.stage)?(editingId?(oldEvent?.followup_added||new Date().toISOString().slice(0,10)):new Date().toISOString().slice(0,10)):'',
   };
+  eventSaveInFlight=true;
+  let saved=false;
+  try{
+    if(oldEvent&&UUID_RE.test(ev.id||'')){
+      const patch=eventToSupabasePatch(oldEvent,ev);
+      saved=!Object.keys(patch).length||await jbPatch(ev.id,patch);
+    }else{
+      saved=await jbUpsert([ev]);
+    }
+  }finally{
+    eventSaveInFlight=false;
+  }
+  if(!saved){alert('This order was not saved. The cloud did not confirm exactly one matching order. Please try again.');return;}
   if(editingId){
     const i=events.findIndex(x=>x.id===editingId);
-    const oldStage=i>=0?events[i].stage:'';
     if(i>=0)events[i]=ev;else events.push(ev);
-    // Trigger telegram if stage just changed to confirmed and stamp not ordered
-    const confirmedStages=['deposit_paid','in_kind','stamp_ordered','payment_full'];
-    if(confirmedStages.includes(ev.stage)&&oldStage!==ev.stage&&ev.stamp_status==='Not ordered'){
-      sendTelegramStampAlert(ev,0);
-    }
-  } else events.push(ev);
+  }else upsertLocalEventsById([ev]);
   saveEvents();closeModal();render();
+  if(isStampAuthorized(ev)&&!isStampAuthorized(oldEvent||{})&&!isLeadStage(ev.stage)&&!isDoneStage(ev.stage)&&ev.stage!=='passed'&&ev.stamp_status==='Not ordered'){
+    sendTelegramStampAlert(ev,(parseFloat(ev.deposit_amount)||0)+(parseFloat(ev.balance_amount)||0));
+  }
 }
 
-function delEvent(id){
+async function delEvent(id){
   if(!confirm('Delete this entry?'))return;
+  if(UUID_RE.test(id||'')){
+    const deleted=await jbDelete(id);
+    if(!deleted){alert('This order was not deleted. The cloud did not confirm exactly one matching order. Please try again.');return;}
+  }
   events=events.filter(e=>e.id!==id);
   saveEvents();closeModal();render();
 }
@@ -1901,10 +1972,10 @@ async function onInvoiceFile(file){
     const isImg=file.type.startsWith('image/');
     const mt=isImg?file.type:'application/pdf';
     const cb=isImg?{type:'image',source:{type:'base64',media_type:mt,data:b64}}:{type:'document',source:{type:'base64',media_type:'application/pdf',data:b64}};
-    const sysPrompt=`You are an invoice parser for Hamptons Coconuts. Return ONLY valid JSON, no markdown, no backticks: {"name":"client or event name","venue":"venue","contact":"contact person","email":"email","phone":"phone","event_date":"YYYY-MM-DD or empty","coconuts":"integer string or empty","total_amount":"number string no $ sign","deposit_amount":"deposit as number string","balance_amount":"balance as number string","stamp_design":"branding notes","delivery_notes":"delivery address or location","notes":"other info"}`;
+    const sysPrompt=`You are an invoice parser for Hamptons Coconuts. Return ONLY valid JSON, no markdown, no backticks: {"name":"client or event name","venue":"venue","contact":"contact person","email":"email","phone":"phone","event_date":"YYYY-MM-DD or empty","coconuts":"integer string or empty","total_amount":"number string no $ sign","stamp_design":"branding notes","delivery_notes":"delivery address or location","notes":"other info"}. Never infer received payments from invoice text.`;
     const txt=await workerParseFile(sysPrompt,[cb,{type:'text',text:'Extract invoice details. JSON only.'}],1000);
     const parsed=JSON.parse(txt.replace(/```json|```/g,'').trim());
-    const map={name:'f-name',venue:'f-venue',contact:'f-contact',email:'f-email',phone:'f-phone',event_date:'f-event-date',coconuts:'f-coconuts',total_amount:'f-total',deposit_amount:'f-deposit',balance_amount:'f-balance',stamp_design:'f-stamp-design',delivery_notes:'f-delivery-notes',notes:'f-notes'};
+    const map={name:'f-name',venue:'f-venue',contact:'f-contact',email:'f-email',phone:'f-phone',event_date:'f-event-date',coconuts:'f-coconuts',total_amount:'f-total',stamp_design:'f-stamp-design',delivery_notes:'f-delivery-notes',notes:'f-notes'};
     let filled=0;
     Object.entries(map).forEach(([k,id])=>{const el=document.getElementById(id);if(el&&parsed[k]&&String(parsed[k]).trim()){el.value=parsed[k];el.classList.add('autofilled');filled++;}});
     if(parsed.coconuts)updateBoxCount(parsed.coconuts);
@@ -2276,14 +2347,16 @@ const SUPABASE_URL='https://omdcfphbwuwsrffdszlg.supabase.co';
 const SUPABASE_ANON_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9tZGNmcGhid3V3c3JmZmRzemxnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU5NTYwNjEsImV4cCI6MjA5MTUzMjA2MX0.lXrH9KPTSxVpW81ph__HlsyeP0Ln7fOpu60317tqKXA';
 const SB_HEADERS={'apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY};
 
-// Legacy JSONBin vars kept truthy so the auto-sync gate in saveEvents() still fires.
+// Legacy JSONBin names are kept for the existing connection and refresh UI.
 let jbMasterKey='supabase';
 let jbBinId='supabase';
 let jbSyncing=false;
+let jbWriteQueue=Promise.resolve();
+let jbPullPromise=null;
 
 // Vocabulary maps between hc-dashboard UI and Supabase orders schema
-const SB_STAGE_TO_UI={'inquiry':'lead','quoted':'lead','invoiced':'deposit_paid','deposit_paid':'deposit_paid','paid_full':'payment_full','fulfilled':'completed','complete':'completed','cancelled':'passed'};
-const UI_STAGE_TO_SB={'lead':'inquiry','deposit_paid':'deposit_paid','stamp_ordered':'invoiced','in_kind':'complete','payment_full':'paid_full','completed':'complete','passed':'complete'};
+const SB_STAGE_TO_UI={'inquiry':'lead','quoted':'quoted','invoiced':'invoiced','deposit_paid':'deposit_paid','paid_full':'payment_full','fulfilled':'fulfilled','complete':'completed','cancelled':'passed'};
+const UI_STAGE_TO_SB={'lead':'inquiry','quoted':'quoted','invoiced':'invoiced','deposit_paid':'deposit_paid','payment_full':'paid_full','fulfilled':'fulfilled','completed':'complete','passed':'cancelled'};
 const SB_ETYPE_TO_UI={'wedding':'Wedding','corporate':'Corporate Event','trade_show':'Networking Event','hospitality':'Other','cruise':'Other','wellness':'Wellness Event','other':'Other'};
 const UI_ETYPE_TO_SB={'Wedding':'wedding','Corporate Event':'corporate','Wellness Event':'wellness','Birthday Party':'other','Holiday Party':'other','Networking Event':'trade_show','Product Launch':'corporate','Charity Event':'other','Bachelor/Bachelorette':'other','Other':'other'};
 const SB_STAMP_TO_UI={'not_ordered':'Not ordered','ordered':'Ordered — pending','received':'Received','not_needed':'Not ordered'};
@@ -2294,6 +2367,28 @@ const SB_SOURCE_TO_UI={'website':'Google Search','referral':'WeddingPro / The Kn
 const UI_SOURCE_TO_SB={'Google Search':'website','Cold Email Outreach':'sales_engine','Referral — Event':'referral','Referral — Venue':'referral','WeddingPro / The Knot':'referral','Instagram / Social':'website','Word of Mouth':'direct','Other':'other'};
 
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function newEventId(){
+  const secureCrypto=globalThis.crypto;
+  if(secureCrypto?.randomUUID)return secureCrypto.randomUUID();
+  if(!secureCrypto?.getRandomValues)throw new Error('Secure order IDs are unavailable on this device');
+  const bytes=new Uint8Array(16);
+  secureCrypto.getRandomValues(bytes);
+  bytes[6]=(bytes[6]&15)|64;
+  bytes[8]=(bytes[8]&63)|128;
+  const hex=Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');
+  return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20);
+}
+
+function stageFromSupabase(stage){
+  if(!Object.prototype.hasOwnProperty.call(SB_STAGE_TO_UI,stage))throw new Error('Unsupported Supabase order stage: '+String(stage));
+  return SB_STAGE_TO_UI[stage];
+}
+
+function stageToSupabase(stage){
+  if(!Object.prototype.hasOwnProperty.call(UI_STAGE_TO_SB,stage))throw new Error('Unsupported dashboard order stage: '+String(stage));
+  return UI_STAGE_TO_SB[stage];
+}
 
 // Translators: Supabase row <-> hc-dashboard event
 function supabaseRowToEvent(o){
@@ -2326,7 +2421,7 @@ function supabaseRowToEvent(o){
     stamp_status:SB_STAMP_TO_UI[o.stamp_status]||'',
     logo_received:o.logo_received?'Yes':'',
     logo_data_url:'',
-    stage:SB_STAGE_TO_UI[o.stage]||'lead',
+    stage:stageFromSupabase(o.stage),
     pre_tax_amount:dollars(o.pre_tax_cents),
     tax_amount:dollars(o.tax_cents),
     total_amount:dollars(o.total_cents),
@@ -2376,7 +2471,7 @@ function eventToSupabaseRow(e){
     balance_cents:cents(e.balance_amount),
     pay_notes:e.pay_notes||null,
     external_invoice_url:e.invoice_url||null,
-    stage:UI_STAGE_TO_SB[e.stage]||'inquiry',
+    stage:stageToSupabase(e.stage),
     market:e.market||null,
     source:e.source?(UI_SOURCE_TO_SB[e.source]||'other'):null,
     delivery_at_utc:ts(e.delivery_date),
@@ -2387,9 +2482,49 @@ function eventToSupabaseRow(e){
     next_order_date:e.next_order_date||null,
     notes:e.notes||null
   };
-  // Only include id if it's already a valid UUID (existing Supabase row).
-  // New client-side events use legacy ids; Supabase will assign a UUID on insert.
+  // Every new browser order is assigned a stable UUID before its first save.
   if(UUID_RE.test(e.id||''))row.id=e.id;
+  return row;
+}
+
+function eventToSupabasePatch(before,after){
+  const withoutProtectedFields=e=>({
+    ...e,
+    stage:'lead',
+    deposit_amount:'',
+    balance_amount:'',
+    pay_notes:''
+  });
+  const previous=eventToSupabaseRow(withoutProtectedFields(before));
+  const next=eventToSupabaseRow(withoutProtectedFields(after));
+  delete previous.id;
+  delete next.id;
+  const patch={};
+  Object.keys(next).forEach(key=>{
+    if(JSON.stringify(previous[key])!==JSON.stringify(next[key]))patch[key]=next[key];
+  });
+  // These fields are owned by the verified QuickBooks and operations path.
+  // Never let this anonymous static dashboard write them, even if its DOM or
+  // cached event data is modified outside the normal display-only controls.
+  delete patch.stage;
+  delete patch.deposit_cents;
+  delete patch.balance_cents;
+  delete patch.pay_notes;
+  return patch;
+}
+
+function eventToSupabaseInsertRow(e){
+  const row=eventToSupabaseRow({
+    ...e,
+    stage:'lead',
+    deposit_amount:'',
+    balance_amount:'',
+    pay_notes:''
+  });
+  row.stage='inquiry';
+  row.deposit_cents=0;
+  row.balance_cents=null;
+  row.pay_notes=null;
   return row;
 }
 
@@ -2433,79 +2568,131 @@ async function jbConnect(){
   await jbPull();
 }
 
-async function jbPush(silent=false){
-  if(jbSyncing)return;
-  jbSyncing=true;
-  try{
-    const rows=events.map(eventToSupabaseRow);
-    const resp=await fetch(SUPABASE_URL+'/rest/v1/orders?on_conflict=id',{
-      method:'POST',
-      headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=representation'},
-      body:JSON.stringify(rows)
-    });
-    if(!resp.ok){
-      const txt=await resp.text();
-      throw new Error('Push failed ('+resp.status+'): '+txt);
-    }
-    // For new rows (no UUID sent), Supabase generated UUIDs. Map them back to local events.
-    try{
-      const returned=await resp.json();
-      if(Array.isArray(returned)){
-        const idMap={};
-        returned.forEach(r=>{const k=(r.client_name||'')+'|'+(r.event_start_at||'')+'|'+(r.total_cents??'');idMap[k]=r.id;});
-        let dirty=false;
-        events=events.map(e=>{
-          if(UUID_RE.test(e.id||''))return e;
-          const totalCents=e.total_amount?Math.round(parseFloat(e.total_amount)*100):'';
-          const startAt=e.event_date?e.event_date+'T12:00:00+00:00':null;
-          const k=(e.name||'')+'|'+(startAt||'')+'|'+(totalCents||'');
-          if(idMap[k]){dirty=true;return{...e,id:idMap[k]};}
-          return e;
-        });
-        if(dirty)localStorage.setItem('hc_events',JSON.stringify(events));
-      }
-    }catch(e){console.warn('id remap skipped:',e);}
-    if(!silent){
-      const now=new Date();
-      setSyncStatus('✓ Saved to cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
-    }
-  }catch(err){
-    if(!silent)setSyncStatus('Sync failed: '+err.message,'err');
-    console.error('jbPush error:',err);
-  }finally{
-    jbSyncing=false;
-  }
+function queueJbWrite(task){
+  const run=jbWriteQueue.then(task,task);
+  jbWriteQueue=run.catch(()=>{});
+  return run;
 }
 
-async function jbPull(){
-  setSyncStatus('<span class="sync-spinner"></span> Loading from cloud...','');
-  try{
-    const controller=new AbortController();
-    const timeout=setTimeout(()=>controller.abort(),15000);
-    const resp=await fetch(SUPABASE_URL+'/rest/v1/orders?select=*',{
-      headers:SB_HEADERS,
-      signal:controller.signal
-    });
-    clearTimeout(timeout);
-    if(!resp.ok)throw new Error('Pull failed ('+resp.status+')');
-    const rows=await resp.json();
-    if(Array.isArray(rows)){
-      events=rows.map(supabaseRowToEvent);
-      applyPendingToEvents();
-      localStorage.setItem('hc_events',JSON.stringify(events));
-      render();
-      const now=new Date();
-      setSyncStatus('✓ Loaded '+events.length+' events from cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
-    } else {
-      setSyncStatus('Cloud data looks empty — using local data','');
+function showCloudSaved(silent){
+  if(silent)return;
+  const now=new Date();
+  setSyncStatus('✓ Saved to cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
+}
+
+async function requireExactOrderWriteAck(resp,expectedId,actionLabel){
+  if(!resp.ok)throw new Error(actionLabel+' failed ('+resp.status+'): '+await resp.text());
+  let rows;
+  try{rows=await resp.json();}
+  catch(_){throw new Error(actionLabel+' failed because the cloud did not confirm the saved order');}
+  if(!Array.isArray(rows)||rows.length!==1||!rows[0]||rows[0].id!==expectedId){
+    throw new Error(actionLabel+' failed because the cloud did not confirm exactly one matching order');
+  }
+  return true;
+}
+
+async function jbPatch(id,patch,silent=false){
+  if(!UUID_RE.test(id||'')||!patch||!Object.keys(patch).length)return false;
+  const body=JSON.stringify(patch);
+  return queueJbWrite(async()=>{
+    try{
+      const resp=await fetch(SUPABASE_URL+'/rest/v1/orders?id=eq.'+encodeURIComponent(id)+'&select=id',{
+        method:'PATCH',
+        headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'return=representation'},
+        body
+      });
+      await requireExactOrderWriteAck(resp,id,'Save');
+      showCloudSaved(silent);
+      return true;
+    }catch(err){
+      if(!silent)setSyncStatus('Sync failed: '+err.message,'err');
+      console.error('jbPatch error:',err);
+      return false;
+    }
+  });
+}
+
+async function jbUpsert(changedEvents,silent=false){
+  if(!Array.isArray(changedEvents)||!changedEvents.length)return false;
+  let rows;
+  try{rows=changedEvents.map(eventToSupabaseInsertRow);}catch(err){if(!silent)setSyncStatus('Sync failed: '+err.message,'err');return false;}
+  if(rows.some(row=>!UUID_RE.test(row.id||'')))return false;
+  return queueJbWrite(async()=>{
+    try{
+      for(const row of rows){
+        const resp=await fetch(SUPABASE_URL+'/rest/v1/orders?on_conflict=id&select=id',{
+          method:'POST',
+          headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=representation'},
+          body:JSON.stringify(row)
+        });
+        await requireExactOrderWriteAck(resp,row.id,'Save');
+      }
+      showCloudSaved(silent);
+      return true;
+    }catch(err){
+      if(!silent)setSyncStatus('Sync failed: '+err.message,'err');
+      console.error('jbUpsert error:',err);
+      return false;
+    }
+  });
+}
+
+async function jbDelete(id,silent=false){
+  if(!UUID_RE.test(id||''))return false;
+  return queueJbWrite(async()=>{
+    try{
+      const resp=await fetch(SUPABASE_URL+'/rest/v1/orders?id=eq.'+encodeURIComponent(id)+'&select=id',{
+        method:'DELETE',
+        headers:{...SB_HEADERS,'Prefer':'return=representation'}
+      });
+      await requireExactOrderWriteAck(resp,id,'Delete');
+      showCloudSaved(silent);
+      return true;
+    }catch(err){
+      if(!silent)setSyncStatus('Sync failed: '+err.message,'err');
+      console.error('jbDelete error:',err);
+      return false;
+    }
+  });
+}
+
+function jbPull(){
+  if(jbPullPromise)return jbPullPromise;
+  const run=queueJbWrite(async()=>{
+    setSyncStatus('<span class="sync-spinner"></span> Loading from cloud...','');
+    try{
+      const controller=new AbortController();
+      const timeout=setTimeout(()=>controller.abort(),15000);
+      const resp=await fetch(SUPABASE_URL+'/rest/v1/orders?select=*',{
+        headers:SB_HEADERS,
+        signal:controller.signal
+      });
+      clearTimeout(timeout);
+      if(!resp.ok)throw new Error('Pull failed ('+resp.status+')');
+      const rows=await resp.json();
+      if(Array.isArray(rows)){
+        events=rows.map(supabaseRowToEvent);
+        applyPendingToEvents();
+        localStorage.setItem('hc_events',JSON.stringify(events));
+        render();
+        const now=new Date();
+        setSyncStatus('✓ Loaded '+events.length+' events from cloud at '+now.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),'ok');
+      } else {
+        setSyncStatus('Cloud data looks empty — using local data','');
+        render();
+      }
+    }catch(err){
+      const msg=err.name==='AbortError'?'Cloud sync timed out — using local data':('Pull failed: '+err.message);
+      setSyncStatus(msg,'err');
+      console.error('jbPull error:',err);
       render();
     }
-  }catch(err){
-    const msg=err.name==='AbortError'?'Cloud sync timed out — using local data':('Pull failed: '+err.message);
-    setSyncStatus(msg,'err');
-    console.error('jbPull error:',err);
-    render();
-  }
+  });
+  const shared=run.finally(()=>{
+    if(jbPullPromise===shared)jbPullPromise=null;
+  });
+  jbPullPromise=shared;
+  return shared;
 }
 
 function jbDisconnect(){
@@ -2573,6 +2760,8 @@ function setGmailStatus(msg,type){
 const GMAIL_SKIP_WORDS=/^(re:|fw:|fwd:)?\s*(welcome|unsubscribe|verify|confirm your email|password reset|security alert|newsletter|promotional|sale|discount|receipt for your payment|your statement|account update|shipping notification|delivery confirmed|tracking number)/i;
 // Must-parse words — if subject has these, always send to Claude
 const GMAIL_MUST_PARSE=/invoice|coconut|event|booking|order|quote|proposal|wedding|party|catering|venue|deposit|payment request|hampton/i;
+const QB_NOTIFICATION_FROM=/quickbooks|intuit|qb@|notifications@.*intuit/i;
+function isQBNotificationEmail(from){return QB_NOTIFICATION_FROM.test(String(from||''));}
 
 async function gmailCheckInbox(){
   if(!gmailToken)return;
@@ -2591,10 +2780,10 @@ async function gmailCheckInbox(){
     const newMsgs=messages.filter(m=>!processed.includes(m.id));
     if(!newMsgs.length){setGmailStatus('Inbox synced','ok');return;}
 
-    // Phase 0: Fetch headers and detect QB payments (zero AI tokens)
+    // Phase 0: Fetch headers and ignore QuickBooks-generated notices.
+    // Payment records must come from verified payment data, never email text.
     setGmailStatus(`Screening ${newMsgs.length} email${newMsgs.length>1?'s':''}...`,'');
     const candidates=[];
-    let paymentUpdates=0;
     for(const msg of newMsgs){
       try{
         const hResp=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/'+msg.id+'?format=metadata&metadataHeaders=Subject&metadataHeaders=From',{
@@ -2606,19 +2795,7 @@ async function gmailCheckInbox(){
         const subj=(hdrs.find(h=>h.name==='Subject')||{}).value||'';
         const from=(hdrs.find(h=>h.name==='From')||{}).value||'';
 
-        // QB Payment detection — no AI needed!
-        if(isQBPaymentEmail(subj,from)){
-          const detail=await gmailGetMessage(msg.id);
-          if(detail){
-            const payInfo=extractPaymentInfo(detail.subject,detail.body);
-            if(payInfo){
-              const matched=matchEventForPayment(payInfo);
-              if(matched){
-                applyPaymentUpdate(matched,payInfo);
-                paymentUpdates++;
-              }
-            }
-          }
+        if(isQBNotificationEmail(from)){
           processed.push(msg.id);
           continue;
         }
@@ -2629,15 +2806,9 @@ async function gmailCheckInbox(){
       }catch(e){processed.push(msg.id);}
     }
 
-    if(paymentUpdates>0){
-      saveEvents();render();
-      showImportToast(paymentUpdates+' payment'+(paymentUpdates>1?'s':'')+' auto-synced from QuickBooks');
-    }
-
     if(!candidates.length){
       saveProcessedIds(processed.slice(-500));
-      const msg=paymentUpdates>0?paymentUpdates+' payment'+(paymentUpdates>1?'s':'')+' synced':'Inbox synced — no new emails';
-      setGmailStatus(msg,'ok');
+      setGmailStatus('Inbox synced — no new emails','ok');
       return;
     }
 
@@ -2668,7 +2839,7 @@ async function gmailCheckInbox(){
     batchResult.forEach((eventData,i)=>{
       const c=candidateMap[i];
       if(eventData){
-        pendingImports.push({...eventData,_gmailId:c.id,_subject:c.subject});
+        pendingImports.push({...eventData,_gmailId:c.id,_subject:c.subject,_eventId:newEventId()});
         parsed++;
       }
       processed.push(c.id);
@@ -2677,8 +2848,7 @@ async function gmailCheckInbox(){
 
     if(parsed>0){
       renderImportPanel();
-      const extraMsg=paymentUpdates>0?' + '+paymentUpdates+' payment'+(paymentUpdates>1?'s':'')+' synced':'';
-      setGmailStatus(parsed+' new email'+(parsed>1?'s':'')+' ready to import'+extraMsg,'ok');
+      setGmailStatus(parsed+' new email'+(parsed>1?'s':'')+' ready to import','ok');
       const btn=document.getElementById('gmail-btn');
       btn.innerHTML='📧 Connected<span class="gmail-badge">'+parsed+'</span>';
     } else {
@@ -2760,7 +2930,7 @@ async function gmailBatchParse(emailTexts,candidateMap){
     const contentBlocks=[];
     const isImg=att.mimeType.startsWith('image/');
     contentBlocks.push(isImg?{type:'image',source:{type:'base64',media_type:att.mimeType,data:att.data}}:{type:'document',source:{type:'base64',media_type:'application/pdf',data:att.data}});
-    contentBlocks.push({type:'text',text:`The attached ${isImg?'image':'PDF'} is the actual order/invoice — extract ALL fields (customer name, contact, email, phone, address, dates, coconut count, amounts, etc.) from the attachment ONLY. Ignore the forwarder's name/email in the cover text below; it is just the person who forwarded the email to us, NOT the customer.\n\nForwarder cover (context only, do NOT extract customer info from this):\n${emailTexts[withAttachment]}\n\nReturn JSON.`});
+    contentBlocks.push({type:'text',text:`The attached ${isImg?'image':'PDF'} is the actual order/invoice — extract customer details, dates, coconut count, and invoice total from the attachment ONLY. Never infer money received, deposits paid, or balances paid from invoice or email text. Ignore the forwarder's name/email in the cover text below; it is just the person who forwarded the email to us, NOT the customer.\n\nForwarder cover (context only, do NOT extract customer info from this):\n${emailTexts[withAttachment]}\n\nReturn JSON.`});
     try{
       const t=await workerParseFile(GMAIL_PARSE_PROMPT_SINGLE,contentBlocks,500);
       const p=JSON.parse(t.replace(/```json|```/g,'').trim());
@@ -2787,14 +2957,14 @@ async function gmailBatchParse(emailTexts,candidateMap){
 }
 
 const GMAIL_PARSE_PROMPT_SINGLE=`Parse this email/invoice for Hamptons Coconuts (coconut catering). Return ONLY JSON:
-{"name":"","venue":"","contact":"","email":"","phone":"","event_date":"YYYY-MM-DD","event_end_date":"","delivery_date":"","delivery_time":"","coconuts":"int","total_amount":"num","deposit_amount":"","balance_amount":"","stamp_design":"","delivery_notes":"address","market":"ny|miami|other","event_type":"Wedding|Corporate Event|Birthday Party|Holiday Party","notes":"","is_event":true/false}
+{"name":"","venue":"","contact":"","email":"","phone":"","event_date":"YYYY-MM-DD","event_end_date":"","delivery_date":"","delivery_time":"","coconuts":"int","total_amount":"num","stamp_design":"","delivery_notes":"address","market":"ny|miami|other","event_type":"Wedding|Corporate Event|Birthday Party|Holiday Party","notes":"","is_event":true/false}
 CRITICAL — event_date extraction: Scan the entire invoice/PDF for the service/event date. It may be labeled "Service date", "Event date", "Date of service", "Activity date", "Delivery date", or appear inline in a line item description (e.g., "Coconut catering — July 3, 2026", "Wedding 7/3/26", etc.). Do NOT use the invoice date, due date, sent date, or overdue date. If you find ANY service date in the document, ALWAYS populate BOTH event_date AND delivery_date with it (YYYY-MM-DD format). Only leave blank if no service date appears anywhere.
-Leave other unknown fields empty. is_event=false for spam/newsletters/unrelated.`;
+Never infer money received, deposits paid, or balances paid from invoice or email text. Leave other unknown fields empty. is_event=false for spam/newsletters/unrelated.`;
 
 function GMAIL_PARSE_PROMPT_BATCH(n){
   return `Parse ${n} emails for Hamptons Coconuts (coconut catering). Return ONLY a JSON array of ${n} objects, one per email in order:
-[{"name":"","venue":"","contact":"","email":"","phone":"","event_date":"YYYY-MM-DD","event_end_date":"","delivery_date":"","delivery_time":"","coconuts":"int","total_amount":"num","deposit_amount":"","balance_amount":"","stamp_design":"","delivery_notes":"address","market":"ny|miami|other","event_type":"Wedding|Corporate Event|Birthday Party|Holiday Party","notes":"","is_event":true/false},...]
-Leave unknown fields empty. is_event=false for spam/newsletters/unrelated. Market: Hamptons/NYC/LI=ny, Miami/FL=miami.`;
+[{"name":"","venue":"","contact":"","email":"","phone":"","event_date":"YYYY-MM-DD","event_end_date":"","delivery_date":"","delivery_time":"","coconuts":"int","total_amount":"num","stamp_design":"","delivery_notes":"address","market":"ny|miami|other","event_type":"Wedding|Corporate Event|Birthday Party|Holiday Party","notes":"","is_event":true/false},...]
+Never infer money received, deposits paid, or balances paid from invoice or email text. Leave unknown fields empty. is_event=false for spam/newsletters/unrelated. Market: Hamptons/NYC/LI=ny, Miami/FL=miami.`;
 }
 
 function renderImportPanel(){
@@ -2832,13 +3002,13 @@ function dismissAllImports(){
   updateGmailBadge();
 }
 
-function confirmAllImports(){
+async function confirmAllImports(){
   try{
-    let count=0;
+    const imported=[];
     const gmailIds=[];
-    pendingImports.forEach((p,idx)=>{
+    pendingImports.forEach(p=>{
       const ev={
-        id:'ev_'+Date.now()+'_'+idx+'_'+Math.random().toString(36).slice(2,6),
+        id:UUID_RE.test(p._eventId||'')?p._eventId:(p._eventId=newEventId()),
         type:'event',
         name:String(p.name||p._subject||'Imported event').slice(0,200),
         stage:'lead',
@@ -2852,8 +3022,8 @@ function confirmAllImports(){
         delivery_time:String(p.delivery_time||''),
         coconuts:String(p.coconuts||''),
         total_amount:String(p.total_amount||''),
-        deposit_amount:String(p.deposit_amount||''),
-        balance_amount:String(p.balance_amount||''),
+        deposit_amount:'',
+        balance_amount:'',
         stamp_design:String(p.stamp_design||''),
         stamp_status:'Not ordered',
         delivery_notes:String(p.delivery_notes||''),
@@ -2873,14 +3043,17 @@ function confirmAllImports(){
         followup_added:new Date().toISOString().split('T')[0],
         frequency:'',next_order_date:'',order_time:'',venue_type:''
       };
-      events.push(ev);
-      count++;
+      imported.push(ev);
       if(p._gmailId)gmailIds.push(p._gmailId);
     });
+    if(!imported.length)return;
+    const saved=await jbUpsert(imported);
+    if(!saved){alert('Import failed because the cloud did not confirm every order. The emails remain ready to import.');return;}
+    upsertLocalEventsById(imported);
     pendingImports=[];
     saveEvents();render();renderImportPanel();
     updateGmailBadge();
-    showImportToast(count+' event'+(count>1?'s':'')+' imported from email');
+    showImportToast(imported.length+' event'+(imported.length>1?'s':'')+' imported from email');
     // Mark emails as read in background (non-blocking)
     gmailIds.forEach(gid=>{
       if(gmailToken){
@@ -2913,94 +3086,6 @@ function showImportToast(msg){
   t.textContent='✓ '+msg;
   document.body.appendChild(t);
   setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity 0.3s';setTimeout(()=>t.remove(),300);},3500);
-}
-
-// ══════════════════════════════════════════════
-// 💰  QUICKBOOKS PAYMENT DETECTION
-// ══════════════════════════════════════════════
-const QB_PAYMENT_SUBJECT=/payment\s*(received|request|from|reminder)|paid.*invoice|invoice.*paid|new payment|payment\s+for\s+invoice/i;
-const QB_PAYMENT_FROM=/quickbooks|intuit|qb@|notifications@.*intuit/i;
-
-function isQBPaymentEmail(subject,from){
-  return QB_PAYMENT_SUBJECT.test(subject)||QB_PAYMENT_FROM.test(from);
-}
-
-function extractPaymentInfo(subject,body){
-  const text=subject+' '+body;
-  // Extract invoice number
-  const invMatch=text.match(/invoice\s*#?\s*(\d{3,})/i);
-  const invoiceNum=invMatch?invMatch[1]:null;
-  // Extract amount paid
-  const amtMatch=text.match(/\$\s*([\d,]+\.?\d{0,2})/);
-  const amount=amtMatch?parseFloat(amtMatch[1].replace(/,/g,'')):0;
-  // Extract client name — try common QB patterns
-  const namePatterns=[
-    /from\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})/,
-    /payment.*?(?:from|by)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})/i,
-    /(?:client|customer|bill to|sold to)[:\s]+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})/i,
-  ];
-  let clientName='';
-  for(const p of namePatterns){
-    const m=text.match(p);
-    if(m){clientName=m[1].trim();break;}
-  }
-  if(!invoiceNum&&!clientName&&!amount)return null;
-  return {invoiceNum,clientName,amount};
-}
-
-function matchEventForPayment(payInfo){
-  // Priority 1: Match by invoice number in notes
-  if(payInfo.invoiceNum){
-    const match=events.find(e=>e.notes&&e.notes.includes(payInfo.invoiceNum));
-    if(match)return match;
-    const match2=events.find(e=>e.invoice_name&&e.invoice_name.includes(payInfo.invoiceNum));
-    if(match2)return match2;
-  }
-  // Priority 2: Match by total amount (exact match)
-  if(payInfo.amount>0){
-    const amtMatches=events.filter(e=>{
-      const tot=parseFloat(e.total_amount)||0;
-      return tot>0&&Math.abs(tot-payInfo.amount)<0.02;
-    });
-    if(amtMatches.length===1)return amtMatches[0];
-  }
-  // Priority 3: Fuzzy match by client name
-  if(payInfo.clientName){
-    const nameLower=payInfo.clientName.toLowerCase();
-    const nameWords=nameLower.split(/\s+/);
-    const match=events.find(e=>{
-      const eName=(e.name||'').toLowerCase();
-      return nameWords.some(w=>w.length>2&&eName.includes(w));
-    });
-    if(match)return match;
-  }
-  return null;
-}
-
-function applyPaymentUpdate(event,payInfo){
-  const total=parseFloat(event.total_amount)||0;
-  const existingDep=parseFloat(event.deposit_amount)||0;
-  const existingBal=parseFloat(event.balance_amount)||0;
-  const paid=payInfo.amount;
-
-  if(total>0&&paid>=total*0.95){
-    // Full payment (within 5% tolerance for fees)
-    event.stage='payment_full';
-    event.deposit_amount=String(existingDep||paid);
-    event.balance_amount=String(Math.max(0,total-(existingDep||paid)));
-    event.pay_notes=(event.pay_notes?event.pay_notes+' | ':'')+'QB payment $'+paid.toLocaleString()+' (auto-synced)';
-  } else if(paid>0){
-    // Partial payment (deposit)
-    if(event.stage==='lead'||!event.stage)event.stage='deposit_paid';
-    if(!existingDep)event.deposit_amount=String(paid);
-    event.balance_amount=String(Math.max(0,total-paid-existingBal));
-    event.pay_notes=(event.pay_notes?event.pay_notes+' | ':'')+'QB deposit $'+paid.toLocaleString()+' (auto-synced)';
-  }
-  // Trigger stamp alert if needed
-  if(event.stamp_status==='Not ordered'&&event.stage!=='lead'&&event.stage!=='passed'){
-    sendTelegramStampAlert(event,paid);
-  }
-  console.log('Payment auto-synced:',event.name,'$'+paid,'→',event.stage);
 }
 
 // ══════════════════════════════════════════════
@@ -3042,6 +3127,7 @@ async function sendTelegram(text){
 }
 
 function sendTelegramStampAlert(event,paymentAmount){
+  if(!isStampAuthorized(event))return false;
   const nuts=parseInt(event.coconuts)||0;
   const boxes=nuts>0?Math.ceil(nuts/9):0;
   const evDate=event.event_date?new Date(event.event_date+'T12:00:00').toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}):'TBD';
@@ -3074,7 +3160,8 @@ function checkPendingStamps(){
 
   const urgent=events.filter(e=>{
     if(e.type==='recurring')return false;
-    if(e.stage==='lead'||e.stage==='passed'||e.stage==='completed')return false;
+    if(isLeadStage(e.stage)||e.stage==='passed'||isDoneStage(e.stage))return false;
+    if(!isStampAuthorized(e))return false;
     if(e.stamp_status!=='Not ordered')return false;
     const d=parseLocalDate(e.event_date);
     if(!d)return false;
@@ -3186,7 +3273,7 @@ function renderDeliveries(){
   const deliveries=events.filter(e=>{
     if(!mf(e))return false;
     if(e.type==='recurring')return false;            // recurring templates aren't single deliveries
-    if(e.stage==='passed'||e.stage==='lead')return false; // not a booked job
+    if(e.stage==='passed'||isLeadStage(e.stage))return false; // not a booked job
     return !!(e.delivery_date||e.event_date);        // needs a date to be deliverable
   });
   const dateVal=e=>{const d=parseLocalDate(e.delivery_date||e.event_date);return d?d.getTime():Infinity;};
@@ -3358,12 +3445,12 @@ async function syncPendingDeliveries(){
         if(!r1.ok)throw new Error('signature save HTTP '+r1.status);
         // b) stamp the order itself as delivered
         const patch={delivery_signed_at:item.signedAt,delivery_signed_by:item.signedBy||null};
-        const r2=await fetch(SUPABASE_URL+'/rest/v1/orders?id=eq.'+item.orderId,{
+        const r2=await fetch(SUPABASE_URL+'/rest/v1/orders?id=eq.'+encodeURIComponent(item.orderId)+'&select=id',{
           method:'PATCH',
-          headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'return=minimal'},
+          headers:{...SB_HEADERS,'Content-Type':'application/json','Prefer':'return=representation'},
           body:JSON.stringify(patch)
         });
-        if(!r2.ok)throw new Error('order update HTTP '+r2.status);
+        await requireExactOrderWriteAck(r2,item.orderId,'Delivery update');
         // success → remove from queue + clear the "saving" flag
         q=q.filter(x=>x.localKey!==item.localKey);
         saveQueue(q);

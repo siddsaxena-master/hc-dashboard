@@ -1,0 +1,3 @@
+# Keep audited database migrations and generated rehearsals byte-stable on Windows.
+migrations/*.sql text eol=lf
+rehearsal/*.sql text eol=lf
