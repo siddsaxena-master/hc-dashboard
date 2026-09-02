@@ -411,7 +411,17 @@ begin
          and index_info.indexprs is null
          and index_info.indpred is null
          and pg_catalog.pg_get_indexdef(index_info.indexrelid, 1, true) = 'order_id'
-         and pg_catalog.pg_get_indexdef(index_info.indexrelid, 2, true) = 'last_seen_at DESC'
+         and pg_catalog.pg_get_indexdef(index_info.indexrelid, 2, true) = 'last_seen_at'
+         and pg_catalog.pg_index_column_has_property(
+           index_info.indexrelid,
+           2,
+           'desc'
+         ) is true
+         and pg_catalog.pg_index_column_has_property(
+           index_info.indexrelid,
+           2,
+           'nulls_first'
+         ) is true
      ) then
     raise exception using
       errcode = '55000',
@@ -644,7 +654,17 @@ begin
          and index_info.indexprs is null
          and index_info.indpred is null
          and pg_catalog.pg_get_indexdef(index_info.indexrelid, 1, true) = 'order_id'
-         and pg_catalog.pg_get_indexdef(index_info.indexrelid, 2, true) = 'last_seen_at DESC'
+         and pg_catalog.pg_get_indexdef(index_info.indexrelid, 2, true) = 'last_seen_at'
+         and pg_catalog.pg_index_column_has_property(
+           index_info.indexrelid,
+           2,
+           'desc'
+         ) is true
+         and pg_catalog.pg_index_column_has_property(
+           index_info.indexrelid,
+           2,
+           'nulls_first'
+         ) is true
      ) then
     raise exception using
       errcode = '55000',

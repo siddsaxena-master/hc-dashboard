@@ -505,6 +505,28 @@ check('payment ledger catalog requires all eight constraints', () => {
     );
   }
 });
+check('ledger index ordering uses PostgreSQL 17 catalog properties', () => {
+  for (const source of [migration, rollback]) {
+    assert.equal(
+      source.match(
+        /pg_get_indexdef\(index_info\.indexrelid, 2, true\) = 'last_seen_at'/g,
+      )?.length,
+      2,
+    );
+    assert.equal(
+      source.match(/pg_index_column_has_property\([\s\S]{0,120}'desc'[\s\S]{0,40}\) is true/g)?.length,
+      2,
+    );
+    assert.equal(
+      source.match(/pg_index_column_has_property\([\s\S]{0,120}'nulls_first'[\s\S]{0,40}\) is true/g)?.length,
+      2,
+    );
+    assert.doesNotMatch(
+      source,
+      /pg_get_indexdef\(index_info\.indexrelid, 2, true\) = 'last_seen_at DESC'/,
+    );
+  }
+});
 check('business transition matrix matches required workflow', () => {
   function allowed({ oldStage, newStage, deposit = 0, balance = 0, positiveHistory = false, voidHistory = false }) {
     if (oldStage === newStage) return true;

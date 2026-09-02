@@ -10,8 +10,8 @@ const rollbackPath = join(repoRoot, 'migrations', '030_order_payment_integrity_r
 const outputPath = join(here, '030_order_payment_integrity_rollback_rehearsal.sql');
 
 const expectedHashes = {
-  forward: '2dc3b2ae9d0ea26d47cf9f213436054374c49b58af5aeace8d67637857cb6185',
-  rollback: '1e6159a0ed2690439f9a0f14748f190c033d158b369948417b171edbf2ed23c5',
+  forward: '451bf850d2ed5a0321e6ea9acec4b7c064e358f62fab8f6d263d0a496cf4c27a',
+  rollback: '30f18c59b1f5ef661077a594f8eb828b531eb9d344286018fed750101e7031d2',
 };
 
 function sha256(text) {
