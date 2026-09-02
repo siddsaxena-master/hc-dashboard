@@ -25,14 +25,16 @@ ACTIONS:
 - "delete" — delete an event. Always ask for confirmation first (action:"none" with a question). Only use action:"delete" if user already confirmed.
 - "list" — just reply with a formatted list (no DB changes needed)
 
-VALID STAGES: lead, deposit_paid, in_kind, stamp_ordered, payment_full, completed, passed
+VALID STAGES: lead, quoted, invoiced, deposit_paid, payment_full, fulfilled, completed, passed
+VALID WRITABLE STAGES: lead, quoted, invoiced, fulfilled, completed, passed
 VALID STAMP_STATUS: "Not ordered", "Ordered — pending", "Received"
 VALID MARKETS: ny, miami, other
-EVENT FIELDS: name, venue, contact, email, phone, market, event_date (YYYY-MM-DD), event_end_date, coconuts, total_amount, deposit_amount, balance_amount, stamp_design, stamp_status, stage, delivery_date, delivery_time, delivery_notes, event_type, source, notes, pay_notes, coi_requested, logo_received
+EVENT FIELDS: name, venue, contact, email, phone, market, event_date (YYYY-MM-DD), event_end_date, coconuts, total_amount, stamp_design, stamp_status, stage, delivery_date, delivery_time, delivery_notes, event_type, source, notes, pay_notes, coi_requested, logo_received
 
 RULES:
-- When user says "mark as paid" or "fully paid" → update stage to "payment_full"
-- When user says "deposit paid" or "got the deposit" → update stage to "deposit_paid"
+- Payment stages deposit_paid and payment_full, plus deposit_amount and balance_amount, are read-only. Only verified QuickBooks Payment records may update them.
+- Never infer, assert, or claim that a payment was received from a Telegram message, invoice, email, note, or user statement.
+- If asked to mark a deposit or full payment, use action:"none" and explain that verified QuickBooks sync handles payment automatically.
 - When user says "stamp ordered" → update stamp_status to "Ordered — pending"
 - When user says "stamp received" or "got the stamp" → update stamp_status to "Received"
 - When searching for events, match flexibly on name, venue, or contact
@@ -50,8 +52,8 @@ const CORS_HEADERS = {
 };
 
 // ── VOCAB MAPS (mirror of dashboard's maps; keep in sync) ──
-const SB_STAGE_TO_UI = {'inquiry':'lead','quoted':'lead','invoiced':'deposit_paid','deposit_paid':'deposit_paid','paid_full':'payment_full','fulfilled':'completed','complete':'completed','cancelled':'passed'};
-const UI_STAGE_TO_SB = {'lead':'inquiry','deposit_paid':'deposit_paid','stamp_ordered':'invoiced','in_kind':'complete','payment_full':'paid_full','completed':'complete','passed':'complete'};
+const SB_STAGE_TO_UI = {'inquiry':'lead','quoted':'quoted','invoiced':'invoiced','deposit_paid':'deposit_paid','paid_full':'payment_full','fulfilled':'fulfilled','complete':'completed','cancelled':'passed'};
+const UI_STAGE_TO_SB = {'lead':'inquiry','quoted':'quoted','invoiced':'invoiced','deposit_paid':'deposit_paid','payment_full':'paid_full','fulfilled':'fulfilled','completed':'complete','passed':'cancelled'};
 const SB_ETYPE_TO_UI = {'wedding':'Wedding','corporate':'Corporate Event','trade_show':'Networking Event','hospitality':'Other','cruise':'Other','wellness':'Wellness Event','other':'Other'};
 const UI_ETYPE_TO_SB = {'Wedding':'wedding','Corporate Event':'corporate','Wellness Event':'wellness','Birthday Party':'other','Holiday Party':'other','Networking Event':'trade_show','Product Launch':'corporate','Charity Event':'other','Bachelor/Bachelorette':'other','Other':'other'};
 const SB_STAMP_TO_UI = {'not_ordered':'Not ordered','ordered':'Ordered — pending','received':'Received','not_needed':'Not ordered'};
@@ -62,6 +64,71 @@ const SB_SOURCE_TO_UI = {'website':'Google Search','referral':'WeddingPro / The 
 const UI_SOURCE_TO_SB = {'Google Search':'website','Cold Email Outreach':'sales_engine','Referral — Event':'referral','Referral — Venue':'referral','WeddingPro / The Knot':'referral','Instagram / Social':'website','Word of Mouth':'direct','Telegram bot':'other','Other':'other'};
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function stageFromSupabase(stage) {
+  if (!Object.prototype.hasOwnProperty.call(SB_STAGE_TO_UI, stage)) {
+    throw new Error('Unsupported Supabase order stage: ' + String(stage));
+  }
+  return SB_STAGE_TO_UI[stage];
+}
+
+export function stageToSupabase(stage) {
+  if (!Object.prototype.hasOwnProperty.call(UI_STAGE_TO_SB, stage)) {
+    throw new Error('Unsupported dashboard order stage: ' + String(stage));
+  }
+  return UI_STAGE_TO_SB[stage];
+}
+
+const PAYMENT_WRITE_FIELDS = new Set([
+  'deposit_amount',
+  'balance_amount',
+  'deposit_cents',
+  'balance_cents',
+]);
+
+function isPaymentManagedStage(stage) {
+  return stage === 'deposit_paid' || stage === 'payment_full';
+}
+
+function positiveMoney(value) {
+  const amount = Number(String(value ?? '').replace(/[$,\s]/g, ''));
+  return Number.isFinite(amount) && amount > 0;
+}
+
+export function hasRecordedPayment(event) {
+  return positiveMoney(event?.deposit_amount) || positiveMoney(event?.balance_amount);
+}
+
+export function canChangeStage(fromStage, toStage, hasVerifiedPayment = false) {
+  if (fromStage === toStage) return true;
+  if (isPaymentManagedStage(toStage)) return false;
+  if (isPaymentManagedStage(fromStage)) {
+    return toStage === 'fulfilled' || toStage === 'completed';
+  }
+  if (!hasVerifiedPayment) return true;
+  if (fromStage === 'completed') return false;
+  if (fromStage === 'fulfilled') return toStage === 'completed';
+  return toStage === 'fulfilled' || toStage === 'completed';
+}
+
+export function validateMutationParams(params, currentStage = '', hasVerifiedPayment = false) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
+    throw new Error('Order changes must be an object');
+  }
+  if (Object.prototype.hasOwnProperty.call(params, 'stage')) {
+    stageToSupabase(params.stage);
+    if (!canChangeStage(currentStage, params.stage, hasVerifiedPayment)) {
+      throw new Error(isPaymentManagedStage(params.stage)
+        ? 'Payment stage is managed by verified QuickBooks sync'
+        : 'A verified paid order can only advance to fulfilled or completed');
+    }
+  }
+  for (const field of PAYMENT_WRITE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(params, field)) {
+      throw new Error('Payment amount is managed by verified QuickBooks sync');
+    }
+  }
+}
 
 export default {
   // ── SCHEDULED (Cloudflare Cron Triggers) ──
@@ -139,7 +206,7 @@ export default {
           '🥥 *Hey! I\'m Claudia, your Hamptons Coconuts assistant.*\n\n' +
           'I can help you manage your dashboard. Try:\n' +
           '• "What events are coming up?"\n' +
-          '• "Mark Steven Filippi as fully paid"\n' +
+          '• "Mark Steven Filippi as fulfilled"\n' +
           '• "Add new event: John Smith, wedding, June 15, 100 coconuts"\n' +
           '• "Who needs stamps ordered?"\n' +
           '• "Give me a summary"\n\n' +
@@ -186,14 +253,61 @@ export default {
         return ok();
       }
 
-      // Execute action
-      if (claudeResp.action === 'update' && claudeResp.eventId && claudeResp.params) {
-        const idx = events.findIndex(e => e.id === claudeResp.eventId);
-        if (idx >= 0) {
-          Object.entries(claudeResp.params).forEach(([k, v]) => { events[idx][k] = v; });
-          await updateEvent(env, events[idx]);
+      // Execute action. A mutation reply is sent only after Supabase returns
+      // the exact affected order, so a rejected or zero-row write can never
+      // look successful in Telegram.
+      if (claudeResp.action === 'update') {
+        if (!claudeResp.eventId || !claudeResp.params || typeof claudeResp.params !== 'object' || Array.isArray(claudeResp.params)) {
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ I could not identify a valid order update. Nothing was changed. Please try again.');
+          return ok();
         }
-      } else if (claudeResp.action === 'create' && claudeResp.params) {
+        const idx = events.findIndex(e => e.id === claudeResp.eventId);
+        if (idx < 0) {
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ I could not find that order. Nothing was changed. Please try again.');
+          return ok();
+        }
+        try {
+          validateMutationParams(
+            claudeResp.params,
+            events[idx].stage,
+            hasRecordedPayment(events[idx]),
+          );
+        } catch (err) {
+          const message = String(err?.message || '');
+          const reply = message.startsWith('Unsupported dashboard order stage')
+            ? '❌ I did not update that order because the requested status was invalid.'
+            : message.includes('only advance')
+              ? '❌ I did not change that verified paid status. It can only advance to fulfilled or completed.'
+              : '❌ I did not update payment. Verified QuickBooks sync controls payment status and received amounts.';
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, reply);
+          return ok();
+        }
+        const beforeEvent = { ...events[idx] };
+        const afterEvent = { ...beforeEvent, ...claudeResp.params, id: beforeEvent.id };
+        const patch = buildSupabasePatch(beforeEvent, afterEvent);
+        if (!Object.keys(patch).length) {
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, 'ℹ️ That order already has those details. Nothing needed changing.');
+          return ok();
+        }
+        if (!await updateEvent(env, beforeEvent.id, patch)) {
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ I could not save that update. Nothing was changed. Please try again.');
+          return ok();
+        }
+        events[idx] = afterEvent;
+      } else if (claudeResp.action === 'create') {
+        if (!claudeResp.params || typeof claudeResp.params !== 'object' || Array.isArray(claudeResp.params)) {
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ I could not identify a valid new order. Nothing was saved. Please try again.');
+          return ok();
+        }
+        try {
+          validateMutationParams(claudeResp.params);
+        } catch (err) {
+          const reply = String(err?.message || '').startsWith('Unsupported dashboard order stage')
+            ? '❌ I did not create that order because the requested status was invalid.'
+            : '❌ I did not create that payment status. Verified QuickBooks sync controls payment status and received amounts.';
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, reply);
+          return ok();
+        }
         const newEvent = {
           id: crypto.randomUUID(),
           type: 'event',
@@ -215,9 +329,19 @@ export default {
           event_type: '', notes: '',
           ...claudeResp.params,
         };
-        await insertEvent(env, newEvent);
-      } else if (claudeResp.action === 'delete' && claudeResp.eventId) {
-        await deleteEvent(env, claudeResp.eventId);
+        if (!await insertEvent(env, newEvent)) {
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ I could not create that order. Nothing was saved. Please try again.');
+          return ok();
+        }
+      } else if (claudeResp.action === 'delete') {
+        if (!claudeResp.eventId) {
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ I could not identify the order to delete. Nothing was changed. Please try again.');
+          return ok();
+        }
+        if (!await deleteEvent(env, claudeResp.eventId)) {
+          await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ I could not delete that order. Nothing was changed. Please try again.');
+          return ok();
+        }
       }
 
       await sendTelegram(env.TG_BOT_TOKEN, chatId, claudeResp.reply || '✅ Done');
@@ -268,7 +392,7 @@ function supabaseRowToEvent(o) {
     stamp_design: o.stamp_design || '',
     stamp_status: SB_STAMP_TO_UI[o.stamp_status] || '',
     logo_received: o.logo_received ? 'Yes' : '',
-    stage: SB_STAGE_TO_UI[o.stage] || 'lead',
+    stage: stageFromSupabase(o.stage),
     pre_tax_amount: dollars(o.pre_tax_cents),
     tax_amount: dollars(o.tax_cents),
     total_amount: dollars(o.total_cents),
@@ -303,11 +427,9 @@ function eventToSupabaseRow(e) {
     pre_tax_cents: cents(e.pre_tax_amount),
     tax_cents: cents(e.tax_amount),
     total_cents: cents(e.total_amount),
-    deposit_cents: cents(e.deposit_amount) ?? 0,
-    balance_cents: cents(e.balance_amount),
     pay_notes: e.pay_notes || null,
     external_invoice_url: e.invoice_url || null,
-    stage: UI_STAGE_TO_SB[e.stage] || 'inquiry',
+    stage: stageToSupabase(e.stage),
     market: e.market || null,
     source: e.source ? (UI_SOURCE_TO_SB[e.source] || 'other') : null,
     delivery_at_utc: ts(e.delivery_date),
@@ -320,6 +442,37 @@ function eventToSupabaseRow(e) {
   };
   if (UUID_RE.test(e.id || '')) row.id = e.id;
   return row;
+}
+
+export function buildSupabasePatch(beforeEvent, afterEvent) {
+  const previous = eventToSupabaseRow(beforeEvent);
+  const next = eventToSupabaseRow(afterEvent);
+  delete previous.id;
+  delete next.id;
+  const patch = {};
+  Object.keys(next).forEach((key) => {
+    if (JSON.stringify(previous[key]) !== JSON.stringify(next[key])) patch[key] = next[key];
+  });
+  return patch;
+}
+
+async function mutationReturnedOrder(resp, expectedId, operation) {
+  if (!resp.ok) {
+    console.error('Supabase ' + operation + ' error:', resp.status, await resp.text());
+    return false;
+  }
+  let rows;
+  try {
+    rows = await resp.json();
+  } catch (e) {
+    console.error('Supabase ' + operation + ' confirmation was not valid JSON');
+    return false;
+  }
+  if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.id !== expectedId) {
+    console.error('Supabase ' + operation + ' did not confirm exactly one matching order');
+    return false;
+  }
+  return true;
 }
 
 async function readEvents(env) {
@@ -362,35 +515,27 @@ async function insertEvent(env, event) {
       headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
       body: JSON.stringify(row),
     });
-    if (!resp.ok) {
-      console.error('Supabase insert error:', resp.status, await resp.text());
-      return false;
-    }
-    return true;
+    return mutationReturnedOrder(resp, row.id, 'insert');
   } catch (e) {
     console.error('Supabase insert exception:', e);
     return false;
   }
 }
 
-async function updateEvent(env, event) {
-  if (!UUID_RE.test(event.id || '')) {
-    console.error('updateEvent: invalid UUID', event.id);
+async function updateEvent(env, eventId, patch) {
+  if (!UUID_RE.test(eventId || '')) {
+    console.error('updateEvent: invalid UUID', eventId);
     return false;
   }
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return false;
+  if (!Object.keys(patch).length) return false;
   try {
-    const row = eventToSupabaseRow(event);
-    delete row.id; // Don't send id in body for PATCH; it's in the URL
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + event.id, {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + eventId, {
       method: 'PATCH',
-      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-      body: JSON.stringify(row),
+      headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+      body: JSON.stringify(patch),
     });
-    if (!resp.ok) {
-      console.error('Supabase update error:', resp.status, await resp.text());
-      return false;
-    }
-    return true;
+    return mutationReturnedOrder(resp, eventId, 'update');
   } catch (e) {
     console.error('Supabase update exception:', e);
     return false;
@@ -405,13 +550,9 @@ async function deleteEvent(env, eventId) {
   try {
     const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + eventId, {
       method: 'DELETE',
-      headers: sbHeaders(env),
+      headers: sbHeaders(env, { 'Prefer': 'return=representation' }),
     });
-    if (!resp.ok) {
-      console.error('Supabase delete error:', resp.status, await resp.text());
-      return false;
-    }
-    return true;
+    return mutationReturnedOrder(resp, eventId, 'delete');
   } catch (e) {
     console.error('Supabase delete exception:', e);
     return false;
