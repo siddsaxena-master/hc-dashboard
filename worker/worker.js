@@ -2921,45 +2921,80 @@ function _scrubOperatorEmail(email) {
 // rows from "RE: Labor Day Event" replies about a job that was already
 // invoiced and delivered. Those rows then sat on the calendar as if they
 // were scheduled work. Rules below run in CODE, in this order, before any
-// lead row is written:
-//  1. An email address already on a non-cancelled orders row is an existing
-//     relationship: invoiced/confirmed/done = a customer thread (no lead
-//     row at all); an open lead (inquiry/quoted) = append this email's note
-//     to it instead of duplicating.
-//  2. A reply/forward subject (RE:/FW:/FWD:) is never a brand-new lead.
-//  3. Otherwise create the lead exactly as before.
-// Cancelled rows are ignored on purpose: a customer who "passed" last year
-// and writes again IS a new lead. Suppression never silences the Telegram
-// alert (the owner still hears about every email); it only stops ghost
-// rows. Exported for worker/test-lead-dedupe.mjs.
+// lead row is written. Every rule FAILS OPEN toward creating the row: this
+// is a lead pipeline, and a missed ghost row is far cheaper than a missed
+// customer.
+//  1. The sender already has an ORDER on file (an invoice id, or money on
+//     the row) = a customer thread: no lead row. "Customer" is decided by
+//     that evidence, never by stage name alone: production rows the owner
+//     marked "passed" before September carry stage 'complete' with no
+//     invoice and $0, and those people writing again ARE new leads.
+//  2. The sender has an OPEN lead (inquiry/quoted): append this email's
+//     note to it instead of minting a twin.
+//  3. A "RE:" subject from a sender WITH history is a thread reply, not a
+//     new inquiry. From a sender with NO history it is a first contact
+//     (a prospect answering the owner's own outreach) and still creates
+//     the row. Forwards (FW:/FWD:) are never suppressed: the owner forwards
+//     leads to himself on purpose (outlook_poller relies on it).
+//  4. Otherwise create the lead exactly as before.
+// Suppression never silences the Telegram alert; it only stops ghost rows.
+// Exported for worker/test-lead-dedupe.mjs.
 const OPEN_LEAD_STAGES = new Set(['inquiry', 'quoted']);
+function _isOrderEvidence(r) {
+  return !!(r && (String(r.external_invoice_id || '').trim() || Number(r.total_cents) > 0));
+}
 export function leadDedupeDecision(subject, existingRows) {
-  const rows = (Array.isArray(existingRows) ? existingRows : []).filter(r => r && r.stage && r.stage !== 'cancelled');
-  const openLead = rows.find(r => OPEN_LEAD_STAGES.has(r.stage)) || null;
-  const customer = rows.find(r => !OPEN_LEAD_STAGES.has(r.stage)) || null;
+  const all = (Array.isArray(existingRows) ? existingRows : []).filter(r => r && typeof r === 'object');
+  const rows = all.filter(r => r.stage !== 'cancelled');
+  const customer = rows.find(_isOrderEvidence) || null;
+  const openLead = rows.find(r => OPEN_LEAD_STAGES.has(r.stage) && !_isOrderEvidence(r)) || null;
   if (customer) {
     return { create: false, appendTo: openLead ? openLead.id : null,
-      reason: 'existing customer thread (' + customer.stage + ' order on file)' };
+      reason: 'existing customer thread (order on file)' };
   }
   if (openLead) {
     return { create: false, appendTo: openLead.id, reason: 'open lead already on file' };
   }
-  if (/^\s*(re|fw|fwd)\s*:/i.test(String(subject || ''))) {
-    return { create: false, appendTo: null, reason: 'reply/forward subject, not a new inquiry' };
+  const isReply = /^\s*(?:\[[^\]]*\]\s*)*re\s*:/i.test(String(subject || ''));
+  if (isReply && all.length > 0) {
+    return { create: false, appendTo: null, reason: 'reply on an existing thread, not a new inquiry' };
   }
   return { create: true, appendTo: null, reason: 'new inquiry' };
 }
 
-// Best-effort note append on an existing lead (dedupe rule 1). A failure
-// here must never fail the webhook delivery: the alert still goes out.
-async function appendLeadNote(env, row, text) {
+// Addresses that must never drive the sender lookup: form relays and
+// no-reply mailers share ONE address across many different leads (the
+// GoDaddy-form lesson in findHandledThreadSibling). Exported for tests.
+export function leadLookupEmail(email) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!e || !e.includes('@')) return null;
+  const [local, domain] = e.split('@');
+  if (/^(no-?reply|do-?not-?reply|notifications?|mailer-daemon|postmaster)/.test(local)) return null;
+  if (/(^|\.)(formspree\.io|formspree\.com|godaddy\.com)$/.test(domain)) return null;
+  return e;
+}
+
+// PostgREST ilike: `_` and `%` are wildcards and `*` is an alias for `%`,
+// so an exact-address lookup must escape them (jane_doe would otherwise
+// match jane.doe). Callers ALSO post-filter on exact equality. Exported.
+export function escapeLikePattern(value) {
+  return String(value).replace(/[\\%_]/g, '\\$&');
+}
+
+// Best-effort, idempotent note append on an existing lead (dedupe rule 2).
+// The receipt id is embedded so a re-claimed delivery never appends twice.
+// A failure here must never fail the webhook delivery: the alert still
+// goes out.
+async function appendLeadNote(env, row, text, receiptId) {
   try {
     const notes = ((row && row.notes) || '').trim();
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + row.id, {
+    const marker = '[receipt ' + receiptId + ']';
+    if (receiptId && notes.includes(marker)) return;
+    const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + row.id, {
       method: 'PATCH',
       headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }),
-      body: JSON.stringify({ notes: (notes ? notes + '\n\n' : '') + text }),
-    });
+      body: JSON.stringify({ notes: (notes ? notes + '\n\n' : '') + text + ' ' + marker }),
+    }, 15000);
     if (!resp.ok) console.error('lead note append failed:', resp.status);
   } catch (e) {
     console.error('lead note append exception:', e);
@@ -3032,17 +3067,28 @@ async function processMsGraphNotification(env, eventKey, notification) {
       if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
         const lead = cls.extracted_lead;
         await renewLease();
-        // Dedupe guard (see leadDedupeDecision): look the sender up by exact
-        // email (ilike with no wildcard = case-insensitive equality; bounded
-        // read). A failed read yields [] and falls through to today's
-        // behavior rather than inventing a suppression.
-        const leadEmail = _scrubOperatorEmail(lead.client_email) ||
-                          _scrubOperatorEmail(cls.from_email) || null;
-        const existing = leadEmail
-          ? (await fetchSb(env, 'orders?select=id,stage,notes&client_email=ilike.' +
-              encodeURIComponent(String(leadEmail).toLowerCase()) +
-              '&order=created_at.desc&limit=25')) || []
-          : [];
+        // Dedupe guard (see leadDedupeDecision): look the sender up by EXACT
+        // email. Relay / no-reply addresses never drive a lookup; LIKE
+        // wildcards are escaped AND rows are post-filtered on exact equality;
+        // the read is bounded (15s, limit 25). A failed read yields [] and
+        // falls through to creating the row, never to a suppression.
+        const leadEmail = leadLookupEmail(
+          _scrubOperatorEmail(lead.client_email) || _scrubOperatorEmail(cls.from_email) || null);
+        let existing = [];
+        if (leadEmail) {
+          try {
+            const lr = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' +
+              '?select=id,stage,notes,client_email,external_invoice_id,total_cents' +
+              '&client_email=ilike.' + encodeURIComponent(escapeLikePattern(leadEmail)) +
+              '&order=created_at.desc&limit=25', { headers: sbHeaders(env) }, 15000);
+            const rows = lr.ok ? await lr.json() : null;
+            existing = (Array.isArray(rows) ? rows : [])
+              .filter(r => String((r && r.client_email) || '').trim().toLowerCase() === leadEmail);
+          } catch (e) {
+            console.error('lead lookup failed, creating the row as before:', e);
+            existing = [];
+          }
+        }
         const decision = leadDedupeDecision(cls.subject, existing);
         if (!decision.create) {
           suppressedReason = decision.reason;
@@ -3051,7 +3097,8 @@ async function processMsGraphNotification(env, eventKey, notification) {
             const target = existing.find(r => r.id === decision.appendTo);
             if (target) {
               await appendLeadNote(env, target,
-                'Follow-up email via MS Graph: ' + (cls.subject || '') + '\n' + (lead.notes || cls.summary || ''));
+                'Follow-up email via MS Graph: ' + (cls.subject || '') + '\n' + (lead.notes || cls.summary || ''),
+                receiptId);
             }
           }
         }
@@ -3083,7 +3130,9 @@ async function processMsGraphNotification(env, eventKey, notification) {
         }, 'Microsoft Graph');
       }
 
-      if (cls.should_alert) {
+      // A suppressed lead is ALWAYS surfaced, even when the classifier said
+      // should_alert:false: the row used to be the backstop for that case.
+      if (cls.should_alert || suppressedReason) {
         const safeFromEmail = _scrubOperatorEmail(cls.from_email);
         const emoji = {
           lead_inquiry: '🌱',
