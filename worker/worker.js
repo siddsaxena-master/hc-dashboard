@@ -74,7 +74,10 @@ const CORS_HEADERS = {
 
 // ── VOCAB MAPS (mirror of dashboard's maps; keep in sync) ──
 const SB_STAGE_TO_UI = {'inquiry':'lead','quoted':'lead','invoiced':'deposit_paid','deposit_paid':'deposit_paid','paid_full':'payment_full','fulfilled':'completed','complete':'completed','cancelled':'passed'};
-const UI_STAGE_TO_SB = {'lead':'inquiry','deposit_paid':'deposit_paid','stamp_ordered':'invoiced','in_kind':'complete','payment_full':'paid_full','completed':'complete','passed':'complete'};
+// 'passed' -> 'cancelled' (2026-09-06): the reverse map above already reads
+// cancelled as passed; writing 'complete' stamped every passed lead as a
+// finished order (they surfaced on the field calendar as done work).
+const UI_STAGE_TO_SB = {'lead':'inquiry','deposit_paid':'deposit_paid','stamp_ordered':'invoiced','in_kind':'complete','payment_full':'paid_full','completed':'complete','passed':'cancelled'};
 const SB_ETYPE_TO_UI = {'wedding':'Wedding','corporate':'Corporate Event','trade_show':'Networking Event','hospitality':'Other','cruise':'Other','wellness':'Wellness Event','other':'Other'};
 const UI_ETYPE_TO_SB = {'Wedding':'wedding','Corporate Event':'corporate','Wellness Event':'wellness','Birthday Party':'other','Holiday Party':'other','Networking Event':'trade_show','Product Launch':'corporate','Charity Event':'other','Bachelor/Bachelorette':'other','Other':'other'};
 const SB_STAMP_TO_UI = {'not_ordered':'Not ordered','ordered':'Ordered — pending','received':'Received','not_needed':'Not ordered'};
