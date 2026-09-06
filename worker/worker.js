@@ -2916,6 +2916,56 @@ function _scrubOperatorEmail(email) {
   return lower.endsWith(OPERATOR_EMAIL_DOMAIN) ? null : email;
 }
 
+// Deterministic lead-dedupe guard (2026-09-06, the Danielle / Dolce Vita
+// ghost leads): the classifier is a MODEL, and it minted two fresh inquiry
+// rows from "RE: Labor Day Event" replies about a job that was already
+// invoiced and delivered. Those rows then sat on the calendar as if they
+// were scheduled work. Rules below run in CODE, in this order, before any
+// lead row is written:
+//  1. An email address already on a non-cancelled orders row is an existing
+//     relationship: invoiced/confirmed/done = a customer thread (no lead
+//     row at all); an open lead (inquiry/quoted) = append this email's note
+//     to it instead of duplicating.
+//  2. A reply/forward subject (RE:/FW:/FWD:) is never a brand-new lead.
+//  3. Otherwise create the lead exactly as before.
+// Cancelled rows are ignored on purpose: a customer who "passed" last year
+// and writes again IS a new lead. Suppression never silences the Telegram
+// alert (the owner still hears about every email); it only stops ghost
+// rows. Exported for worker/test-lead-dedupe.mjs.
+const OPEN_LEAD_STAGES = new Set(['inquiry', 'quoted']);
+export function leadDedupeDecision(subject, existingRows) {
+  const rows = (Array.isArray(existingRows) ? existingRows : []).filter(r => r && r.stage && r.stage !== 'cancelled');
+  const openLead = rows.find(r => OPEN_LEAD_STAGES.has(r.stage)) || null;
+  const customer = rows.find(r => !OPEN_LEAD_STAGES.has(r.stage)) || null;
+  if (customer) {
+    return { create: false, appendTo: openLead ? openLead.id : null,
+      reason: 'existing customer thread (' + customer.stage + ' order on file)' };
+  }
+  if (openLead) {
+    return { create: false, appendTo: openLead.id, reason: 'open lead already on file' };
+  }
+  if (/^\s*(re|fw|fwd)\s*:/i.test(String(subject || ''))) {
+    return { create: false, appendTo: null, reason: 'reply/forward subject, not a new inquiry' };
+  }
+  return { create: true, appendTo: null, reason: 'new inquiry' };
+}
+
+// Best-effort note append on an existing lead (dedupe rule 1). A failure
+// here must never fail the webhook delivery: the alert still goes out.
+async function appendLeadNote(env, row, text) {
+  try {
+    const notes = ((row && row.notes) || '').trim();
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + row.id, {
+      method: 'PATCH',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }),
+      body: JSON.stringify({ notes: (notes ? notes + '\n\n' : '') + text }),
+    });
+    if (!resp.ok) console.error('lead note append failed:', resp.status);
+  } catch (e) {
+    console.error('lead note append exception:', e);
+  }
+}
+
 async function handleMsGraphWebhook(request, env, url) {
   // Microsoft Graph subscriptions send a validationToken on creation; echo it back.
   if (url.searchParams.has('validationToken')) {
@@ -2978,9 +3028,36 @@ async function processMsGraphNotification(env, eventKey, notification) {
       }, 60000);
       const cls = await parseWebhookClaudeResponse(cResp, 'Microsoft Graph');
 
+      let suppressedReason = null; // set when the dedupe guard stops a lead row
       if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
         const lead = cls.extracted_lead;
         await renewLease();
+        // Dedupe guard (see leadDedupeDecision): look the sender up by exact
+        // email (ilike with no wildcard = case-insensitive equality; bounded
+        // read). A failed read yields [] and falls through to today's
+        // behavior rather than inventing a suppression.
+        const leadEmail = _scrubOperatorEmail(lead.client_email) ||
+                          _scrubOperatorEmail(cls.from_email) || null;
+        const existing = leadEmail
+          ? (await fetchSb(env, 'orders?select=id,stage,notes&client_email=ilike.' +
+              encodeURIComponent(String(leadEmail).toLowerCase()) +
+              '&order=created_at.desc&limit=25')) || []
+          : [];
+        const decision = leadDedupeDecision(cls.subject, existing);
+        if (!decision.create) {
+          suppressedReason = decision.reason;
+          console.log('ms_graph lead row suppressed: ' + decision.reason);
+          if (decision.appendTo) {
+            const target = existing.find(r => r.id === decision.appendTo);
+            if (target) {
+              await appendLeadNote(env, target,
+                'Follow-up email via MS Graph: ' + (cls.subject || '') + '\n' + (lead.notes || cls.summary || ''));
+            }
+          }
+        }
+      }
+      if (cls.category === 'lead_inquiry' && cls.extracted_lead && !suppressedReason) {
+        const lead = cls.extracted_lead;
         await insertWebhookOrder(env, {
           id: receiptId,
           client_name: lead.client_name || 'Unknown',
@@ -3018,7 +3095,9 @@ async function processMsGraphNotification(env, eventKey, notification) {
           (cls.category || 'unknown') + '\n' +
           'From: ' + (cls.from_name || safeFromEmail || 'unknown') + '\n' +
           'Subject: ' + (cls.subject || '') + '\n\n' +
-          (cls.summary || '');
+          (cls.summary || '') +
+          // Dedupe guard receipt: the owner always sees WHY no row was made.
+          (suppressedReason ? '\n\n(No new lead row: ' + suppressedReason + '.)' : '');
         await enqueueWebhookTelegramAlerts(
           env,
           'ms_graph',
