@@ -898,7 +898,7 @@ async function handleParseBatch(request, env) {
 // Cron schedule (in wrangler.toml [triggers]):
 //   "0 12 * * *"   — daily 8am ET (12 UTC) — Weee box math digest
 //   "0 * * * *"    — hourly — reconfirmation scan + post-event debrief scan + intake nags
-//   "*/5 * * * *"  — every 5 minutes — intake approval cards + shift summaries + clock-in pings + stillness watch
+//   "*/5 * * * *"  — every 5 minutes — intake approval cards + delivery time confirmations + shift summaries + clock-in pings + stillness watch
 async function runScheduled(event, env, alsoNotify = true) {
   const cron = event.cron;
   try {
@@ -919,6 +919,11 @@ async function runScheduled(event, env, alsoNotify = true) {
       if (hourlyErr) throw hourlyErr;
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
+      // Owner-confirmed delivery times (migration 034 delivery_request)
+      // go out as banners right after the intake cards. Fully wrapped
+      // inside, so it can never break the Live Activity or field-ops
+      // scans below.
+      await runDeliveryConfirmationScan(env);
       // Live Activity START and END delivery use independent durable scans.
       // Neither one depends on the normal clock-in banner or Telegram stamps.
       // START owns one stable queue row per shift + physical phone, while END
@@ -4327,6 +4332,11 @@ async function watch40Hours(env, row, minsJustClosed) {
 // Telegram is Sidd's channel). opts.excludeEmail suppresses the self-echo;
 // opts.market is required for manager delivery and must match their roster;
 // opts.ownersOnly keeps scheduling/pay matters off manager phones entirely.
+// opts.queueId (optional, a UUID the caller derives from its own facts) fixes
+// the queue row's id, so a caller that retries after a lost stamp re-inserts
+// the SAME row (push_queue ignores duplicates) instead of pushing twice. On a
+// split send it names the owner row; opts.managerQueueId names the manager
+// row. Left out, every row gets a fresh random id as before.
 async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds, opts = {}) {
   try {
     const staff = await fetchSb(env, 'field_workers?role=in.(owner,manager)&active=eq.true&select=email,role,market') || [];
@@ -4360,7 +4370,7 @@ async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds,
         aps: { alert: { title: title, body: body }, sound: 'default' },
         telegram_text: telegramText || null,
         fallback_chat_ids: fallbackChatIds || [],
-      });
+      }, opts.queueId || null);
     }
     let queued = false;
     if (ownerTokens.length || telegramText) {
@@ -4369,7 +4379,7 @@ async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds,
         aps: { alert: { title: title, body: body }, sound: 'default' },
         telegram_text: telegramText || null,
         fallback_chat_ids: fallbackChatIds || [],
-      }) || queued;
+      }, opts.queueId || null) || queued;
     }
     if (managerTokens.length) {
       queued = await enqueuePush(env, 'alert', {
@@ -4377,13 +4387,177 @@ async function sendPushToOwners(env, title, body, telegramText, fallbackChatIds,
         aps: { alert: { title: title, body: managerBody }, sound: 'default' },
         telegram_text: null,
         fallback_chat_ids: [],
-      }) || queued;
+      }, opts.managerQueueId || null) || queued;
     }
     return queued;
   } catch (e) {
     console.error('sendPushToOwners error:', e);
     return false;
   }
+}
+
+// ── Delivery time confirmations (migration 034 delivery_request) ──────
+// Every 5 minutes, right after the intake cards: one banner to every
+// owner phone and to the manager phones of the order's market the first
+// time an OWNER-confirmed delivery time is seen. The owner types the time
+// into the app's Calendar; nothing here reads email or guesses a time.
+// Idempotency: the queue row's UUID is derived from the order id plus the
+// request's checked_at, so a retry after a lost stamp re-inserts the same
+// id (push_queue ignores duplicates, and done rows live 7 days) and can
+// never push twice. A fresh owner edit carries a fresh checked_at, so it
+// is announced again on purpose. NEVER throws (own try/catch top to
+// bottom, one more per row).
+
+const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Pure: 'YYYY-MM-DD' (or a timestamp that starts with one) -> 'Sep 11'.
+// String work only, no Date object, so the day can never shift with the
+// server's timezone. Anything else -> ''.
+// Exported for worker/test-delivery-confirmation.mjs.
+export function formatDeliveryDay(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?$/.exec(String(value || '').trim());
+  if (!m) return '';
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return '';
+  return MONTH_ABBR[month - 1] + ' ' + day;
+}
+
+// Pure: the banner for one order. Null when the request is not usable
+// (no window to announce, or no checked_at to guard the stamp on). Only
+// words already on the crew screens travel: client name, day, window,
+// on-site location. Never an email address or a phone number.
+// Exported for worker/test-delivery-confirmation.mjs.
+export function deliveryConfirmationMessage(row) {
+  const dr = row && row.delivery_request;
+  if (!dr || typeof dr !== 'object' || Array.isArray(dr)) return null;
+  const window = String(dr.window || '').trim();
+  const checkedAt = String(dr.checked_at || '').trim();
+  if (!window || !checkedAt) return null;
+  const client = String(row.client_name || '').trim() || 'Unnamed';
+  // The request's own date first (the 034 contract says it equals the
+  // row's delivery date); the row's date marker is the fallback.
+  const day = formatDeliveryDay(dr.date) ||
+    formatDeliveryDay(String(row.delivery_at_utc || '').slice(0, 10));
+  const location = String(dr.location || '').trim();
+  const body = [client, day, window, location].filter(Boolean).join(' · ');
+  return {
+    title: 'Delivery time confirmed',
+    body: body,
+    // Plain text on purpose: pushdrain sends telegram_text without a
+    // parse_mode, so client names can never break Telegram formatting.
+    telegramText: 'Delivery time confirmed: ' + body,
+    checkedAt: checkedAt,
+  };
+}
+
+// Stable queue UUID for one confirmation: the same order id and the same
+// checked_at always give the same id (SHA-256 of both, folded into a UUID
+// by the helper the webhook outbox already uses). No secret is needed:
+// the id only has to be stable and unique, not unguessable.
+// Exported for worker/test-delivery-confirmation.mjs.
+export async function deliveryConfirmationQueueId(orderId, checkedAt) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(
+    'hc-delivery-confirmation-v1\0' + String(orderId) + '\0' + String(checkedAt)));
+  return uuidFromDigest(new Uint8Array(digest));
+}
+
+// The scan itself. Returns its counts (handy for tests and logs).
+// Exported for worker/test-delivery-confirmation.mjs.
+export async function runDeliveryConfirmationScan(env) {
+  const counts = { seen: 0, pushed: 0, stamped: 0, reedited: 0, skipped: 0, failed: 0 };
+  try {
+    // Up to 20 rows per tick, ordered by updated_at (no trigger bumps
+    // that column on edit today, so in practice oldest row first).
+    // Filters, in plain English: the owner confirmed a time, the worker
+    // has not announced it yet, and the order is not cancelled. The JSON
+    // filters read the keys inside the delivery_request column (a
+    // missing notified_at counts as null, which is exactly "not
+    // announced yet").
+    let rows;
+    try {
+      const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' +
+        '?select=id,client_name,market,venue,delivery_at_utc,delivery_request' +
+        '&delivery_request->>status=eq.confirmed' +
+        '&delivery_request->>source=eq.owner' +
+        '&delivery_request->>notified_at=is.null' +
+        '&stage=neq.cancelled' +
+        '&order=updated_at.asc&limit=20',
+        { headers: sbHeaders(env) }, 15000);
+      if (!resp.ok) {
+        console.error('delivery confirmation read failed:', resp.status);
+        return counts;
+      }
+      rows = await resp.json();
+    } catch (e) {
+      console.error('delivery confirmation read exception:', e);
+      return counts;
+    }
+    if (!Array.isArray(rows) || !rows.length) return counts;
+    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+    for (const row of rows) {
+      counts.seen++;
+      // Each row wrapped on its own so one bad row never kills the batch.
+      try {
+        const msg = deliveryConfirmationMessage(row);
+        if (!msg) {
+          counts.skipped++;
+          console.error('delivery confirmation skipped: order ' + (row && row.id) +
+            ' has no window or checked_at');
+          continue;
+        }
+        const queueId = await deliveryConfirmationQueueId(row.id, msg.checkedAt);
+        const queued = await sendPushToOwners(env, msg.title, msg.body, msg.telegramText, chatIds,
+          { market: row.market, queueId: queueId });
+        if (!queued) {
+          // Nothing reached the queue, so nothing gets stamped: the row
+          // comes back next tick, and the same queue id keeps that safe.
+          counts.failed++;
+          console.error('delivery confirmation push not queued for order ' + row.id +
+            ', retrying next tick');
+          continue;
+        }
+        counts.pushed++;
+
+        // Stamp notified_at, guarded on the checked_at we read. A fresh
+        // owner edit in between carries a new checked_at, so this matches
+        // zero rows and the new time is announced on its own next tick
+        // instead of being marked as already sent.
+        const stamp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' +
+          '?id=eq.' + encodeURIComponent(row.id) +
+          '&delivery_request->>checked_at=eq.' + encodeURIComponent(msg.checkedAt), {
+          method: 'PATCH',
+          headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+          body: JSON.stringify({
+            delivery_request: { ...row.delivery_request, notified_at: new Date().toISOString() },
+          }),
+        }, 15000);
+        if (!stamp.ok) {
+          // The banner is queued; the retry next tick re-inserts the same
+          // queue id (a no-op) and stamps again, so nothing doubles.
+          counts.failed++;
+          console.error('delivery confirmation stamp failed on order ' + row.id + ':', stamp.status);
+          continue;
+        }
+        const changed = await stamp.json();
+        if (Array.isArray(changed) && changed.length) {
+          counts.stamped++;
+        } else {
+          counts.reedited++;
+          console.log('delivery confirmation on order ' + row.id +
+            ' was re-edited meanwhile, left for the next tick');
+        }
+      } catch (e) {
+        counts.failed++;
+        console.error('delivery confirmation failed on order ' + (row && row.id) + ':', e);
+      }
+    }
+    console.log('delivery confirmation scan: ' + JSON.stringify(counts));
+  } catch (e) {
+    console.error('runDeliveryConfirmationScan error:', e);
+  }
+  return counts;
 }
 
 // ================= LIVE ACTIVITY (owner lock-screen shift card) =================
