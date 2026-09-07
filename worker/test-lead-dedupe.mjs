@@ -37,22 +37,39 @@ d = leadDedupeDecision(undefined, [{ id: 'x', stage: null }]);
 check('rows without a stage or evidence are ignored', d.create === true);
 
 // ── rule 1: real customers (evidence, never stage or bare total) ──
+// Owner decision 2026-09-07: a repeat customer asking about a NEW event
+// gets its own row. A reply, or the same event date, is still a thread.
+const invoicedDated = { ...invoiced, event_start_at: '2026-09-05T12:00:00+00:00' };
 d = leadDedupeDecision('RE: Labor Day Event', [invoiced]);
 check('the Danielle case: invoiced customer + reply -> no row, note on the order row', d.create === false && d.appendTo === 'row-inv' && /order on file/.test(d.reason));
+d = leadDedupeDecision('RE: Labor Day Event', [invoicedDated], '2026-09-07');
+check('the Danielle case with the guessed date: a reply is a thread whatever the date says', d.create === false && d.appendTo === 'row-inv');
 d = leadDedupeDecision('Brand new question', [paid]);
-check('paid customer with a fresh subject: customer thread, note on the order row', d.create === false && d.appendTo === 'row-paid');
+check('paid customer, fresh subject, no date: NEW row, the order named as sibling', d.create === true && d.sibling === 'row-paid' && /existing customer/.test(d.reason));
+d = leadDedupeDecision('Coconuts for our holiday party', [invoicedDated], '2026-12-12');
+check('customer, fresh subject, DIFFERENT event date: new row, sibling named', d.create === true && d.sibling === 'row-inv');
+d = leadDedupeDecision('Coconuts for Sep 5', [invoicedDated], '2026-09-05');
+check('customer, fresh subject, SAME event date as the order: no row, note on the order', d.create === false && d.appendTo === 'row-inv' && /same event date/.test(d.reason));
 d = leadDedupeDecision('FW: intro from the venue', [invoiced]);
-check('a forward from a real customer is still a customer thread', d.create === false);
-d = leadDedupeDecision('Coconuts for our October launch?', [doneReal]);
-check('complete WITH an invoice on file is a real customer', d.create === false);
+check('a forward from a real customer with no date is a new inquiry (forwards are never suppressed)', d.create === true && d.sibling === 'row-inv');
+d = leadDedupeDecision('Coconuts for our October launch?', [doneReal], '2026-10-20');
+check('complete WITH an invoice on file is still recognized: new row, that order named as sibling', d.create === true && d.sibling === 'row-done');
 d = leadDedupeDecision('hello', [depositOnly]);
-check('a deposit on file is a customer even without an invoice id', d.create === false);
+check('a deposit on file is a customer even without an invoice id: sibling named', d.create === true && d.sibling === 'row-dep');
 d = leadDedupeDecision('hello', [openLead, invoiced]);
-check('customer AND open lead: no row, note goes to the open lead', d.create === false && d.appendTo === 'row-lead');
+check('customer AND open lead, fresh subject, no date: new row, the open lead is the sibling', d.create === true && d.sibling === 'row-lead' && /open lead/.test(d.reason));
+d = leadDedupeDecision('RE: hello', [openLead, invoiced]);
+check('customer AND open lead, reply: no row, note goes to the open lead', d.create === false && d.appendTo === 'row-lead');
+d = leadDedupeDecision('Coconuts for Oct 5', [openLead, invoicedDated], '2026-10-05');
+check('customer AND open lead, same date as the open lead: note on the open lead', d.create === false && d.appendTo === 'row-lead');
 d = leadDedupeDecision('[EXTERNAL] RE: Labor Day Event', [invoiced]);
 check('M365 external tag before RE: still a customer thread', d.create === false);
 d = leadDedupeDecision('hello', [{ ...invoiced, total_cents: '200000' }]);
-check('total_cents as a string still counts on an invoiced stage', d.create === false);
+check('total_cents as a string still counts on an invoiced stage (sibling named)', d.create === true && d.sibling === 'row-inv');
+d = leadDedupeDecision('Coconuts for Sep 5', [{ ...invoicedDated, stage: 'cancelled' }], '2026-09-05');
+check('a cancelled row never absorbs a same-date email', d.create === true && d.sibling === null);
+d = leadDedupeDecision('Coconuts for Sep 5', [invoicedDated], '2026-09-05T12:00:00Z');
+check('event date with a time part still matches on the calendar day', d.create === false && d.appendTo === 'row-inv');
 
 // ── NOT evidence: quotes, passed leads, unknown stages ──
 d = leadDedupeDecision('Coconuts for our October launch?', [passedOld]);
