@@ -5,7 +5,7 @@
 //  - Cross-origin calls (Supabase, Google sign-in, fonts) always go to the network.
 //  - Writes (POST/PATCH) are never touched, so signing/saving works normally.
 
-const CACHE = 'hc-deliveries-v7';  // v7: includes the fail-closed authenticated rollout bridge
+const CACHE = 'hc-deliveries-v8';  // v8: passed writes cancelled (v7: the fail-closed authenticated rollout bridge)
 const SHELL = [
   './',
   './index.html',
