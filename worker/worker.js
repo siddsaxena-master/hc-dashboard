@@ -3087,6 +3087,7 @@ async function processMsGraphNotification(env, eventKey, notification) {
 
       let suppressedReason = null; // set when the dedupe guard stops a lead row
       let siblingLeadId = null;    // set when a row is created despite an open lead on file
+      let normalizedLeadEmail = null; // the exact lowercase address the lookup used (stored on the row so later lookups match)
       if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
         const lead = cls.extracted_lead;
         await renewLease();
@@ -3097,6 +3098,7 @@ async function processMsGraphNotification(env, eventKey, notification) {
         // falls through to creating the row, never to a suppression.
         const leadEmail = leadLookupEmail(
           _scrubOperatorEmail(lead.client_email) || _scrubOperatorEmail(cls.from_email) || null);
+        normalizedLeadEmail = leadEmail;
         let existing = [];
         if (leadEmail) {
           try {
@@ -3132,7 +3134,10 @@ async function processMsGraphNotification(env, eventKey, notification) {
         await insertWebhookOrder(env, {
           id: receiptId,
           client_name: lead.client_name || 'Unknown',
-          client_email: _scrubOperatorEmail(lead.client_email) ||
+          // Store the normalized address the dedupe lookup uses, so this
+          // sender's next email finds this row; raw fallback only when none.
+          client_email: normalizedLeadEmail ||
+                        _scrubOperatorEmail(lead.client_email) ||
                         _scrubOperatorEmail(cls.from_email) || null,
           client_phone: lead.client_phone || null,
           event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(lead.event_type) ? lead.event_type : 'other',
@@ -3156,7 +3161,7 @@ async function processMsGraphNotification(env, eventKey, notification) {
 
       // A suppressed lead is ALWAYS surfaced, even when the classifier said
       // should_alert:false: the row used to be the backstop for that case.
-      if (cls.should_alert || suppressedReason) {
+      if (cls.should_alert || suppressedReason || siblingLeadId) {
         const safeFromEmail = _scrubOperatorEmail(cls.from_email);
         const emoji = {
           lead_inquiry: '🌱',
