@@ -13,86 +13,90 @@ const check = (name, cond) => {
   if (!cond) failed++;
 };
 
-const invoiced = { id: 'row-inv', stage: 'invoiced', external_invoice_id: '3475', total_cents: 200000, notes: 'x' };
-const paid = { id: 'row-paid', stage: 'paid_full', external_invoice_id: '3513', total_cents: 201825 };
-const openLead = { id: 'row-lead', stage: 'inquiry', external_invoice_id: null, total_cents: null, notes: 'Email lead via MS Graph: hi' };
-const quoted = { id: 'row-quoted', stage: 'quoted', total_cents: 0 };
-const passedOld = { id: 'row-passed-old', stage: 'complete', external_invoice_id: null, total_cents: 0 }; // pre-Sept "passed" mapping
-const passedNew = { id: 'row-passed', stage: 'cancelled', external_invoice_id: null, total_cents: 0 };
-const doneReal = { id: 'row-done', stage: 'complete', external_invoice_id: '3300', total_cents: 90000 };
-const weirdStage = { id: 'row-weird', stage: 'something_new', external_invoice_id: null, total_cents: 0 };
+const invoiced = { id: 'row-inv', stage: 'invoiced', external_invoice_id: '3475', total_cents: 200000, deposit_cents: 0, notes: 'x' };
+const paid = { id: 'row-paid', stage: 'paid_full', external_invoice_id: '3513', total_cents: 201825, deposit_cents: 0 };
+const openLead = { id: 'row-lead', stage: 'inquiry', external_invoice_id: null, total_cents: null, deposit_cents: 0, event_start_at: '2026-10-05T12:00:00+00:00', notes: 'Email lead via MS Graph: hi' };
+const quotedLead = { id: 'row-quoted', stage: 'quoted', external_invoice_id: null, total_cents: 150000, deposit_cents: 0, event_start_at: null };
+const passedOld = { id: 'row-passed-old', stage: 'complete', external_invoice_id: null, total_cents: 0, deposit_cents: 0 }; // pre-Sept "passed" mapping
+const passedOldQuoted = { id: 'row-passed-quoted', stage: 'complete', external_invoice_id: null, total_cents: 150000, deposit_cents: 0 }; // passed AFTER a quote
+const passedNew = { id: 'row-passed', stage: 'cancelled', external_invoice_id: null, total_cents: 0, deposit_cents: 0 };
+const doneReal = { id: 'row-done', stage: 'complete', external_invoice_id: '3300', total_cents: 90000, deposit_cents: 0 };
+const depositOnly = { id: 'row-dep', stage: 'deposit_paid', external_invoice_id: null, total_cents: 80000, deposit_cents: 40000 };
+const weirdStage = { id: 'row-weird', stage: 'something_new', external_invoice_id: null, total_cents: 0, deposit_cents: 0 };
 
-// ── decision table ──
+// ── rule 3: unknown sender always creates ──
 let d = leadDedupeDecision('Coconuts for our gala?', []);
-check('fresh subject, unknown sender: create', d.create === true && d.appendTo === null);
-
+check('fresh subject, unknown sender: create', d.create === true && d.appendTo === null && d.sibling === null);
 d = leadDedupeDecision('RE: Coconut bar for 200 guests', []);
 check('RE: from a sender with NO history is a first contact: create', d.create === true);
-
 d = leadDedupeDecision('Fwd: Coconut bar for 200 guests', []);
 check('forwards are never suppressed (owner self-forwards leads): create', d.create === true);
-
-d = leadDedupeDecision('FW: intro from the venue', [passedOld]);
-check('a forward from a sender with history (no order) is NOT read as a reply: create', d.create === true);
-
-d = leadDedupeDecision('FW: intro from the venue', [invoiced]);
-check('a forward from a real customer is still a customer thread (rule 1): no row', d.create === false);
-
-d = leadDedupeDecision('RE: Labor Day Event', [invoiced]);
-check('the Danielle case: invoiced customer + reply -> no row, no append', d.create === false && d.appendTo === null && /order on file/.test(d.reason));
-
-d = leadDedupeDecision('Brand new question', [paid]);
-check('paid customer with a fresh subject: still a customer thread, no row', d.create === false && d.appendTo === null);
-
-d = leadDedupeDecision('Brand new question', [openLead]);
-check('open lead on file: append instead of duplicating', d.create === false && d.appendTo === 'row-lead');
-
-d = leadDedupeDecision('RE: quote', [quoted]);
-check('quoted counts as an open lead (append)', d.create === false && d.appendTo === 'row-quoted');
-
-d = leadDedupeDecision('Coconuts for our October launch?', [passedOld]);
-check('pre-Sept passed lead (stage complete, no invoice, $0) writing again IS a new lead', d.create === true);
-
-d = leadDedupeDecision('Coconuts for our October launch?', [passedNew]);
-check('cancelled (passed) customer writing again IS a new lead', d.create === true);
-
-d = leadDedupeDecision('Coconuts for our October launch?', [doneReal]);
-check('complete WITH an invoice on file is a real customer: no row', d.create === false);
-
-d = leadDedupeDecision('RE: Labor Day Event', [passedOld]);
-check('reply from a passed (complete/$0) sender WITH history: thread reply, no row', d.create === false && d.appendTo === null);
-
-d = leadDedupeDecision('hello', [weirdStage]);
-check('unknown stage without order evidence fails OPEN: create', d.create === true);
-
-d = leadDedupeDecision('hello', [{ ...weirdStage, total_cents: 12345 }]);
-check('unknown stage WITH money on the row is a customer: no row', d.create === false);
-
-d = leadDedupeDecision('hello', [openLead, invoiced]);
-check('customer AND open lead: no row, note goes to the open lead', d.create === false && d.appendTo === 'row-lead');
-
-d = leadDedupeDecision('hello', [{ id: 'lead-newer', stage: 'inquiry', total_cents: 0 }, { id: 'lead-older', stage: 'inquiry', total_cents: 0 }]);
-check('two open leads: the first (caller orders created_at desc = newest) wins', d.appendTo === 'lead-newer');
-
-d = leadDedupeDecision('[EXTERNAL] RE: Labor Day Event', [invoiced]);
-check('M365 external tag before RE: still customer (rule 1 does not need the subject)', d.create === false);
-
-d = leadDedupeDecision('[EXTERNAL] RE: pricing?', [passedOld]);
-check('M365 external tag before RE: still reads as a reply when the sender has history', d.create === false);
-
-d = leadDedupeDecision('Retail order question', [passedOld]);
-check('a subject that merely STARTS with re is not a reply', d.create === true);
-
 d = leadDedupeDecision('hello', null);
 check('null rows behave like no rows', d.create === true);
-
 d = leadDedupeDecision(undefined, [{ id: 'x', stage: null }]);
 check('rows without a stage or evidence are ignored', d.create === true);
 
+// ── rule 1: real customers (evidence, never stage or bare total) ──
+d = leadDedupeDecision('RE: Labor Day Event', [invoiced]);
+check('the Danielle case: invoiced customer + reply -> no row, note on the order row', d.create === false && d.appendTo === 'row-inv' && /order on file/.test(d.reason));
+d = leadDedupeDecision('Brand new question', [paid]);
+check('paid customer with a fresh subject: customer thread, note on the order row', d.create === false && d.appendTo === 'row-paid');
+d = leadDedupeDecision('FW: intro from the venue', [invoiced]);
+check('a forward from a real customer is still a customer thread', d.create === false);
+d = leadDedupeDecision('Coconuts for our October launch?', [doneReal]);
+check('complete WITH an invoice on file is a real customer', d.create === false);
+d = leadDedupeDecision('hello', [depositOnly]);
+check('a deposit on file is a customer even without an invoice id', d.create === false);
+d = leadDedupeDecision('hello', [openLead, invoiced]);
+check('customer AND open lead: no row, note goes to the open lead', d.create === false && d.appendTo === 'row-lead');
+d = leadDedupeDecision('[EXTERNAL] RE: Labor Day Event', [invoiced]);
+check('M365 external tag before RE: still a customer thread', d.create === false);
+d = leadDedupeDecision('hello', [{ ...invoiced, total_cents: '200000' }]);
+check('total_cents as a string still counts on an invoiced stage', d.create === false);
+
+// ── NOT evidence: quotes, passed leads, unknown stages ──
+d = leadDedupeDecision('Coconuts for our October launch?', [passedOld]);
+check('pre-Sept passed lead (complete, no invoice, $0) writing again IS a new lead', d.create === true);
+d = leadDedupeDecision('Coconuts for our October launch?', [passedOldQuoted]);
+check('passed AFTER a $1,500 quote (complete, no invoice, no deposit) is STILL a new lead', d.create === true);
+d = leadDedupeDecision('Coconuts for our October launch?', [passedNew]);
+check('cancelled (passed) customer writing again IS a new lead', d.create === true);
+d = leadDedupeDecision('RE: Labor Day Event', [passedOld]);
+check('a reply from a passed sender creates (the reply rule is gone on purpose)', d.create === true);
+d = leadDedupeDecision('hello', [weirdStage]);
+check('unknown stage without evidence fails OPEN: create', d.create === true);
+d = leadDedupeDecision('hello', [{ ...weirdStage, total_cents: 12345 }]);
+check('unknown stage with a bare total is NOT evidence: create', d.create === true);
+d = leadDedupeDecision('hello', [{ ...invoiced, external_invoice_id: ' ', total_cents: -5, stage: 'invoiced' }]);
+check('blank invoice id + negative total: not evidence', d.create === true);
+
+// ── rule 2: open leads (follow-up vs a different event) ──
+d = leadDedupeDecision('RE: quote', [quotedLead]);
+check('reply on a quoted lead ($1,500 quote, no invoice): append to it', d.create === false && d.appendTo === 'row-quoted');
+d = leadDedupeDecision('RE: quick question', [openLead]);
+check('reply on an open lead: append', d.create === false && d.appendTo === 'row-lead');
+d = leadDedupeDecision('Coconuts for Oct 5', [openLead], '2026-10-05');
+check('fresh subject, SAME event date as the open lead: append', d.create === false && d.appendTo === 'row-lead');
+d = leadDedupeDecision('Another event in November', [openLead], '2026-11-01');
+check('fresh subject, DIFFERENT event date: new row, sibling named', d.create === true && d.sibling === 'row-lead');
+d = leadDedupeDecision('Another question', [openLead], null);
+check('fresh subject, unknown event date: new row, sibling named', d.create === true && d.sibling === 'row-lead');
+d = leadDedupeDecision('Re[2]: quick question', [openLead]);
+check('bracket-counter reply prefix counts as a reply', d.create === false && d.appendTo === 'row-lead');
+d = leadDedupeDecision('Retail order question', [openLead]);
+check('a subject that merely STARTS with re is not a reply (new row + sibling)', d.create === true && d.sibling === 'row-lead');
+d = leadDedupeDecision('RE: hi', [{ id: 'lead-newer', stage: 'inquiry', total_cents: 0 }, { id: 'lead-older', stage: 'inquiry', total_cents: 0 }]);
+check('two open leads: the first (caller orders created_at desc = newest) wins', d.appendTo === 'lead-newer');
+d = leadDedupeDecision('RE: hi', [{ ...quotedLead, external_invoice_id: '3600' }]);
+check('a quoted row that carries an invoice id is a customer, not an open lead', d.create === false && d.appendTo === 'row-quoted' && /order on file/.test(d.reason));
+
 // ── lookup address hygiene ──
 check('normal address normalizes', leadLookupEmail('  Jane@Example.com ') === 'jane@example.com');
+check('display-name form reduces to the address', leadLookupEmail('Jane Doe <Jane@Example.com>') === 'jane@example.com');
 check('formspree relay never drives a lookup', leadLookupEmail('submissions@formspree.io') === null);
+check('formspree subdomain relay never drives a lookup', leadLookupEmail('x@mail.formspree.io') === null);
 check('godaddy relay never drives a lookup', leadLookupEmail('noreply@godaddy.com') === null);
+check('secureserver relay never drives a lookup', leadLookupEmail('forms@secureserver.net') === null);
 check('no-reply local part never drives a lookup', leadLookupEmail('no-reply@somevenue.com') === null);
 check('notifications local part never drives a lookup', leadLookupEmail('notifications@planner.app') === null);
 check('missing @ is rejected', leadLookupEmail('not an email') === null);

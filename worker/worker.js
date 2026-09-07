@@ -2927,53 +2927,72 @@ function _scrubOperatorEmail(email) {
 // lead row is written. Every rule FAILS OPEN toward creating the row: this
 // is a lead pipeline, and a missed ghost row is far cheaper than a missed
 // customer.
-//  1. The sender already has an ORDER on file (an invoice id, or money on
-//     the row) = a customer thread: no lead row. "Customer" is decided by
-//     that evidence, never by stage name alone: production rows the owner
-//     marked "passed" before September carry stage 'complete' with no
-//     invoice and $0, and those people writing again ARE new leads.
-//  2. The sender has an OPEN lead (inquiry/quoted): append this email's
-//     note to it instead of minting a twin.
-//  3. A "RE:" subject from a sender WITH history is a thread reply, not a
-//     new inquiry. From a sender with NO history it is a first contact
-//     (a prospect answering the owner's own outreach) and still creates
-//     the row. Forwards (FW:/FWD:) are never suppressed: the owner forwards
-//     leads to himself on purpose (outlook_poller relies on it).
-//  4. Otherwise create the lead exactly as before.
+//  1. The sender already has an ORDER on file = a customer thread: no lead
+//     row; the email's note is appended to their open lead if one exists,
+//     else to the newest order row, so the dashboard shows the follow-up.
+//     "Order on file" means an invoice id, a deposit, or money on a row
+//     whose stage is actually invoiced/paid. NEVER stage name alone and
+//     NEVER a bare total: the dashboard stores a typed QUOTE amount in
+//     total_cents on lead rows, and rows the owner marked "passed" before
+//     September carry stage 'complete' with no invoice. Those people
+//     writing again ARE new leads.
+//  2. The sender has an OPEN lead (inquiry/quoted, no invoice): a reply
+//     ("RE:") or an email about the SAME event date is a follow-up, appended
+//     to that lead. A fresh subject about a different (or unknown) date is
+//     a new inquiry: venues and planners book many events, so it gets its
+//     own row and the alert names the sibling as a possible duplicate.
+//  3. Otherwise create the lead exactly as before. Forwards (FW:/FWD:) and
+//     first-contact replies are never suppressed: the owner forwards leads
+//     to himself on purpose, and prospects answer his outreach with "RE:".
 // Suppression never silences the Telegram alert; it only stops ghost rows.
 // Exported for worker/test-lead-dedupe.mjs.
 const OPEN_LEAD_STAGES = new Set(['inquiry', 'quoted']);
-function _isOrderEvidence(r) {
-  return !!(r && (String(r.external_invoice_id || '').trim() || Number(r.total_cents) > 0));
+const INVOICED_STAGES = new Set(['invoiced', 'deposit_paid', 'paid_full', 'fulfilled']);
+function _hasInvoice(r) {
+  return !!String((r && r.external_invoice_id) || '').trim();
 }
-export function leadDedupeDecision(subject, existingRows) {
+function _isOrderEvidence(r) {
+  if (!r) return false;
+  if (_hasInvoice(r)) return true;
+  if (Number(r.deposit_cents) > 0) return true;
+  return Number(r.total_cents) > 0 && INVOICED_STAGES.has(r.stage);
+}
+const REPLY_SUBJECT_RE = /^\s*(?:\[[^\]]*\]\s*)*re(?:\[\d+\])?\s*:/i;
+export function leadDedupeDecision(subject, existingRows, eventDate) {
   const all = (Array.isArray(existingRows) ? existingRows : []).filter(r => r && typeof r === 'object');
   const rows = all.filter(r => r.stage !== 'cancelled');
-  const customer = rows.find(_isOrderEvidence) || null;
-  const openLead = rows.find(r => OPEN_LEAD_STAGES.has(r.stage) && !_isOrderEvidence(r)) || null;
+  const customer = rows.find(_isOrderEvidence) || null;   // rows arrive newest-first
+  const openLead = rows.find(r => OPEN_LEAD_STAGES.has(r.stage) && !_hasInvoice(r)) || null;
+  const isReply = REPLY_SUBJECT_RE.test(String(subject || ''));
   if (customer) {
-    return { create: false, appendTo: openLead ? openLead.id : null,
+    return { create: false, appendTo: (openLead || customer).id, sibling: null,
       reason: 'existing customer thread (order on file)' };
   }
   if (openLead) {
-    return { create: false, appendTo: openLead.id, reason: 'open lead already on file' };
+    const want = String(eventDate || '').slice(0, 10);
+    const have = String(openLead.event_start_at || '').slice(0, 10);
+    if (isReply || (want && have && want === have)) {
+      return { create: false, appendTo: openLead.id, sibling: null,
+        reason: 'follow-up on the open lead already on file' };
+    }
+    return { create: true, appendTo: null, sibling: openLead.id,
+      reason: 'new inquiry (this sender also has an open lead on file)' };
   }
-  const isReply = /^\s*(?:\[[^\]]*\]\s*)*re\s*:/i.test(String(subject || ''));
-  if (isReply && all.length > 0) {
-    return { create: false, appendTo: null, reason: 'reply on an existing thread, not a new inquiry' };
-  }
-  return { create: true, appendTo: null, reason: 'new inquiry' };
+  return { create: true, appendTo: null, sibling: null, reason: 'new inquiry' };
 }
 
 // Addresses that must never drive the sender lookup: form relays and
 // no-reply mailers share ONE address across many different leads (the
-// GoDaddy-form lesson in findHandledThreadSibling). Exported for tests.
+// GoDaddy-form lesson in findHandledThreadSibling). A display-name form
+// ("Jane Doe <jane@x.com>") is reduced to the address. Exported for tests.
 export function leadLookupEmail(email) {
-  const e = String(email || '').trim().toLowerCase();
+  let e = String(email || '').trim().toLowerCase();
+  const angled = e.match(/<([^<>]+)>/);
+  if (angled) e = angled[1].trim();
   if (!e || !e.includes('@')) return null;
   const [local, domain] = e.split('@');
   if (/^(no-?reply|do-?not-?reply|notifications?|mailer-daemon|postmaster)/.test(local)) return null;
-  if (/(^|\.)(formspree\.io|formspree\.com|godaddy\.com)$/.test(domain)) return null;
+  if (/(^|\.)(formspree\.io|formspree\.com|godaddy\.com|secureserver\.net)$/.test(domain)) return null;
   return e;
 }
 
@@ -2991,7 +3010,7 @@ export function escapeLikePattern(value) {
 async function appendLeadNote(env, row, text, receiptId) {
   try {
     const notes = ((row && row.notes) || '').trim();
-    const marker = '[receipt ' + receiptId + ']';
+    const marker = '[rcpt ' + String(receiptId || '').slice(0, 8) + ']';
     if (receiptId && notes.includes(marker)) return;
     const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + row.id, {
       method: 'PATCH',
@@ -3067,6 +3086,7 @@ async function processMsGraphNotification(env, eventKey, notification) {
       const cls = await parseWebhookClaudeResponse(cResp, 'Microsoft Graph');
 
       let suppressedReason = null; // set when the dedupe guard stops a lead row
+      let siblingLeadId = null;    // set when a row is created despite an open lead on file
       if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
         const lead = cls.extracted_lead;
         await renewLease();
@@ -3081,7 +3101,7 @@ async function processMsGraphNotification(env, eventKey, notification) {
         if (leadEmail) {
           try {
             const lr = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' +
-              '?select=id,stage,notes,client_email,external_invoice_id,total_cents' +
+              '?select=id,stage,notes,client_email,external_invoice_id,total_cents,deposit_cents,event_start_at' +
               '&client_email=ilike.' + encodeURIComponent(escapeLikePattern(leadEmail)) +
               '&order=created_at.desc&limit=25', { headers: sbHeaders(env) }, 15000);
             const rows = lr.ok ? await lr.json() : null;
@@ -3092,7 +3112,8 @@ async function processMsGraphNotification(env, eventKey, notification) {
             existing = [];
           }
         }
-        const decision = leadDedupeDecision(cls.subject, existing);
+        const decision = leadDedupeDecision(cls.subject, existing, lead.event_date || null);
+        if (decision.create && decision.sibling) siblingLeadId = decision.sibling;
         if (!decision.create) {
           suppressedReason = decision.reason;
           console.log('ms_graph lead row suppressed: ' + decision.reason);
@@ -3148,8 +3169,10 @@ async function processMsGraphNotification(env, eventKey, notification) {
           'From: ' + (cls.from_name || safeFromEmail || 'unknown') + '\n' +
           'Subject: ' + (cls.subject || '') + '\n\n' +
           (cls.summary || '') +
-          // Dedupe guard receipt: the owner always sees WHY no row was made.
-          (suppressedReason ? '\n\n(No new lead row: ' + suppressedReason + '.)' : '');
+          // Dedupe guard receipt: the owner always sees WHY no row was made,
+          // or that a row WAS made next to an existing open lead.
+          (suppressedReason ? '\n\n(No new lead row: ' + suppressedReason + '.)' : '') +
+          (siblingLeadId ? '\n\n(New lead row created. This sender also has an open lead on file: check this is not a duplicate.)' : '');
         await enqueueWebhookTelegramAlerts(
           env,
           'ms_graph',
