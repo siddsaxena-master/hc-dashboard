@@ -2939,7 +2939,14 @@ function _scrubOperatorEmail(email) {
 //     total_cents on lead rows, and rows the owner marked "passed" before
 //     September carry stage 'complete' with no invoice. Those people
 //     writing again ARE new leads.
-//  2. A fresh subject about an event DATE already on any live row (order or
+//     The caller looks up BOTH the From address and the address the model
+//     extracted. A reply from a company (non-freemail) address with nothing
+//     live under either also checks the company's domain for ORDER rows,
+//     because Jarvis's invoice sync writes the QuickBooks billing address
+//     onto the row, so a customer's orders can sit under a different
+//     address than the person replying (the Danielle rows). Domain matches
+//     are named in the alert ("matched by company domain").
+//  2. A fresh subject about an event DATE already on a live row (order or
 //     open lead) is a follow-up, appended to that row.
 //  3. A fresh subject about a different (or unknown) date is a NEW inquiry
 //     and gets its own row, even from a paying customer (owner decision
@@ -2961,6 +2968,13 @@ function _isOrderEvidence(r) {
   if (Number(r.deposit_cents) > 0) return true;
   return Number(r.total_cents) > 0 && INVOICED_STAGES.has(r.stage);
 }
+// A row that can still absorb a follow-up: an order, or an open lead.
+// Passed leads (cancelled, or pre-September 'complete' with no evidence)
+// are not threads. Exported for tests.
+export function isLiveLeadRow(r) {
+  return !!r && typeof r === 'object' && r.stage !== 'cancelled' &&
+    (_isOrderEvidence(r) || (OPEN_LEAD_STAGES.has(r.stage) && !_hasInvoice(r)));
+}
 const REPLY_SUBJECT_RE = /^\s*(?:\[[^\]]*\]\s*)*re(?:\[\d+\])?\s*:/i;
 export function leadDedupeDecision(subject, existingRows, eventDate) {
   const all = (Array.isArray(existingRows) ? existingRows : []).filter(r => r && typeof r === 'object');
@@ -2969,9 +2983,10 @@ export function leadDedupeDecision(subject, existingRows, eventDate) {
   const openLead = rows.find(r => OPEN_LEAD_STAGES.has(r.stage) && !_hasInvoice(r)) || null;
   const isReply = REPLY_SUBJECT_RE.test(String(subject || ''));
   const want = String(eventDate || '').slice(0, 10);
-  // Any live row (order or open lead) already dated to this email's event.
+  // A LIVE row (an order, or an open lead) already dated to this email's
+  // event. A passed lead that happens to share the date is not a thread.
   const sameEvent = want
-    ? rows.find(r => String((r && r.event_start_at) || '').slice(0, 10) === want) || null
+    ? rows.find(r => isLiveLeadRow(r) && String((r && r.event_start_at) || '').slice(0, 10) === want) || null
     : null;
   // A reply ("RE:") on a known sender is a thread on what is already on
   // file, whatever date the classifier guessed: the 2026-09-06 ghost rows
@@ -3023,6 +3038,57 @@ export function escapeLikePattern(value) {
   return String(value).replace(/[\\%_]/g, '\\$&');
 }
 
+// Addresses at these domains identify a person, not a company, so a reply
+// from one never triggers the company-domain fallback in the lookup. The
+// owner's own domain is listed so it can never be treated as a customer.
+export const FREEMAIL_DOMAINS = new Set([
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'ymail.com', 'hotmail.com', 'outlook.com', 'live.com',
+  'msn.com', 'icloud.com', 'me.com', 'mac.com', 'aol.com', 'comcast.net', 'optonline.net',
+  'verizon.net', 'att.net', 'sbcglobal.net', 'protonmail.com', 'proton.me', 'hamptonscoconuts.com',
+]);
+export function emailDomain(email) {
+  const e = String(email || '').trim().toLowerCase();
+  const at = e.lastIndexOf('@');
+  return at > 0 && at < e.length - 1 ? e.slice(at + 1) : null;
+}
+export function isCompanyDomain(email) {
+  const d = emailDomain(email);
+  return !!d && d.includes('.') && !FREEMAIL_DOMAINS.has(d);
+}
+// The addresses that can name a sender, in lookup order: the address the
+// model extracted first (it is what the row stores), then the From address.
+// Each is normalized and relay addresses are dropped; duplicates collapse.
+export function leadLookupCandidates(extractedAddr, fromAddr) {
+  const out = [];
+  for (const a of [extractedAddr, fromAddr]) {
+    const e = leadLookupEmail(a);
+    if (e && !out.includes(e)) out.push(e);
+  }
+  return out;
+}
+// Rows from several lookups, first occurrence of each id wins.
+export function mergeLeadRows(a, b) {
+  const seen = new Set();
+  const out = [];
+  for (const r of [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]) {
+    if (!r || typeof r !== 'object') continue;
+    const key = r.id == null ? null : String(r.id);
+    if (key !== null && seen.has(key)) continue;
+    if (key !== null) seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+// The raw subject from the poller's Graph-shaped notification, when present,
+// so the reply test runs on what was actually sent, not the model's echo.
+export function graphNotificationSubject(notification) {
+  const n = notification && typeof notification === 'object' ? notification : null;
+  const rd = n && n.resourceData && typeof n.resourceData === 'object' ? n.resourceData : null;
+  const nested = rd && rd.message && typeof rd.message === 'object' ? rd.message.subject : undefined;
+  const s = (rd && rd.subject != null) ? rd.subject : (nested != null ? nested : (n ? n.subject : undefined));
+  return typeof s === 'string' && s.trim() ? s : null;
+}
+
 // Best-effort, idempotent note append on an existing lead (dedupe rule 2).
 // The receipt id is embedded so a re-claimed delivery never appends twice.
 // A failure here must never fail the webhook delivery: the alert still
@@ -3031,15 +3097,17 @@ async function appendLeadNote(env, row, text, receiptId) {
   try {
     const notes = ((row && row.notes) || '').trim();
     const marker = '[rcpt ' + String(receiptId || '').slice(0, 8) + ']';
-    if (receiptId && notes.includes(marker)) return;
+    if (receiptId && notes.includes(marker)) return true; // already appended by an earlier delivery
     const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders?id=eq.' + row.id, {
       method: 'PATCH',
       headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }),
       body: JSON.stringify({ notes: (notes ? notes + '\n\n' : '') + text + ' ' + marker }),
     }, 15000);
-    if (!resp.ok) console.error('lead note append failed:', resp.status);
+    if (!resp.ok) { console.error('lead note append failed:', resp.status); return false; }
+    return true;
   } catch (e) {
     console.error('lead note append exception:', e);
+    return false;
   }
 }
 
@@ -3109,33 +3177,64 @@ async function processMsGraphNotification(env, eventKey, notification) {
       let siblingLeadId = null;    // set when a row is created next to an open lead or an order on file
       let siblingReason = null;    // the guard's wording for that case (goes into the alert)
       let normalizedLeadEmail = null; // the exact lowercase address the lookup used (stored on the row so later lookups match)
+      let noteFailed = false;      // a suppressed email whose note did not reach the dashboard row
       if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
         const lead = cls.extracted_lead;
         await renewLease();
-        // Dedupe guard (see leadDedupeDecision): look the sender up by EXACT
-        // email. Relay / no-reply addresses never drive a lookup; LIKE
-        // wildcards are escaped AND rows are post-filtered on exact equality;
-        // the read is bounded (15s, limit 25). A failed read yields [] and
-        // falls through to creating the row, never to a suppression.
-        const leadEmail = leadLookupEmail(
-          _scrubOperatorEmail(lead.client_email) || _scrubOperatorEmail(cls.from_email) || null);
-        normalizedLeadEmail = leadEmail;
+        // Dedupe guard (see leadDedupeDecision). Both addresses that can name
+        // this sender are looked up EXACTLY: the address the model extracted
+        // (what the row stores) and the actual From address. Relay / no-reply
+        // addresses never drive a lookup; LIKE wildcards are escaped AND rows
+        // are post-filtered on exact equality; every read is bounded (15s,
+        // limit 25). A failed read yields nothing and falls through to
+        // creating the row, never to a suppression.
+        const fromAddr = leadLookupEmail(_scrubOperatorEmail(cls.from_email) || null);
+        const extractedAddr = leadLookupEmail(_scrubOperatorEmail(lead.client_email) || null);
+        const candidates = leadLookupCandidates(extractedAddr, fromAddr);
+        normalizedLeadEmail = candidates[0] || null;
+        // The reply test runs on the raw subject the poller sent when it is
+        // there (code, not the model's echo of it).
+        const subjectForGuard = graphNotificationSubject(notification) || cls.subject || '';
+        const LEAD_SELECT = '?select=id,stage,notes,client_email,external_invoice_id,total_cents,deposit_cents,event_start_at,created_at';
         let existing = [];
-        if (leadEmail) {
+        for (const addr of candidates) {
           try {
-            const lr = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' +
-              '?select=id,stage,notes,client_email,external_invoice_id,total_cents,deposit_cents,event_start_at' +
-              '&client_email=ilike.' + encodeURIComponent(escapeLikePattern(leadEmail)) +
+            const lr = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' + LEAD_SELECT +
+              '&client_email=ilike.' + encodeURIComponent(escapeLikePattern(addr)) +
               '&order=created_at.desc&limit=25', { headers: sbHeaders(env) }, 15000);
             const rows = lr.ok ? await lr.json() : null;
-            existing = (Array.isArray(rows) ? rows : [])
-              .filter(r => String((r && r.client_email) || '').trim().toLowerCase() === leadEmail);
+            existing = mergeLeadRows(existing, (Array.isArray(rows) ? rows : [])
+              .filter(r => String((r && r.client_email) || '').trim().toLowerCase() === addr));
           } catch (e) {
             console.error('lead lookup failed, creating the row as before:', e);
-            existing = [];
           }
         }
-        const decision = leadDedupeDecision(cls.subject, existing, lead.event_date || null);
+        // A retried delivery must never read the row it created as history.
+        existing = existing.filter(r => r && r.id !== receiptId);
+        // A reply from a company address with nothing live on file: the
+        // customer's order rows may carry the QuickBooks billing address
+        // instead of the person replying (Jarvis's invoice sync writes it onto
+        // the row; the 2026-09-06 ghost rows were exactly this). One more
+        // bounded read by company domain, ORDER rows only, never freemail.
+        let matchedByDomain = false;
+        const fromDomain = isCompanyDomain(fromAddr) ? emailDomain(fromAddr) : null;
+        if (fromDomain && REPLY_SUBJECT_RE.test(String(subjectForGuard)) && !existing.some(isLiveLeadRow)) {
+          try {
+            const dr = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' + LEAD_SELECT +
+              '&client_email=ilike.' + encodeURIComponent('*@' + escapeLikePattern(fromDomain)) +
+              '&external_invoice_id=not.is.null&order=created_at.desc&limit=25', { headers: sbHeaders(env) }, 15000);
+            const rows = dr.ok ? await dr.json() : null;
+            const byDomain = (Array.isArray(rows) ? rows : [])
+              .filter(r => emailDomain(r && r.client_email) === fromDomain && isLiveLeadRow(r) && _isOrderEvidence(r));
+            if (byDomain.length) { matchedByDomain = true; existing = mergeLeadRows(existing, byDomain); }
+          } catch (e) {
+            console.error('lead domain lookup failed, creating the row as before:', e);
+          }
+        }
+        // Newest first across every lookup: the decision reads rows in order.
+        existing.sort((x, y) => String((y && y.created_at) || '').localeCompare(String((x && x.created_at) || '')));
+        const decision = leadDedupeDecision(subjectForGuard, existing, lead.event_date || null);
+        if (!decision.create && matchedByDomain) decision.reason += ' (matched by company domain)';
         if (decision.create && decision.sibling) { siblingLeadId = decision.sibling; siblingReason = decision.reason; }
         if (!decision.create) {
           suppressedReason = decision.reason;
@@ -3143,9 +3242,12 @@ async function processMsGraphNotification(env, eventKey, notification) {
           if (decision.appendTo) {
             const target = existing.find(r => r.id === decision.appendTo);
             if (target) {
-              await appendLeadNote(env, target,
-                'Follow-up email via MS Graph: ' + (cls.subject || '') + '\n' + (lead.notes || cls.summary || ''),
+              const ok = await appendLeadNote(env, target,
+                'Follow-up email via MS Graph: ' + (subjectForGuard || '') + '\n' + (lead.notes || cls.summary || ''),
                 receiptId);
+              if (!ok) noteFailed = true;
+            } else {
+              noteFailed = true;
             }
           }
         }
@@ -3198,7 +3300,9 @@ async function processMsGraphNotification(env, eventKey, notification) {
           // Dedupe guard receipt: the owner always sees WHY no row was made,
           // or that a row WAS made next to an existing open lead.
           (suppressedReason ? '\n\n(No new lead row: ' + suppressedReason + '.)' : '') +
-          (siblingLeadId ? '\n\n(New lead row created: ' + (siblingReason || 'this sender already has a row on file') + '. Check this is not a duplicate.)' : '');
+          (suppressedReason && noteFailed ? '\n(The follow-up note could not be added to that dashboard row.)' : '') +
+          (siblingLeadId ? '\n\n(New lead row created: ' + (siblingReason || 'this sender already has a row on file') +
+            '. Existing row ' + String(siblingLeadId).slice(0, 8) + '. Check this is not a duplicate.)' : '');
         await enqueueWebhookTelegramAlerts(
           env,
           'ms_graph',

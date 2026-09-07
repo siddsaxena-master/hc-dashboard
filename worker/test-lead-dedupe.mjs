@@ -3,7 +3,10 @@
 // Background: 2026-09-06, two "RE: Labor Day Event" replies from an
 // already-invoiced customer became fresh inquiry rows on the calendar.
 // Every rule fails OPEN toward creating the row (a lead pipeline).
-import { leadDedupeDecision, leadLookupEmail, escapeLikePattern } from './worker.js';
+import {
+  leadDedupeDecision, leadLookupEmail, escapeLikePattern, isLiveLeadRow, emailDomain, isCompanyDomain,
+  leadLookupCandidates, mergeLeadRows, graphNotificationSubject, FREEMAIL_DOMAINS,
+} from './worker.js';
 
 let failed = 0;
 let total = 0;
@@ -106,6 +109,43 @@ d = leadDedupeDecision('RE: hi', [{ id: 'lead-newer', stage: 'inquiry', total_ce
 check('two open leads: the first (caller orders created_at desc = newest) wins', d.appendTo === 'lead-newer');
 d = leadDedupeDecision('RE: hi', [{ ...quotedLead, external_invoice_id: '3600' }]);
 check('a quoted row that carries an invoice id is a customer, not an open lead', d.create === false && d.appendTo === 'row-quoted' && /order on file/.test(d.reason));
+
+// ── rule 2 only absorbs into LIVE rows ──
+d = leadDedupeDecision('Coconuts for Sep 5', [{ ...passedOld, event_start_at: '2026-09-05T12:00:00+00:00' }], '2026-09-05');
+check('a passed lead (complete, no evidence) sharing the date is not a thread: create', d.create === true && d.sibling === null);
+d = leadDedupeDecision('Coconuts for Sep 5', [{ ...passedNew, event_start_at: '2026-09-05T12:00:00+00:00' }], '2026-09-05');
+check('a cancelled row sharing the date is ignored: create', d.create === true);
+check('isLiveLeadRow: invoiced order', isLiveLeadRow(invoiced) === true);
+check('isLiveLeadRow: open lead', isLiveLeadRow(openLead) === true);
+check('isLiveLeadRow: quoted lead with an invoice id counts (order evidence)', isLiveLeadRow({ ...quotedLead, external_invoice_id: '3600' }) === true);
+check('isLiveLeadRow: pre-Sept passed lead is not live', isLiveLeadRow(passedOld) === false);
+check('isLiveLeadRow: cancelled is not live', isLiveLeadRow({ ...invoiced, stage: 'cancelled' }) === false);
+check('isLiveLeadRow: null is not live', isLiveLeadRow(null) === false);
+
+// ── lookup helpers: both addresses, company-domain fallback, merged rows, raw subject ──
+check('emailDomain lowercases and takes the last @', emailDomain('  Jane@Acme.COM ') === 'acme.com');
+check('emailDomain rejects a missing or trailing @', emailDomain('bad') === null && emailDomain('x@') === null && emailDomain(null) === null);
+check('gmail is not a company domain', isCompanyDomain('jane@gmail.com') === false);
+check('every listed freemail domain is rejected', [...FREEMAIL_DOMAINS].every(dm => isCompanyDomain('a@' + dm) === false));
+check('the owner domain is never a company to match', isCompanyDomain('someone@hamptonscoconuts.com') === false);
+check('a corporate domain is a company domain', isCompanyDomain('erica@dolce-vita-example.com') === true);
+check('a domain without a dot is not a company domain', isCompanyDomain('a@localhost') === false);
+check('candidates: extracted first, From second, duplicates collapse', JSON.stringify(leadLookupCandidates('Jane@X.com', 'jane@x.com')) === '["jane@x.com"]');
+check('candidates: two different addresses keep order', JSON.stringify(leadLookupCandidates('planner@agency.com', 'client@venue.com')) === '["planner@agency.com","client@venue.com"]');
+check('candidates: a relay extracted address is dropped, From survives', JSON.stringify(leadLookupCandidates('submissions@formspree.io', 'Bob <bob@y.com>')) === '["bob@y.com"]');
+check('candidates: nothing usable gives an empty list', leadLookupCandidates(null, undefined).length === 0);
+const merged = mergeLeadRows([{ id: 'a', stage: 'inquiry' }, null, { id: 'b' }], [{ id: 'a', stage: 'invoiced' }, { id: 'c' }, 'junk']);
+check('mergeLeadRows keeps the first occurrence of an id and drops junk', merged.length === 3 && merged[0].stage === 'inquiry' && merged.map(r => r.id).join() === 'a,b,c');
+check('mergeLeadRows matches numeric and string ids', mergeLeadRows([{ id: 7 }], [{ id: '7' }]).length === 1);
+check('raw subject from resourceData', graphNotificationSubject({ resourceData: { subject: 'RE: Labor Day Event' } }) === 'RE: Labor Day Event');
+check('raw subject nested under message', graphNotificationSubject({ resourceData: { message: { subject: 'z' } } }) === 'z');
+check('raw subject at the top level', graphNotificationSubject({ subject: 'y' }) === 'y');
+check('blank or missing raw subject yields null (caller falls back to the model)', graphNotificationSubject({ resourceData: { subject: '  ' } }) === null && graphNotificationSubject(null) === null && graphNotificationSubject({}) === null);
+// The Danielle shape once the customer's order rows are found by domain:
+// the reply is suppressed and the note goes to the newest order row.
+const orderByDomain = { id: 'row-order-billing', stage: 'invoiced', external_invoice_id: '3479', total_cents: 150000, deposit_cents: 0, event_start_at: '2026-09-05T12:00:00+00:00', client_email: 'billing@dolce-vita-example.com' };
+d = leadDedupeDecision('RE: Labor Day Event', [orderByDomain], '2026-09-07');
+check('reply + order rows found by company domain: no row, note on the order', d.create === false && d.appendTo === 'row-order-billing');
 
 // ── lookup address hygiene ──
 check('normal address normalizes', leadLookupEmail('  Jane@Example.com ') === 'jane@example.com');
