@@ -6,6 +6,7 @@
 import {
   leadDedupeDecision, leadLookupEmail, escapeLikePattern, isLiveLeadRow, emailDomain, isCompanyDomain,
   leadLookupCandidates, mergeLeadRows, graphNotificationSubject, FREEMAIL_DOMAINS,
+  graphNotificationFrom, splitEmailList, rowEmailMatches, rowDomainMatches,
 } from './worker.js';
 
 let failed = 0;
@@ -141,6 +142,15 @@ check('raw subject from resourceData', graphNotificationSubject({ resourceData: 
 check('raw subject nested under message', graphNotificationSubject({ resourceData: { message: { subject: 'z' } } }) === 'z');
 check('raw subject at the top level', graphNotificationSubject({ subject: 'y' }) === 'y');
 check('blank or missing raw subject yields null (caller falls back to the model)', graphNotificationSubject({ resourceData: { subject: '  ' } }) === null && graphNotificationSubject(null) === null && graphNotificationSubject({}) === null);
+check('raw From from the Graph shape', graphNotificationFrom({ resourceData: { from: { emailAddress: { name: 'D', address: ' D@Example.com ' } } } }) === 'D@Example.com');
+check('raw From as a plain string', graphNotificationFrom({ resourceData: { from: 'd@example.com' } }) === 'd@example.com');
+check('raw From missing yields null (caller falls back to the model)', graphNotificationFrom({ resourceData: {} }) === null && graphNotificationFrom(null) === null);
+check('splitEmailList splits a QuickBooks BillEmail list', JSON.stringify(splitEmailList('A@X.com, b@x.com; c@y.com')) === '["a@x.com","b@x.com","c@y.com"]');
+check('splitEmailList ignores junk without @', splitEmailList('n/a').length === 0 && splitEmailList(null).length === 0);
+check('rowEmailMatches any listed address', rowEmailMatches({ client_email: 'a@x.com, B@X.com' }, 'b@x.com') === true && rowEmailMatches({ client_email: 'a@x.com' }, 'b@x.com') === false);
+check('rowEmailMatches never matches a partial address', rowEmailMatches({ client_email: 'jane.doe@x.com' }, 'doe@x.com') === false);
+check('rowDomainMatches any listed address domain', rowDomainMatches({ client_email: 'a@x.com, b@y.com' }, 'x.com') === true && rowDomainMatches({ client_email: 'a@notx.com' }, 'x.com') === false);
+check('rowDomainMatches rejects a look-alike domain', rowDomainMatches({ client_email: 'a@x.com.evil.net' }, 'x.com') === false);
 // The Danielle shape once the customer's order rows are found by domain:
 // the reply is suppressed and the note goes to the newest order row.
 const orderByDomain = { id: 'row-order-billing', stage: 'invoiced', external_invoice_id: '3479', total_cents: 150000, deposit_cents: 0, event_start_at: '2026-09-05T12:00:00+00:00', client_email: 'billing@dolce-vita-example.com' };

@@ -3088,6 +3088,31 @@ export function graphNotificationSubject(notification) {
   const s = (rd && rd.subject != null) ? rd.subject : (nested != null ? nested : (n ? n.subject : undefined));
   return typeof s === 'string' && s.trim() ? s : null;
 }
+// The raw From address from the notification (Graph shape
+// resourceData.from.emailAddress.address, or a plain string), when present.
+export function graphNotificationFrom(notification) {
+  const n = notification && typeof notification === 'object' ? notification : null;
+  const rd = n && n.resourceData && typeof n.resourceData === 'object' ? n.resourceData : null;
+  const from = rd ? rd.from : (n ? n.from : undefined);
+  if (typeof from === 'string') return from.trim() || null;
+  if (from && typeof from === 'object') {
+    const ea = from.emailAddress && typeof from.emailAddress === 'object' ? from.emailAddress.address : from.address;
+    return typeof ea === 'string' && ea.trim() ? ea.trim() : null;
+  }
+  return null;
+}
+// Jarvis writes the QuickBooks BillEmail onto client_email, and that field
+// is often a LIST ("a@x.com, b@x.com"; nearly half the order rows). A row
+// matches an address, or a domain, when ANY address in its list does.
+export function splitEmailList(value) {
+  return String(value || '').toLowerCase().split(/[,;\s]+/).map(s => s.trim()).filter(s => s.includes('@'));
+}
+export function rowEmailMatches(row, addr) {
+  return !!addr && splitEmailList(row && row.client_email).includes(String(addr).toLowerCase());
+}
+export function rowDomainMatches(row, domain) {
+  return !!domain && splitEmailList(row && row.client_email).some(e => emailDomain(e) === domain);
+}
 
 // Best-effort, idempotent note append on an existing lead (dedupe rule 2).
 // The receipt id is embedded so a re-claimed delivery never appends twice.
@@ -3178,6 +3203,7 @@ async function processMsGraphNotification(env, eventKey, notification) {
       let siblingReason = null;    // the guard's wording for that case (goes into the alert)
       let normalizedLeadEmail = null; // the exact lowercase address the lookup used (stored on the row so later lookups match)
       let noteFailed = false;      // a suppressed email whose note did not reach the dashboard row
+      let suppressedTargetId = null; // the row that absorbed a suppressed email (named in the alert)
       if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
         const lead = cls.extracted_lead;
         await renewLease();
@@ -3188,7 +3214,9 @@ async function processMsGraphNotification(env, eventKey, notification) {
         // are post-filtered on exact equality; every read is bounded (15s,
         // limit 25). A failed read yields nothing and falls through to
         // creating the row, never to a suppression.
-        const fromAddr = leadLookupEmail(_scrubOperatorEmail(cls.from_email) || null);
+        // The From address comes from the raw notification when it is there
+        // (code, not the model's echo); the extracted address is the model's.
+        const fromAddr = leadLookupEmail(_scrubOperatorEmail(graphNotificationFrom(notification) || cls.from_email) || null);
         const extractedAddr = leadLookupEmail(_scrubOperatorEmail(lead.client_email) || null);
         const candidates = leadLookupCandidates(extractedAddr, fromAddr);
         normalizedLeadEmail = candidates[0] || null;
@@ -3199,12 +3227,14 @@ async function processMsGraphNotification(env, eventKey, notification) {
         let existing = [];
         for (const addr of candidates) {
           try {
+            // "contains" on the database side (client_email may be a list),
+            // exact match on any listed address on this side.
             const lr = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' + LEAD_SELECT +
-              '&client_email=ilike.' + encodeURIComponent(escapeLikePattern(addr)) +
+              '&client_email=ilike.' + encodeURIComponent('*' + escapeLikePattern(addr) + '*') +
               '&order=created_at.desc&limit=25', { headers: sbHeaders(env) }, 15000);
             const rows = lr.ok ? await lr.json() : null;
             existing = mergeLeadRows(existing, (Array.isArray(rows) ? rows : [])
-              .filter(r => String((r && r.client_email) || '').trim().toLowerCase() === addr));
+              .filter(r => rowEmailMatches(r, addr)));
           } catch (e) {
             console.error('lead lookup failed, creating the row as before:', e);
           }
@@ -3221,11 +3251,11 @@ async function processMsGraphNotification(env, eventKey, notification) {
         if (fromDomain && REPLY_SUBJECT_RE.test(String(subjectForGuard)) && !existing.some(isLiveLeadRow)) {
           try {
             const dr = await webhookFetch(env.SUPABASE_URL + '/rest/v1/orders' + LEAD_SELECT +
-              '&client_email=ilike.' + encodeURIComponent('*@' + escapeLikePattern(fromDomain)) +
+              '&client_email=ilike.' + encodeURIComponent('*@' + escapeLikePattern(fromDomain) + '*') +
               '&external_invoice_id=not.is.null&order=created_at.desc&limit=25', { headers: sbHeaders(env) }, 15000);
             const rows = dr.ok ? await dr.json() : null;
             const byDomain = (Array.isArray(rows) ? rows : [])
-              .filter(r => emailDomain(r && r.client_email) === fromDomain && isLiveLeadRow(r) && _isOrderEvidence(r));
+              .filter(r => r && r.id !== receiptId && rowDomainMatches(r, fromDomain) && isLiveLeadRow(r) && _isOrderEvidence(r));
             if (byDomain.length) { matchedByDomain = true; existing = mergeLeadRows(existing, byDomain); }
           } catch (e) {
             console.error('lead domain lookup failed, creating the row as before:', e);
@@ -3238,6 +3268,7 @@ async function processMsGraphNotification(env, eventKey, notification) {
         if (decision.create && decision.sibling) { siblingLeadId = decision.sibling; siblingReason = decision.reason; }
         if (!decision.create) {
           suppressedReason = decision.reason;
+          suppressedTargetId = decision.appendTo || null;
           console.log('ms_graph lead row suppressed: ' + decision.reason);
           if (decision.appendTo) {
             const target = existing.find(r => r.id === decision.appendTo);
@@ -3299,7 +3330,8 @@ async function processMsGraphNotification(env, eventKey, notification) {
           (cls.summary || '') +
           // Dedupe guard receipt: the owner always sees WHY no row was made,
           // or that a row WAS made next to an existing open lead.
-          (suppressedReason ? '\n\n(No new lead row: ' + suppressedReason + '.)' : '') +
+          (suppressedReason ? '\n\n(No new lead row: ' + suppressedReason + '.' +
+            (suppressedTargetId ? ' Existing row ' + String(suppressedTargetId).slice(0, 8) + '.' : '') + ')' : '') +
           (suppressedReason && noteFailed ? '\n(The follow-up note could not be added to that dashboard row.)' : '') +
           (siblingLeadId ? '\n\n(New lead row created: ' + (siblingReason || 'this sender already has a row on file') +
             '. Existing row ' + String(siblingLeadId).slice(0, 8) + '. Check this is not a duplicate.)' : '');
