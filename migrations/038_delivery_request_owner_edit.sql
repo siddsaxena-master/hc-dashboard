@@ -62,15 +62,31 @@ begin
     end if;
   end loop;
 
-  if not exists (
-    select 1 from pg_catalog.pg_attribute
-    where attrelid = 'public.field_workers'::regclass
-      and attname = 'auth_user_id'
-      and not attisdropped
-  ) then
+  -- Every roster column the access gate reads, not just the link column.
+  foreach v_column in array array['auth_user_id', 'role', 'market', 'active'] loop
+    if not exists (
+      select 1 from pg_catalog.pg_attribute
+      where attrelid = 'public.field_workers'::regclass
+        and attname = v_column
+        and attnum > 0
+        and not attisdropped
+    ) then
+      raise exception using
+        errcode = '55000',
+        message = pg_catalog.format('038 requires field_workers.%s from migration 015', v_column);
+    end if;
+  end loop;
+
+  -- PRIVACY GATE (2026-09-07 review). This migration creates the first way to
+  -- write on-site access instructions (gate codes, service entrances) into
+  -- orders, and mirrors them into orders.venue. While the anon role can still
+  -- read public.orders, that text is world-readable to anyone holding the
+  -- public key published in the dashboard page. Migration 020 removes that
+  -- anon access. Refuse until it has, rather than quietly widening a leak.
+  if pg_catalog.has_table_privilege('anon', 'public.orders', 'SELECT') then
     raise exception using
-      errcode = '55000',
-      message = '038 requires field_workers.auth_user_id from migration 015';
+      errcode = '42501',
+      message = '038 refuses to add the delivery-location write path while anon can still read public.orders: run 020 first, or remove the anon select grant and policies on orders';
   end if;
 
   -- The 034 shape guard: delivery_request is null or a JSON object.
@@ -265,11 +281,22 @@ begin
     v_material := v_material || pg_catalog.jsonb_build_object('location', v_location);
   end if;
 
-  -- Replay safety: the same details again leave the row exactly as it is.
+  -- Replay safety: the same details again leave the request exactly as it is.
   -- checked_at, set_by, notified_at and venue_before stay, so a retried tap
   -- never re-announces a time the crew already heard about.
   if v_existing is not null
      and (v_existing - array['checked_at', 'set_by', 'notified_at', 'venue_before']) = v_material then
+    -- ...but the mirrored venue may have been overwritten meanwhile (the web
+    -- dashboard writes venue too, and venue is the ONLY place today's crew
+    -- app shows the location). Re-tapping Confirm is the owner's only repair,
+    -- so put the location back. The request itself is untouched, so this
+    -- never re-notifies (2026-09-07 review).
+    if v_location is not null and v_order.venue is distinct from v_location then
+      update public.orders
+      set venue = v_location,
+          updated_at = v_now
+      where id = p_order_id;
+    end if;
     return v_existing;
   end if;
 
@@ -282,9 +309,14 @@ begin
 
   v_venue := v_order.venue;
   if v_location is not null then
-    -- venue_before is captured the first time a location is set and kept
-    -- across later location edits, so a clear always restores the original.
-    if v_existing is not null and (v_existing ? 'venue_before') then
+    -- venue_before is the venue to restore when the location is cleared. Keep
+    -- the one we already hold only while our mirror is still in place; if
+    -- someone else changed venue since (a QuickBooks correction, say), THAT
+    -- is now the value a clear must restore, so capture it instead. Without
+    -- this test a later clear resurrects a stale venue over a newer correct
+    -- one, silently (2026-09-07 review).
+    if v_existing is not null and (v_existing ? 'venue_before')
+       and v_order.venue is not distinct from (v_existing ->> 'location') then
       v_new := v_new || pg_catalog.jsonb_build_object('venue_before', v_existing -> 'venue_before');
     else
       v_new := v_new || pg_catalog.jsonb_build_object('venue_before', v_order.venue);

@@ -208,6 +208,37 @@ try {
   await db.query('update public.orders set venue = $1 where id = $2', ['Fake Beach Club', nyOrder]);
   await identity('owner');
 
+  // ── re-confirming identical details repairs a clobbered mirror ────────
+  // The web dashboard also writes venue, and venue is the only place the
+  // shipped crew app shows the location, so re-tapping Confirm has to be the
+  // repair. The request itself must not change, or the crew is re-notified.
+  const mirrored = await setRequest(nyOrder, '3:00 PM', 'loading dock');
+  assert.equal((await row(nyOrder)).venue, 'loading dock');
+  await identity(null, 'postgres');
+  await db.query('update public.orders set venue = $1 where id = $2', ['Clobbered by the dashboard', nyOrder]);
+  await identity('owner');
+  const repaired = await setRequest(nyOrder, '3:00 PM', 'loading dock');
+  assert.equal((await row(nyOrder)).venue, 'loading dock');
+  assert.deepEqual(repaired, mirrored);
+  assert.equal(repaired.checked_at, mirrored.checked_at);
+  pass('re-confirming the same details puts a clobbered venue mirror back without touching the request');
+
+  // ── a venue corrected after the mirror survives a later clear ─────────
+  // venue_before must follow the newest legitimate venue, not the first one,
+  // or a clear resurrects a stale name over a QuickBooks correction.
+  await identity(null, 'postgres');
+  await db.query('update public.orders set venue = $1 where id = $2',
+    ['Fake Beach Club PAVILION B', nyOrder]);
+  await identity('owner');
+  const recaptured = await setRequest(nyOrder, '4:00 PM', 'loading dock');
+  assert.equal(recaptured.venue_before, 'Fake Beach Club PAVILION B');
+  assert.equal(await setRequest(nyOrder, null), null);
+  assert.equal((await row(nyOrder)).venue, 'Fake Beach Club PAVILION B');
+  pass('a venue corrected after the mirror was set is what a later clear restores');
+  await identity(null, 'postgres');
+  await db.query('update public.orders set venue = $1 where id = $2', ['Fake Beach Club', nyOrder]);
+  await identity('owner');
+
   // ── a null venue is restored as null ──────────────────────────────────
   request = await setRequest(unassignedOrder, '10am - 12pm', 'back porch');
   assert.equal(request.date, '2026-09-12');
@@ -372,6 +403,19 @@ try {
   await db.exec(migration);
   assert.equal(await projectionHasLocation(), 1);
   pass('migration refuses a projection without the 034 delivery block, then applies once 034 is back');
+
+  // ── the privacy gate: no location write path while anon can read orders ──
+  // Gate codes and service-entrance notes must not land in a table the
+  // public dashboard key can read. Migration 020 removes that anon access.
+  await db.exec(rollback);
+  await db.exec('grant select on table public.orders to anon;');
+  await assert.rejects(db.exec(migration), /anon can still read public\.orders/);
+  await db.exec('rollback;');
+  await db.exec('revoke select on table public.orders from anon;');
+  await db.exec(migration);
+  assert.equal(await functionCount(), 1);
+  assert.equal(await projectionHasLocation(), 1);
+  pass('migration refuses to add the location write path while anon can read orders, and applies once that is revoked');
 
   // ── 035 and 038 patch different projection lines, so either can go live first ──
   // 035 (customer logos) is still local preparation while 038 may ship before it.
