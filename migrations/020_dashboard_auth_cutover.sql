@@ -121,12 +121,16 @@ grant execute on function public.hc_list_orders_for_current_user(
   timestamptz, timestamptz, text[], integer, integer
 ) to authenticated;
 
+-- The five-argument confirm is RETIRED, so nothing is granted back here.
+-- Migration 026 (applied 2026-09-08, i.e. BEFORE this one despite the lower
+-- number) replaced it with hc_confirm_order_delivery_v2 and revoked this one
+-- from every role; 026's own postflight asserts that neither authenticated
+-- nor service_role may execute it. 020 was written before 026 existed, and
+-- its original re-grant here would have silently undone that hardening.
+-- Revoking service_role too makes this migration reinforce 026 instead.
 revoke all on function public.hc_confirm_order_delivery(
   uuid, timestamptz, text, text, text
-) from public, anon, authenticated;
-grant execute on function public.hc_confirm_order_delivery(
-  uuid, timestamptz, text, text, text
-) to authenticated, service_role;
+) from public, anon, authenticated, service_role;
 
 do $postflight$
 begin
