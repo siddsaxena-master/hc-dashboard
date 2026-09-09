@@ -82,17 +82,16 @@ begin
     end if;
   end loop;
 
-  -- PRIVACY GATE (2026-09-07 review). This migration creates the first way to
-  -- write on-site access instructions (gate codes, service entrances) into
-  -- orders, and mirrors them into orders.venue. While the anon role can still
-  -- read public.orders, that text is world-readable to anyone holding the
-  -- public key published in the dashboard page. Migration 020 removes that
-  -- anon access. Refuse until it has, rather than quietly widening a leak.
-  if pg_catalog.has_table_privilege('anon', 'public.orders', 'SELECT') then
-    raise exception using
-      errcode = '42501',
-      message = '038 refuses to add the delivery-location write path while anon can still read public.orders: run 020 first, or remove the anon select grant and policies on orders';
-  end if;
+  -- PRIVACY NOTE (2026-09-07, narrowed 2026-09-09). The LOCATION field is
+  -- for on-site access instructions (gate codes, service entrances). While
+  -- the anon role can still read public.orders, that text would be readable
+  -- by anyone holding the public key published in the dashboard page, so the
+  -- function REFUSES a location write until migration 020 removes that
+  -- access. The refusal is enforced per call, below, not here, because the
+  -- delivery WINDOW is not in the same class: the customer names, street
+  -- addresses, phone numbers and delivery dates on this table are already
+  -- exposed today, so a time of day adds essentially nothing, and blocking
+  -- it would cost the owner the feature he actually needs in the field.
 
   -- The 034 shape guard: delivery_request is null or a JSON object.
   if not exists (
@@ -235,6 +234,15 @@ begin
     raise exception using
       errcode = '22023',
       message = 'delivery location must be 200 characters or fewer';
+  end if;
+
+  -- On-site access instructions do not go into a table the public key can
+  -- still read. The window is allowed; only the location waits for 020.
+  if v_location is not null
+     and pg_catalog.has_table_privilege('anon', 'public.orders', 'SELECT') then
+    raise exception using
+      errcode = '42501',
+      message = 'the on-site location cannot be saved until public read access to orders is removed; the delivery time can be saved now';
   end if;
 
   if v_contact_name is not null and pg_catalog.length(v_contact_name) > 80 then

@@ -451,18 +451,34 @@ try {
   assert.equal(await projectionHasLocation(), 1);
   pass('migration refuses a projection without the 034 delivery block, then applies once 034 is back');
 
-  // ── the privacy gate: no location write path while anon can read orders ──
-  // Gate codes and service-entrance notes must not land in a table the
-  // public dashboard key can read. Migration 020 removes that anon access.
-  await db.exec(rollback);
+  // -- the privacy gate, narrowed 2026-09-09: the LOCATION waits, the TIME does not --
+  // Gate codes and service-entrance notes must not land in a table the public
+  // dashboard key can read, and migration 020 removes that access. The delivery
+  // WINDOW is not in that class: names, street addresses, phones and delivery
+  // dates on this table are already exposed, so a time of day adds nothing, and
+  // withholding it would cost the owner the field feature entirely.
+  await identity(null, 'postgres');
   await db.exec('grant select on table public.orders to anon;');
-  await assert.rejects(db.exec(migration), /anon can still read public\.orders/);
-  await db.exec('rollback;');
+  await identity('owner');
+  const publicWindow = await setRequest(nyOrder, '4:30 PM');
+  assert.equal(publicWindow.window, '4:30 PM');
+  assert.equal(publicWindow.location, undefined);
+  pass('the delivery time still saves while the orders table is publicly readable');
+  await denied('the on-site location is refused while anon can read orders',
+    'select public.hc_set_delivery_request($1, $2, $3)',
+    [nyOrder, '4:30 PM', 'gate code 4412'], '42501', /cannot be saved until public read access/);
+  assert.equal((await row(nyOrder)).delivery_request.location, undefined);
+  assert.equal((await row(nyOrder)).venue, 'Fake Beach Club');
+  pass('a refused location writes nothing at all, and never touches the venue');
+  await identity(null, 'postgres');
   await db.exec('revoke select on table public.orders from anon;');
-  await db.exec(migration);
-  assert.equal(await functionCount(), 1);
-  assert.equal(await projectionHasLocation(), 1);
-  pass('migration refuses to add the location write path while anon can read orders, and applies once that is revoked');
+  await identity('owner');
+  const privateLocation = await setRequest(nyOrder, '4:30 PM', 'gate code 4412');
+  assert.equal(privateLocation.location, 'gate code 4412');
+  pass('the same location saves once public read access is removed');
+  // Hand the next scenario the state it expects: the manager's window and
+  // on-site location, exactly as it stood before this gate block ran.
+  await setRequest(nyOrder, '9 AM', 'kitchen door');
 
   // ── 035 and 038 patch different projection lines, so either can go live first ──
   // 035 (customer logos) is still local preparation while 038 may ship before it.
