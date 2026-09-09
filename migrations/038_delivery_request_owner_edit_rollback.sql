@@ -1,7 +1,8 @@
 -- ============================================================================
 -- 038_delivery_request_owner_edit_rollback.sql
 -- Undo the 038 code change: drop hc_set_delivery_request and take the
--- 'location' key back out of the non-owner order projection (the exact 034
+-- 'location', 'contact_name' and 'contact_phone' keys back out of the
+-- non-owner order projection (the exact 034
 -- shape). Rerunning it is harmless.
 --
 -- Data is deliberately left alone. Rows already carrying location,
@@ -17,7 +18,7 @@ begin;
 set local lock_timeout = '10s';
 set local statement_timeout = '120s';
 
-drop function if exists public.hc_set_delivery_request(uuid, text, text, date);
+drop function if exists public.hc_set_delivery_request(uuid, text, text, date, text, text);
 
 -- Reverse the 038 projection patch on whichever function carries the body
 -- (the public function, or the 028 backing implementation when the optional
@@ -37,7 +38,9 @@ declare
   v_config text[];
   v_anchor constant text := $anchor$'checked_at', o.delivery_request -> 'checked_at'$anchor$;
   v_addition constant text := $addition$,
-          'location', o.delivery_request -> 'location'$addition$;
+          'location', o.delivery_request -> 'location',
+          'contact_name', o.delivery_request -> 'contact_name',
+          'contact_phone', o.delivery_request -> 'contact_phone'$addition$;
 begin
   if v_public is null then
     -- No projection installed at all: nothing to restore.
@@ -114,7 +117,7 @@ $comment$;
 
 do $postflight$
 begin
-  if pg_catalog.to_regprocedure('public.hc_set_delivery_request(uuid,text,text,date)') is not null
+  if pg_catalog.to_regprocedure('public.hc_set_delivery_request(uuid,text,text,date,text,text)') is not null
      or exists (
        select 1
        from pg_catalog.pg_proc as p

@@ -1,18 +1,23 @@
 -- ============================================================================
 -- 038_delivery_request_owner_edit.sql
--- Owner-confirmed delivery time and on-site location (HC Field app Calendar).
+-- Owner-confirmed delivery time, on-site location and site contact
+-- (HC Field app Calendar, My Day and Ops Plan).
 --
 -- LOCAL PREPARATION ONLY until Sidd approves the production run.
 --
 -- What this adds:
---   * public.hc_set_delivery_request(order, window, location, date): the ONE
+--   * public.hc_set_delivery_request(order, window, location, date,
+--     contact name, contact phone): the ONE
 --     write path for orders.delivery_request. Owners anywhere, managers only
 --     inside their own market (the 036 access rule). Team, anon, and public
 --     are refused. It writes the 034 contract keys plus the optional
---     location, mirrors the location into orders.venue (the crew screens
---     already print venue), remembers the original venue in venue_before,
---     and restores it when the location is cleared.
---   * 'location' joins the delivery_request keys that non-owner phones may
+--     location and site contact, mirrors the location into orders.venue
+--     (the crew screens already print venue), remembers the original venue
+--     in venue_before, and restores it when the location is cleared. The
+--     contact is what a driver at the door actually needs: the app already
+--     has a Call button, it simply never had a number to call.
+--   * 'location', 'contact_name' and 'contact_phone' join the keys that
+--     non-owner phones may
 --     see through hc_list_orders_for_current_user. The live projection is
 --     patched in place exactly like 034 did, so a database that carries the
 --     028 owner-MFA wrapper keeps that wrapper untouched.
@@ -105,14 +110,19 @@ $preflight$;
 -- Confirms (or clears) the delivery window and on-site location for one order.
 --   p_window   the time or window as typed, trimmed, 1..80 characters
 --   p_location optional on-site instruction, trimmed, up to 200 characters
+--   p_contact_name  optional site contact, trimmed, up to 80 characters
+--   p_contact_phone optional site phone, trimmed, up to 40 characters
 --   p_date     optional; must equal the row's own delivery date
--- Both p_window and p_location null (or blank) clears the request.
+-- A blank window clears the whole request. A location or a contact
+-- without a window is refused: they describe a confirmed delivery.
 -- Returns the stored delivery_request, or null once cleared.
 create or replace function public.hc_set_delivery_request(
   p_order_id uuid,
   p_window text,
   p_location text default null,
-  p_date date default null
+  p_date date default null,
+  p_contact_name text default null,
+  p_contact_phone text default null
 )
 returns jsonb
 language plpgsql
@@ -130,6 +140,13 @@ declare
     pg_catalog.regexp_replace(coalesce(p_window, ''), '\s+', ' ', 'g')), '');
   v_location text := nullif(pg_catalog.btrim(
     pg_catalog.regexp_replace(coalesce(p_location, ''), '\s+', ' ', 'g')), '');
+  -- The person the crew calls from the doorstep. Kept as free text on
+  -- purpose: real contacts arrive as "Maria (venue coordinator)" and phones
+  -- as "+1 631 555 0134 x2", and inventing a format would reject them.
+  v_contact_name text := nullif(pg_catalog.btrim(
+    pg_catalog.regexp_replace(coalesce(p_contact_name, ''), '\s+', ' ', 'g')), '');
+  v_contact_phone text := nullif(pg_catalog.btrim(
+    pg_catalog.regexp_replace(coalesce(p_contact_phone, ''), '\s+', ' ', 'g')), '');
   v_row_date date;
   v_existing jsonb;
   v_material jsonb;
@@ -201,7 +218,8 @@ begin
       message = 'a cancelled order cannot take delivery details';
   end if;
 
-  if v_window ~ '[[:cntrl:]]' or v_location ~ '[[:cntrl:]]' then
+  if v_window ~ '[[:cntrl:]]' or v_location ~ '[[:cntrl:]]'
+     or v_contact_name ~ '[[:cntrl:]]' or v_contact_phone ~ '[[:cntrl:]]' then
     raise exception using
       errcode = '22023',
       message = 'delivery details must be plain text';
@@ -219,10 +237,26 @@ begin
       message = 'delivery location must be 200 characters or fewer';
   end if;
 
-  if v_window is null and v_location is not null then
+  if v_contact_name is not null and pg_catalog.length(v_contact_name) > 80 then
     raise exception using
       errcode = '22023',
-      message = 'a delivery window is required when setting a location';
+      message = 'contact name must be 80 characters or fewer';
+  end if;
+
+  if v_contact_phone is not null and pg_catalog.length(v_contact_phone) > 40 then
+    raise exception using
+      errcode = '22023',
+      message = 'contact phone must be 40 characters or fewer';
+  end if;
+
+  -- The window is the anchor of a confirmation. A location or a contact
+  -- without one would leave the crew details attached to nothing.
+  if v_window is null
+     and (v_location is not null or v_contact_name is not null
+          or v_contact_phone is not null) then
+    raise exception using
+      errcode = '22023',
+      message = 'a delivery window is required when setting a location or contact';
   end if;
 
   -- The row's own delivery date, the way the app buckets days: the UTC
@@ -279,6 +313,12 @@ begin
   );
   if v_location is not null then
     v_material := v_material || pg_catalog.jsonb_build_object('location', v_location);
+  end if;
+  if v_contact_name is not null then
+    v_material := v_material || pg_catalog.jsonb_build_object('contact_name', v_contact_name);
+  end if;
+  if v_contact_phone is not null then
+    v_material := v_material || pg_catalog.jsonb_build_object('contact_phone', v_contact_phone);
   end if;
 
   -- Replay safety: the same details again leave the request exactly as it is.
@@ -338,12 +378,12 @@ begin
 end
 $function$;
 
-revoke all on function public.hc_set_delivery_request(uuid, text, text, date)
+revoke all on function public.hc_set_delivery_request(uuid, text, text, date, text, text)
   from public, anon, authenticated;
-grant execute on function public.hc_set_delivery_request(uuid, text, text, date)
+grant execute on function public.hc_set_delivery_request(uuid, text, text, date, text, text)
   to authenticated;
 
-comment on function public.hc_set_delivery_request(uuid, text, text, date) is
+comment on function public.hc_set_delivery_request(uuid, text, text, date, text, text) is
   'Owner or same-market manager confirms a delivery window (1..80 chars) and optional on-site location (up to 200 chars) for one order. p_date must equal the row delivery date (UTC date of delivery_at_utc, else event_start_at); other dates are refused because dates change through the invoice. Both null clears the request and restores venue from venue_before. The location mirrors into venue while set. Replay-safe: identical details leave the row untouched. Never touches delivery_at_utc, delivery_notes, market, stage, or payment fields.';
 
 comment on column public.orders.delivery_request is
@@ -370,7 +410,9 @@ declare
   -- The last line 034 placed inside the delivery_request block.
   v_anchor constant text := $anchor$'checked_at', o.delivery_request -> 'checked_at'$anchor$;
   v_addition constant text := $addition$,
-          'location', o.delivery_request -> 'location'$addition$;
+          'location', o.delivery_request -> 'location',
+          'contact_name', o.delivery_request -> 'contact_name',
+          'contact_phone', o.delivery_request -> 'contact_phone'$addition$;
 begin
   v_public_before := pg_catalog.pg_get_functiondef(v_public);
   v_target := v_public;
@@ -444,7 +486,7 @@ $projection$;
 
 do $postflight$
 declare
-  v_signature constant text := 'public.hc_set_delivery_request(uuid,text,text,date)';
+  v_signature constant text := 'public.hc_set_delivery_request(uuid,text,text,date,text,text)';
   v_definition text;
   v_projection text;
 begin

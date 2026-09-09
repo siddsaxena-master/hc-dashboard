@@ -71,8 +71,8 @@ async function allRows() {
   await identity(caller.name, caller.role);
   return result;
 }
-const setRequest = (order, window, location = null, date = null) =>
-  scalar('select public.hc_set_delivery_request($1, $2, $3, $4::date) as value', [order, window, location, date]);
+const setRequest = (order, window, location = null, date = null, contactName = null, contactPhone = null) =>
+  scalar('select public.hc_set_delivery_request($1, $2, $3, $4::date, $5, $6) as value', [order, window, location, date, contactName, contactPhone]);
 const projection = async () =>
   (await db.query('select value from public.hc_list_orders_for_current_user() as t(value)')).rows.map(r => r.value);
 const projectionHasLocation = () => scalar(
@@ -107,11 +107,20 @@ try {
   const projectionAfter038 = await scalar(
     "select pg_get_functiondef('public.hc_list_orders_for_current_user(timestamptz,timestamptz,text[],integer,integer)'::regprocedure) as value");
   assert.equal(projectionAfter038.split("'location', o.delivery_request -> 'location'").length, 2);
-  assert.equal(projectionAfter038.replace(",\n          'location', o.delivery_request -> 'location'", ''), projectionAfter034);
+  // Rebuild the exact block 038 inserts, from its own key names, so this
+  // assertion cannot drift from the migration.
+  const addition = ['location', 'contact_name', 'contact_phone']
+    .map(key => "," + String.fromCharCode(10) + "          '" + key + "', o.delivery_request -> '" + key + "'")
+    .join('');
+  // Compare with line endings normalised: the base projection text carries
+  // CRLF from its own source file while this migration inserts LF, and the
+  // database treats both as ordinary whitespace.
+  const flat = text => text.split(String.fromCharCode(13)).join('');
+  assert.equal(flat(projectionAfter038).replace(flat(addition), ''), flat(projectionAfter034));
   pass('real migration applies, reruns without duplicating the projection key, and changes nothing else in the projection');
-  assert.equal(await scalar("select has_function_privilege('anon', 'public.hc_set_delivery_request(uuid,text,text,date)', 'execute') as value"), false);
-  assert.equal(await scalar("select has_function_privilege('authenticated', 'public.hc_set_delivery_request(uuid,text,text,date)', 'execute') as value"), true);
-  assert.equal(await scalar("select has_function_privilege('service_role', 'public.hc_set_delivery_request(uuid,text,text,date)', 'execute') as value"), false);
+  assert.equal(await scalar("select has_function_privilege('anon', 'public.hc_set_delivery_request(uuid,text,text,date,text,text)', 'execute') as value"), false);
+  assert.equal(await scalar("select has_function_privilege('authenticated', 'public.hc_set_delivery_request(uuid,text,text,date,text,text)', 'execute') as value"), true);
+  assert.equal(await scalar("select has_function_privilege('service_role', 'public.hc_set_delivery_request(uuid,text,text,date,text,text)', 'execute') as value"), false);
   pass('only authenticated sessions may call the function; anon and service_role are not granted');
   const before = await allRows();
 
@@ -168,6 +177,44 @@ try {
   assert.equal(request.venue_before, undefined);
   assert.equal((await row(nyOrder)).venue, 'Fake Beach Club');
   pass('removing the location while keeping the window restores venue and drops venue_before');
+
+  // ---- site contact: the person the driver calls from the door ----
+  request = await setRequest(nyOrder, '3:00 PM', 'loading dock', null,
+    '  Maria   (venue coordinator) ', ' +1 631 555 0134 x2 ');
+  assert.equal(request.contact_name, 'Maria (venue coordinator)');
+  assert.equal(request.contact_phone, '+1 631 555 0134 x2');
+  assert.equal(request.location, 'loading dock');
+  pass('owner sets a site contact: name and phone are trimmed and stored beside the window');
+  const withContact = await setRequest(nyOrder, '3:00 PM', 'loading dock', null,
+    'Maria (venue coordinator)', '+1 631 555 0134 x2');
+  assert.deepEqual(withContact, request);
+  pass('an identical call including the contact still writes nothing');
+  request = await setRequest(nyOrder, '3:00 PM', 'loading dock');
+  assert.equal(request.contact_name, undefined);
+  assert.equal(request.contact_phone, undefined);
+  pass('dropping the contact removes both keys and keeps the window and location');
+  await denied('a contact without a window is refused',
+    'select public.hc_set_delivery_request($1, null, null, null, $2, $3)',
+    [nyOrder, 'Maria', '631 555 0134'], '22023', /delivery window is required/);
+  await denied('an over-long contact name is refused',
+    'select public.hc_set_delivery_request($1, $2, null, null, $3, null)',
+    [nyOrder, '3:00 PM', 'x'.repeat(81)], '22023', /contact name must be 80/);
+  await denied('an over-long contact phone is refused',
+    'select public.hc_set_delivery_request($1, $2, null, null, null, $3)',
+    [nyOrder, '3:00 PM', '5'.repeat(41)], '22023', /contact phone must be 40/);
+  await denied('a control character in the contact is refused',
+    'select public.hc_set_delivery_request($1, $2, null, null, $3, null)',
+    [nyOrder, '3:00 PM', 'Maria' + String.fromCharCode(7)], '22023', /plain text/);
+  request = await setRequest(nyOrder, '3:00 PM', null, null, 'x'.repeat(80), '5'.repeat(40));
+  assert.equal(request.contact_name.length, 80);
+  assert.equal(request.contact_phone.length, 40);
+  pass('a contact exactly at both limits is accepted');
+  assert.equal(await setRequest(nyOrder, null), null);
+  assert.equal((await row(nyOrder)).delivery_request, null);
+  pass('clearing the request removes the contact with it');
+  // Hand the next scenario the state it expects: a window-only request,
+  // no location, so its repeat call is a true replay.
+  await setRequest(nyOrder, '2:00 PM');
 
   // ── worker stamp survives a replay and is cleared by a real edit ──────
   await identity(null, 'postgres');
@@ -338,7 +385,7 @@ try {
   let rows = await projection();
   let seen = rows.find(r => r.id === nyOrder);
   assert.ok(seen);
-  assert.deepEqual(Object.keys(seen.delivery_request).sort(), ['checked_at', 'date', 'location', 'source', 'status', 'window']);
+  assert.deepEqual(Object.keys(seen.delivery_request).sort(), ['checked_at', 'contact_name', 'contact_phone', 'date', 'location', 'source', 'status', 'window']);
   assert.equal(seen.delivery_request.location, 'kitchen door');
   assert.equal(seen.venue, 'kitchen door');
   assert.equal(seen.client_email, undefined);
@@ -349,7 +396,7 @@ try {
   seen = (await projection()).find(r => r.id === nyOrder);
   assert.equal(seen.delivery_request.location, 'kitchen door');
   assert.equal(seen.delivery_request.venue_before, undefined);
-  pass('team phones get the same six delivery_request keys');
+  pass('team phones get the same eight delivery_request keys');
   await identity('owner');
   seen = (await projection()).find(r => r.id === nyOrder);
   assert.equal(seen.delivery_request.venue_before, 'Fake Beach Club');
