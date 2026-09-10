@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import worker, { runWebhookIntakeScan } from './worker.js';
+import worker, {
+  runWebhookIntakeScan,
+  isOwnColdEmailNotification,
+} from './worker.js';
 
 const WORKER_URL = 'https://worker.example.test';
 const FORMSPREE_SECRET = 'formspree-test-signing-secret';
@@ -698,6 +701,116 @@ await check('Microsoft Graph accepts every valid clientState and allowlisted ide
       (receipt) => receipt.deliveryState === 'completed',
     ));
   } finally { harness.restore(); }
+});
+
+// Emma (the cold-email persona) CCs Sidd on every send, so copies of
+// our OWN outbound mail arrive on this webhook. Those must be dropped
+// before the classifier, the lead row, and the Telegram alert - Sidd
+// asked (2026-08-31) to stop being pinged about his own cold emails.
+// A real prospect email in the same batch must still flow end to end.
+await check('own cold-email CC copies are dropped; prospect mail still alerts', async () => {
+  const harness = installFetchHarness({
+    aiResponses: [JSON.stringify({
+      category: 'lead_inquiry',
+      from_email: 'buyer@prospectcompany.com',
+      from_name: 'Real Prospect',
+      subject: 'Coconuts for our summer event',
+      summary: 'New inquiry about coconuts',
+      should_alert: true,
+      extracted_lead: {
+        client_name: 'Real Prospect',
+        client_email: 'buyer@prospectcompany.com',
+        client_phone: null,
+        event_type: 'corporate',
+        event_date: null,
+        headcount: null,
+        venue: null,
+        market: 'ny',
+        notes: 'wants pricing',
+      },
+    })],
+  });
+  // Alerts fan out to ALLOWED_CHAT_IDS; the base env leaves it empty,
+  // so give this check two chats to prove the prospect alert enqueues.
+  const alertEnv = { ...baseEnv, ALLOWED_CHAT_IDS: '111,222' };
+  try {
+    const response = await worker.fetch(
+      request('/webhooks/ms-graph', JSON.stringify({
+        value: [
+          {
+            clientState: GRAPH_CLIENT_STATE,
+            subscriptionId: 'subscription-one',
+            tenantId: 'tenant-one',
+            resourceData: {
+              id: 'emma-own-outbound-copy',
+              subject: 'Quick question about your beach club',
+              from: { emailAddress: {
+                name: 'Emma Briggs',
+                address: 'Emma@FreshHamptonsCoconuts.com',
+              } },
+            },
+          },
+          {
+            clientState: GRAPH_CLIENT_STATE,
+            subscriptionId: 'subscription-one',
+            tenantId: 'tenant-one',
+            resourceData: {
+              id: 'real-prospect-inquiry',
+              subject: 'Coconuts for our summer event',
+              from: { emailAddress: {
+                name: 'Real Prospect',
+                address: 'buyer@prospectcompany.com',
+              } },
+            },
+          },
+        ],
+      })),
+      alertEnv,
+    );
+    assert.equal(response.status, 202);
+    assert.equal(harness.state.intake.size, 2);
+
+    const drained = await runWebhookIntakeScan(alertEnv);
+    assert.deepEqual(drained, { claimed: 2, completed: 2, released: 0 });
+    assert.ok([...harness.state.receipts.values()].every(
+      (receipt) => receipt.deliveryState === 'completed',
+    ));
+    // Only the prospect email ever reached the classifier.
+    assert.equal(harness.state.aiMessages.length, 1);
+    assert.ok(harness.state.aiMessages[0].includes('buyer@prospectcompany.com'));
+    assert.ok(!harness.state.aiMessages[0].toLowerCase()
+      .includes('freshhamptonscoconuts'));
+    // Only the prospect email produced a lead row and alert rows.
+    assert.equal(harness.state.orders.size, 1);
+    assert.equal(
+      [...harness.state.orders.values()][0].client_email,
+      'buyer@prospectcompany.com',
+    );
+    // One encrypted outbox row per chat, both for the prospect email
+    // (Emma's copy returned before the alert step, so it added none).
+    assert.equal(harness.state.pushQueue.size, 2);
+  } finally { harness.restore(); }
+});
+
+await check('own cold-email sender matching is exact-domain and case-insensitive', async () => {
+  const fromAddr = (address) => ({
+    resourceData: { from: { emailAddress: { address } } },
+  });
+  assert.equal(isOwnColdEmailNotification(
+    fromAddr('emma@freshhamptonscoconuts.com')), true);
+  assert.equal(isOwnColdEmailNotification(
+    fromAddr('EMMA@BRANDEDCOCO.COM')), true);
+  assert.equal(isOwnColdEmailNotification(
+    fromAddr('buyer@prospectcompany.com')), false);
+  // The operator's primary domain is DELIBERATELY not on the list:
+  // GoDaddy website form notifications arrive from it and every one
+  // is a real lead.
+  assert.equal(isOwnColdEmailNotification(
+    fromAddr('sidd@hamptonscoconuts.com')), false);
+  // Missing or empty sender never matches (real Graph subscription
+  // notifications may not carry a from field at all).
+  assert.equal(isOwnColdEmailNotification({ resourceData: { id: 'x' } }), false);
+  assert.equal(isOwnColdEmailNotification(fromAddr('')), false);
 });
 
 await check('completed provider receipts skip every downstream side effect on retry', async () => {

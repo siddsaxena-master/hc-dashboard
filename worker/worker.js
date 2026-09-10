@@ -2883,6 +2883,8 @@ async function handleQuoWebhook(request, env) {
 
 const MS_GRAPH_CLASSIFIER_PROMPT = `You receive an email payload fetched from Microsoft Graph (Outlook / Microsoft 365). The mailbox is operated by Hamptons Coconuts, a premium coconut catering business.
 
+IMPORTANT, THE SENDER IS OFTEN NOT THE CUSTOMER. This mailbox belongs to the operator (Sidd, at hamptonscoconuts.com). Many emails here are his own replies in a thread, or a message he forwarded to himself, so the From line is HIM. When that happens, the customer's name and email are in the QUOTED text further down: the "On <date>, <Name> <<email>> wrote:" line, an "Original Message" block, or a "From:" header inside the forwarded body. Read down into the quoted thread and take the customer's real name and address from there. Only fall back to null when the customer genuinely cannot be identified anywhere in the message. Never return the operator's own name or address as the customer.
+
 Classify the email. Respond with ONLY valid JSON:
 {
   "category": "lead_inquiry | customer_reply | vendor | noise",
@@ -2899,7 +2901,7 @@ Classify the email. Respond with ONLY valid JSON:
     "event_date": "YYYY-MM-DD or null",
     "headcount": number or null,
     "venue": "venue or null",
-    "market": "ny|miami|other",
+    "market": "ny|miami|vegas|other",
     "notes": "context"
   }
 }
@@ -3141,6 +3143,44 @@ async function appendLeadNote(env, row, text, receiptId) {
   }
 }
 
+// Sidd's OWN cold-email sending domains (the Instantly lookalike
+// mailboxes, the "Emma Briggs" persona). Emma CCs Sidd on every cold
+// email she sends, so a copy of each send lands in his inbox, the
+// poller forwards it here, and the classifier used to alert Sidd about
+// his own outbound mail (2026-08-31 request: stop those updates).
+// Replies from prospects come from the PROSPECT's domain, so they are
+// untouched by this list and still classify and alert normally.
+// This mirrors OWN_SENDING_DOMAINS in hc-invoice-bot/outlook_poller.py;
+// keep both lists in sync when a sending domain is added or retired.
+// NEVER add @hamptonscoconuts.com here: GoDaddy website form
+// notifications arrive FROM the owner's own address and each one is a
+// real lead (same warning as the poller's LEAD_SENDER_PATTERNS note).
+// VERIFIED 2026-09-10 against the cold-email engine's own account list
+// (hc-cold-email/scripts/reply_notifier.py, which reads them live from
+// Instantly and falls back to these eight). The first five were the only
+// ones here, and NONE of them matched real traffic: 186 of the 256
+// self-sent messages jammed in intake_messages came from the three added
+// below. A domain missing from this list is not a small miss, it is a card
+// to the owner for every cold email his own system sends.
+const OWN_COLD_EMAIL_DOMAINS = [
+  '@brandedcoco.com',
+  '@freshhamptonscoconuts.com',
+  '@gethamptonscoco.com',
+  '@gethamptonscoconuts.com',
+  '@hamptoncoconuts.com',
+  '@hamptonscoco.com',
+  '@hamptonscoconutsnyc.com',
+  '@hamptonscoconutsusa.com',
+];
+
+export function isOwnColdEmailNotification(notification) {
+  const address = String(
+    notification?.resourceData?.from?.emailAddress?.address || '',
+  ).trim().toLowerCase();
+  if (!address) return false;
+  return OWN_COLD_EMAIL_DOMAINS.some((domain) => address.endsWith(domain));
+}
+
 async function handleMsGraphWebhook(request, env, url) {
   // Microsoft Graph subscriptions send a validationToken on creation; echo it back.
   if (url.searchParams.has('validationToken')) {
@@ -3183,6 +3223,10 @@ async function processMsGraphNotification(env, eventKey, notification) {
     'ms_graph',
     eventKey,
     async (receiptId, renewLease) => {
+      // Emma's own cold-email CC copies stop here: no classifier call,
+      // no lead row, no Telegram alert. Returning early still marks
+      // the delivery completed, so the row is never retried.
+      if (isOwnColdEmailNotification(notification)) return;
       const cResp = await webhookFetch(CLAUDE_API, {
         method: 'POST',
         headers: {
