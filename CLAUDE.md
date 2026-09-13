@@ -379,9 +379,22 @@ Probed from the droplet with the app's exact parameter names.
   only; push_tokens rows untouched (3), 008 anon policy still present; 022 and
   028 absent. From now on 016, 017 and 022 must NEVER run as written (see the
   section above). 042 still 404.
-- SQL editor paste trap (seen on 041): a migration with `drop` or `revoke`
-  makes Supabase open a "Potential issue detected" dialog after Run, and the
-  Chrome extension can go blind (page-script calls time out) while it is up.
-  The database tells the truth: probe the new object from the droplet. If the
-  page is blind, send the Return key (the dialog's default is "Run query");
-  never click Run a second time without knowing the state.
+- 2026-09-13, after 041: MIGRATION 042 IS LIVE (Sidd's "yes do it, run 042"),
+  as committed in 9c58a08 (15,857 bytes, sha1 d4166b0c2174092fdc2cbdd1cabe13470182c792).
+  The file was fixed FIRST: Supabase default privileges grant execute on
+  every new public function to anon, authenticated and service_role
+  (`pg_default_acl` shows `service_role=X/postgres`), so any postflight that
+  demands "service_role cannot execute" needs an explicit
+  `revoke ... from service_role`. 040's hc_departure_action still carries the
+  default service_role execute (harmless, auth.uid() is null; tidy up in a
+  later migration). Verified from the droplet: table 200 `[]`, anon 401,
+  service RPC 403 permission denied.
+- SQL editor paste trap (seen on 041 and 042): a migration with `drop` or
+  `revoke` makes Supabase open a "Potential issue detected" dialog after Run,
+  and the Chrome extension's find/screenshot go blind (they wait for
+  document_idle, which never comes) while it is up. The database tells the
+  truth: probe the new object from the droplet before doing anything else.
+  javascript_tool usually still works: read
+  `document.querySelector('[role="alertdialog"]')` and click its "Run query"
+  button from a page script. The Return key is a coin flip (it ran 041 but
+  hit Cancel on 042). Never click Run a second time without knowing the state.
