@@ -222,7 +222,7 @@ check('duration helper enforces exact one-minute and 24-hour boundaries', () => 
 
 check('app matches current workers by stable ID and legacy names only when unique', () => {
   includesAll(app, [
-    'field_workers?select=id,email,name,hourly_rate_cents',
+    'field_workers?select=id,email,name,role,hourly_rate_cents',
     "const workerId = String((sh && sh.field_worker_id) || '').toLowerCase();",
     'if (workerId) {',
     'if (emailMatches.length === 1) return emailMatches[0];',
