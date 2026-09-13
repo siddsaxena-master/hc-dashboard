@@ -300,9 +300,29 @@ this feature; every message is an HC Field banner.
 - The crew's taps (on_my_way, left_garage, silence, unsilence,
   reset_departure) come through `hc_departure_action` (migration 040); the
   scan echoes each tap to owner + manager once.
+- Proposed times (migration 042): `runProposalScan` (5-minute chain, just
+  before the departure scan) reads a clock time out of every pending intake
+  email Jarvis linked to an order (`extractArrivalTimes` over the FULL
+  raw_text, PDF sections included). More than 15 minutes from the time on
+  file, or nothing parsable on file: one `order_time_proposals` row, older
+  pending proposals for that order retired as `newer_email`, one "Time
+  change?" banner to the owner (full body) and same-market managers (short
+  body), never crew. No readable time: one "Coordinator email" banner and the
+  intake row marked `linked_no_time notified <iso>` in error_detail. The
+  owner decides in the app through `hc_decide_proposed_time` (Accept goes
+  through 038 under the owner's login; Keep changes nothing; both dismiss
+  the intake row). `runStillWaitingScan` (hourly) nags the owner only:
+  hourly inside 24 h, every 4 h from 72 h, quiet 22:00 to 07:00 market
+  time, and retires a proposal the owner overtook by hand or whose order is
+  cancelled. While a proposal is pending the departure alarm uses the
+  EARLIER time (`alt_arrive_at`); an alt-only change keeps the nags already
+  sent. Before 042 is applied the scan logs "proposals table missing" and
+  does nothing. Telegram intake cards for linked rows only say to decide in
+  the app; there are no Accept/Keep buttons on Telegram, ever (Sidd's rule).
 - Tests: `node worker/test-departure-plan.mjs` (pure functions, shared
-  vectors in `worker/test-vectors/window-parse.json`) and
-  `node worker/test-departure-scan.mjs` (the scan against a fake network).
+  vectors in `worker/test-vectors/window-parse.json`),
+  `node worker/test-departure-scan.mjs` (the scan against a fake network) and
+  `node worker/test-proposal-scan.mjs` (proposals, still waiting, alt time).
 - Deploy order, each after Sidd's exact "yes do it": migration 040, then 041,
   then the droplet drainer swap (the deployed 26 KB copy cannot pass
   `payload.body` or collapse ids to Apple), then `npx wrangler deploy` from
