@@ -70,6 +70,68 @@ Telegram-fallback-only mode: alert rows skip straight to Telegram. Legacy
 rows carry plaintext fallback fields; provider-webhook rows carry one
 AES-GCM-encrypted destination and message. Live Activity rows just close.
 Restart after adding the APNs settings.
+
+CUSTOM KEYS (departure plan, 2026-09-13): a queue row's payload may carry
+an object under the key "body" (the worker's sendPushToMarket writes
+payload.body = { v, kind, order_id, day, market, ... }). The drainer sends
+it to Apple as a top-level key NEXT TO "aps", so the request body is
+{"aps": {...}, "body": {...}}. The key MUST be named "body": on iOS,
+expo-notifications hands request.content.userInfo["body"] to the app as
+notification.request.content.data (NotificationRecords.swift:331), which
+is what lets a tap deep-link by order_id and kind. "aps" always wins if a
+payload tries to override it. A payload with no "body" object sends
+exactly what it sent before: {"aps": {...}}. Nothing else in the payload
+(tokens, headers, telegram_text, fallback_chat_ids) ever reaches Apple.
+The header keys the worker writes, headers.collapse_id (apns-collapse-id)
+and headers.expiration (apns-expiration, epoch seconds), are forwarded
+as-is; la_start rows are always forced to expiration 0.
+
+A 413 PayloadTooLarge from Apple (the alert body is over 4 KB) is TERMINAL:
+the same bytes would fail on every retry and on every phone, so the row is
+closed at once with last_error "apns_payload_too_large", attempts bumped,
+no Telegram fallback, and one owner alert per cooldown. (push_queue's
+dead_lettered_at columns are reserved for webhook_telegram rows by the
+027 check constraint, so a push row is closed through done_at + last_error.)
+The worker's 3,800-byte enqueue guard should make this path unreachable.
+
+DEPLOYMENT (droplet swap, Sidd watching, from the laptop in Git Bash;
+the deployed copy on 2026-09-13 was the 26,084-byte 2026-08-04 original,
+sha1 cb11c963b3226d032cd16ee6e990dbc519081787). One step at a time:
+
+    # 0. compare: the laptop copy's fingerprint (print this before you go)
+    sha1sum hc-dashboard/droplet/pushdrain.py
+
+    # 1. keep a rollback copy of the running file on the droplet
+    ssh -i ~/.ssh/hc_deploy root@138.197.105.163 \\
+      'cp -p /opt/jarvis-invoice-bot/pushdrain.py /opt/jarvis-invoice-bot/pushdrain.py.bak-aug4-cb11c963'
+
+    # 2. copy the repo file up (lands as root, fixed in step 3)
+    scp -i ~/.ssh/hc_deploy hc-dashboard/droplet/pushdrain.py \\
+      root@138.197.105.163:/opt/jarvis-invoice-bot/pushdrain.py
+
+    # 3. owner, permissions, fingerprint, and a syntax check with the SAME
+    #    python the service uses; the sha1 must equal step 0's
+    ssh -i ~/.ssh/hc_deploy root@138.197.105.163 \\
+      'chown jarvis:jarvis /opt/jarvis-invoice-bot/pushdrain.py && \\
+       chmod 644 /opt/jarvis-invoice-bot/pushdrain.py && \\
+       sha1sum /opt/jarvis-invoice-bot/pushdrain.py && \\
+       sudo -u jarvis /opt/jarvis-invoice-bot/.venv/bin/python -m py_compile /opt/jarvis-invoice-bot/pushdrain.py'
+
+    # 4. restart the service (runs as user jarvis per pushdrain.service)
+    ssh -i ~/.ssh/hc_deploy root@138.197.105.163 'systemctl restart pushdrain'
+
+    # 5. read the journal (wait 30 s first so a heartbeat has happened)
+    ssh -i ~/.ssh/hc_deploy root@138.197.105.163 'journalctl -u pushdrain -n 30 --no-pager'
+
+Expected journal lines after step 5, in this order and nothing else:
+    ... [INFO] pushdrain: pushdrain starting: interval=20s apns=on queue=https://<project>.supabase.co/rest/v1/push_queue
+    ... [INFO] pushdrain: loop: depth=0 expired=0 claimed=0 delivered=0 fellback=0
+    (one loop: line every 20 seconds; depth may be a small number on a busy day)
+A WARNING about "APNs not fully configured" or a Traceback means stop:
+rollback = ssh in, cp -p the .bak-aug4-cb11c963 file back over pushdrain.py,
+systemctl restart pushdrain. Never `source .env` on the droplet (it prints
+secrets as shell errors); this file loads it with python-dotenv only.
+After a clean start, record the new sha1 in hc-dashboard/CLAUDE.md.
 """
 
 import base64
@@ -322,11 +384,27 @@ def _apns_jwt() -> str:
     return _JWT["jwt"]
 
 
-def _apns_send(device_token, headers_cfg, aps, request_id=None):
+def _apns_body(aps, extra=None) -> str:
+    """The JSON Apple receives: {"aps": ...} plus every key of `extra`
+    placed NEXT TO aps (the worker's payload.body object lands here as
+    the top-level "body" key, which the app reads as content.data).
+    "aps" always wins: an extra key spelled "aps" is ignored, never
+    merged. A missing or empty `extra` gives exactly the old
+    {"aps": ...} bytes."""
+    doc = {"aps": aps}
+    for key, value in (extra or {}).items():
+        if key == "aps":
+            continue
+        doc[str(key)] = value
+    return json.dumps(doc)
+
+
+def _apns_send(device_token, headers_cfg, aps, request_id=None, extra=None):
     """One push to one device via curl --http2 (the PROVEN road from
     this droplet; Workers fetch and plain HTTP/1.1 both fail against
-    Apple). Returns (http_status, reason). status 0 = local/transport
-    failure. Never raises."""
+    Apple). `extra` is an optional dict of custom top-level keys sent
+    beside "aps" (see _apns_body). Returns (http_status, reason).
+    status 0 = local/transport failure. Never raises."""
     try:
         jwt = _apns_jwt()
     except Exception as e:
@@ -359,7 +437,7 @@ def _apns_send(device_token, headers_cfg, aps, request_id=None):
             "-H", "apns-priority: " + str(headers_cfg.get("priority", 10)),
             "-H", "content-type: application/json",
         ] + stable_headers + [
-            "--data-binary", json.dumps({"aps": aps}),
+            "--data-binary", _apns_body(aps, extra),
             APNS_HOST + "/3/device/" + str(device_token),
         ]
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -1064,6 +1142,24 @@ def _process_webhook_outbox(row):
     return (0, False)
 
 
+def _close_payload_too_large(row, kind, token=None) -> bool:
+    """Apple answered 413: the alert body is over its 4 KB limit. The same
+    bytes would fail on every phone and on every retry, so the row is closed
+    for good (done_at + last_error, attempts bumped), no Telegram fallback
+    is attempted, and the owner hears about it once per cooldown. The
+    worker's own 3,800-byte guard should make this unreachable."""
+    ok = _persist_queue_patch(row, {
+        "done_at": _now_iso(),
+        "last_error": "apns_payload_too_large",
+        "attempts": int(row.get("attempts") or 0) + 1,
+    })
+    _alert_owner("apns_payload_too_large",
+                 "pushdrain: Apple refused a " + str(kind) + " banner as too large (413). "
+                 "Queue row " + str(row.get("id")) + " was closed unsent. The worker's "
+                 "3,800-byte guard should make this impossible; check the latest worker deploy.")
+    return ok
+
+
 def _process_row(row):
     """Returns (delivered_count, fell_back_bool) for the heartbeat."""
     global _LA_BLOCKED_UNTIL
@@ -1097,6 +1193,16 @@ def _process_row(row):
     if not isinstance(aps, dict):
         _finish(row, "bad payload (aps is not an object)")
         return (0, False)
+    # Custom keys for the app (departure plan): payload.body is an object
+    # like { v, kind, order_id, day, market } that Apple must receive NEXT TO
+    # aps as the top-level "body" key (see the CUSTOM KEYS docstring section).
+    # Missing = the old aps-only send. Present but not an object = a worker
+    # bug; close the row rather than send a banner the app cannot route.
+    raw_body = payload.get("body")
+    if raw_body is not None and not isinstance(raw_body, dict):
+        _finish(row, "bad payload (body is not an object)")
+        return (0, False)
+    apns_extra = {"body": raw_body} if raw_body else None
     delivered_before = _row_had_delivery(row)
 
     if kind == "la_end" and (len(tokens) != 1 or not _live_activity_end_identity(row, tokens[0] if tokens else None)):
@@ -1196,7 +1302,12 @@ def _process_row(row):
             if eligible is False:
                 _finish(row, "Live Activity START no longer eligible")
                 return (delivered, False)
-        status, reason = _apns_send(t, headers_cfg, aps, row.get("id"))
+        # Rows without custom keys take the exact call they always took, so
+        # every earlier test and every legacy row is byte for byte unchanged.
+        if apns_extra:
+            status, reason = _apns_send(t, headers_cfg, aps, row.get("id"), apns_extra)
+        else:
+            status, reason = _apns_send(t, headers_cfg, aps, row.get("id"))
         if status == 200:
             delivered += 1
             if kind == "la_start" and not _record_live_activity_start_result(
@@ -1210,6 +1321,11 @@ def _process_row(row):
                              "Supabase and pushdrain logs.")
             continue
         errors.append(str(status) + " " + reason)
+        if status == 413 or reason == "PayloadTooLarge":
+            # Terminal: the same bytes would fail on every phone and every
+            # retry, so stop the token loop here and close the row for good.
+            _close_payload_too_large(row, kind, t)
+            return (delivered, False)
         if status == 410 or reason in _DEAD_TOKEN_REASONS:
             if kind == "la_start":
                 terminal_reason = (str(status) + " " + str(reason or "dead token"))[:300]

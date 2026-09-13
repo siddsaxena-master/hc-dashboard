@@ -1217,5 +1217,120 @@ class PushdrainDeliveryTests(unittest.TestCase):
                 self.assertIn("retry-me", state)
 
 
+class PushdrainDeparturePlanTests(unittest.TestCase):
+    """The departure plan's needs of the drainer (2026-09-13): custom keys
+    beside "aps" so the app can route a tap, the worker's collapse id and
+    expiration forwarded, and a 413 closed for good instead of retried."""
+
+    def setUp(self):
+        self.old_configured = pd._APNS_CONFIGURED
+        self.old_blocked = pd._LA_BLOCKED_UNTIL
+        pd._APNS_CONFIGURED = True
+        pd._LA_BLOCKED_UNTIL = 0.0
+
+    def tearDown(self):
+        pd._APNS_CONFIGURED = self.old_configured
+        pd._LA_BLOCKED_UNTIL = self.old_blocked
+
+    def _curl_capture(self):
+        calls = []
+
+        def run(cmd, capture_output=True, text=True, timeout=30):
+            calls.append(cmd)
+            return Mock(returncode=0, stdout="\n200", stderr="")
+        return calls, run
+
+    @staticmethod
+    def _data(cmd):
+        return json.loads(cmd[cmd.index("--data-binary") + 1])
+
+    @staticmethod
+    def _headers(cmd):
+        return [cmd[i + 1] for i, part in enumerate(cmd) if part == "-H"]
+
+    def test_custom_body_keys_land_beside_aps(self):
+        calls, run = self._curl_capture()
+        headers = {"topic": "com.hamptonscoconuts.field", "push_type": "alert", "priority": 10}
+        aps = {"alert": {"title": "LEAVE NOW", "body": "go"}, "sound": "default"}
+        with patch.object(pd, "_apns_jwt", return_value="jwt"),              patch.object(pd.subprocess, "run", side_effect=run):
+            status, reason = pd._apns_send(TOKEN_A, headers, aps, "rid",
+                                           {"body": {"v": 1, "kind": "leave_now", "order_id": "o1"}})
+        self.assertEqual((status, reason), (200, ""))
+        sent = self._data(calls[0])
+        self.assertEqual(sent["aps"], aps)
+        self.assertEqual(sent["body"], {"v": 1, "kind": "leave_now", "order_id": "o1"})
+
+    def test_no_custom_keys_sends_exactly_aps(self):
+        calls, run = self._curl_capture()
+        aps = {"alert": {"title": "T", "body": "B"}}
+        with patch.object(pd, "_apns_jwt", return_value="jwt"),              patch.object(pd.subprocess, "run", side_effect=run):
+            pd._apns_send(TOKEN_A, {"topic": "t"}, aps, "rid")
+        self.assertEqual(self._data(calls[0]), {"aps": aps})
+
+    def test_extra_aps_key_never_overrides_aps(self):
+        calls, run = self._curl_capture()
+        aps = {"alert": {"title": "real"}}
+        with patch.object(pd, "_apns_jwt", return_value="jwt"),              patch.object(pd.subprocess, "run", side_effect=run):
+            pd._apns_send(TOKEN_A, {"topic": "t"}, aps, "rid", {"aps": {"alert": "fake"}, "body": {"k": 1}})
+        self.assertEqual(self._data(calls[0]), {"aps": aps, "body": {"k": 1}})
+
+    def test_collapse_id_and_expiration_are_forwarded(self):
+        calls, run = self._curl_capture()
+        headers = {"topic": "t", "push_type": "alert", "priority": 10,
+                   "collapse_id": "dep-567ba3a6", "expiration": 1757689200}
+        with patch.object(pd, "_apns_jwt", return_value="jwt"),              patch.object(pd.subprocess, "run", side_effect=run):
+            pd._apns_send(TOKEN_A, headers, {"alert": {"title": "T"}}, "rid")
+        sent = self._headers(calls[0])
+        self.assertIn("apns-collapse-id: dep-567ba3a6", sent)
+        self.assertIn("apns-expiration: 1757689200", sent)
+
+    def test_process_row_passes_body_only_when_present(self):
+        seen = []
+
+        def send(token, headers, aps, request_id=None, extra=None):
+            seen.append(extra)
+            return (200, "")
+        row = alert_row()
+        row["payload"]["body"] = {"v": 1, "kind": "late", "order_id": "o1"}
+        row["payload"]["tokens"] = [TOKEN_A]
+        with patch.object(pd, "_apns_send", side_effect=send),              patch.object(pd, "_sb_patch", return_value=True),              patch.object(pd, "_alert_owner"):
+            self.assertEqual(pd._process_row(row), (1, False))
+        self.assertEqual(seen, [{"body": {"v": 1, "kind": "late", "order_id": "o1"}}])
+
+        legacy_calls = []
+
+        def legacy_send(token, headers, aps, request_id=None):
+            legacy_calls.append(token)
+            return (200, "")
+        plain = alert_row()
+        plain["payload"]["tokens"] = [TOKEN_A]
+        with patch.object(pd, "_apns_send", side_effect=legacy_send),              patch.object(pd, "_sb_patch", return_value=True),              patch.object(pd, "_alert_owner"):
+            self.assertEqual(pd._process_row(plain), (1, False))
+        self.assertEqual(legacy_calls, [TOKEN_A])
+
+    def test_non_object_body_closes_the_row_before_any_send(self):
+        row = alert_row()
+        row["payload"]["body"] = "not an object"
+        with patch.object(pd, "_apns_send") as send,              patch.object(pd, "_sb_patch", return_value=True) as state,              patch.object(pd, "_alert_owner"):
+            self.assertEqual(pd._process_row(row), (0, False))
+        send.assert_not_called()
+        done = next(call.args[2] for call in state.call_args_list if "done_at" in call.args[2])
+        self.assertEqual(done["last_error"], "bad payload (body is not an object)")
+
+    def test_413_is_terminal_with_no_retry_and_no_telegram(self):
+        row = alert_row(attempts=2)
+        row["payload"]["tokens"] = [TOKEN_A, TOKEN_B]
+        with patch.object(pd, "_apns_send", return_value=(413, "PayloadTooLarge")) as send,              patch.object(pd, "_sb_patch", return_value=True) as state,              patch.object(pd, "_alert_owner") as alert,              patch.object(pd.requests, "post") as telegram:
+            result = pd._process_row(row)
+        self.assertEqual(result, (0, False))
+        self.assertEqual(send.call_count, 1, "the second phone is never tried with the same bytes")
+        done = next(call.args[2] for call in state.call_args_list if "done_at" in call.args[2])
+        self.assertEqual(done["last_error"], "apns_payload_too_large")
+        self.assertEqual(done["attempts"], 3)
+        telegram.assert_not_called()
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.args[0], "apns_payload_too_large")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
