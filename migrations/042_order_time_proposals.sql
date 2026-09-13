@@ -319,7 +319,7 @@ end
 $function$;
 
 revoke all on function public.hc_decide_proposed_time(uuid, bigint, text)
-  from public, anon, authenticated;
+  from public, anon, authenticated, service_role;
 grant execute on function public.hc_decide_proposed_time(uuid, bigint, text)
   to authenticated;
 
