@@ -229,6 +229,33 @@ index.html has the one-line pending-payment fix described above staged
 locally, awaiting Sidd's "yes do it" to push + deploy (remember the
 sw.js cache bump when it goes).
 
+## NEVER RUN 016, 017 OR 022 AFTER 041 (added 2026-09-13)
+
+Migration 041 lets crew phones (roster role team) keep ONE alert push token by
+replacing `hc_sync_notification_device` with the 015 text plus a team branch.
+Migrations 016, 017 and 022 each `create or replace` that same function with
+the owner/manager-only rule and NO error, which silently strands every crew
+phone again (proved by execution in `rehearsal/run-041-team-alert-push-pglite.mjs`,
+scenario "THE TRAP DEMONSTRATED"). Rules:
+
+- 015c before or after 041 is fine (015c never redefines this function).
+- 016, 017 and 022 need REWRITTEN files that keep the team branch before they
+  can ever run. 041's preflight refuses when 022's trigger function exists.
+- 028 (owner MFA) is fine AFTER 041 and must never run before a 041 re-run;
+  041's preflight refuses once 028 has renamed the function.
+- A migration that drops the 008 anon policies on push_tokens (the D-L item)
+  must stamp `notification_team_push_state.anon_push_policies_dropped_at` in
+  the same transaction, or 041 refuses to re-apply.
+- 041's rollback refuses once any crew token has been kept
+  (`ever_kept_team_token_at`); repair forward.
+- Rehearse: `node rehearsal/run-040-order-departures-pglite.mjs <pglite dir>`
+  (38 scenarios) and `node rehearsal/run-041-team-alert-push-pglite.mjs <pglite dir>`
+  (34 scenarios). Order in production: 040, then 041, each after Sidd's exact
+  "yes do it". The worker's recipient rule (owners always; same-market
+  managers; clocked-in team; every active team phone in the market when
+  nobody is clocked in; App Review and inactive rows never) is written as SQL
+  inside the 041 rehearsal and the worker query must match it.
+
 ## Departure plan, stage 0 truth checks (recorded 2026-09-13, read-only)
 
 Plan: `../DEPARTURE-PLAN-2026-09-12.md` (original + the app-only revision).
