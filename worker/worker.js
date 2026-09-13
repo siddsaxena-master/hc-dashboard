@@ -4506,6 +4506,742 @@ export async function deliveryConfirmationQueueId(orderId, checkedAt) {
   return uuidFromDigest(new Uint8Array(digest));
 }
 
+
+// ════════════════════════════════════════════════════════════════════
+// DEPARTURE PLAN, pure functions (2026-09-13). Nothing in this block
+// touches the network or the database. Every function here is exported
+// for worker/test-departure-plan.mjs. The scan that uses them
+// (runDeparturePlanScan) lives further down. Written after the Pridwin
+// wedding ran 2h45 late because nothing knew a clock time, a drive time,
+// or when to leave the garage. Spec: DEPARTURE-PLAN-2026-09-12.md.
+// ════════════════════════════════════════════════════════════════════
+
+// Which clock each market runs on. Unknown or blank markets are New York.
+export const MARKET_TZ = {
+  ny: 'America/New_York',
+  miami: 'America/New_York',
+  other: 'America/New_York',
+  vegas: 'America/Los_Angeles',
+};
+export function marketKey(market) {
+  const key = String(market || '').trim().toLowerCase();
+  return key || 'ny';
+}
+export function marketZone(market) {
+  return MARKET_TZ[marketKey(market)] || ET_ZONE;
+}
+// Short market word for titles: NY, Miami, Vegas.
+export function marketTag(market) {
+  const key = marketKey(market);
+  return key === 'ny' ? 'NY' : key === 'vegas' ? 'Vegas' : key === 'miami' ? 'Miami' : key.toUpperCase();
+}
+
+// Wall clock of an instant in a zone, as if it were UTC (for arithmetic).
+function wallClockUtcMs(ms, tz) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  }).formatToParts(new Date(ms));
+  const get = (type) => Number(parts.find((p) => p.type === type).value);
+  return Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'));
+}
+// 'YYYY-MM-DD' + a wall-clock hour and minute in tz -> ISO instant. Two
+// passes so a DST switch between the guess and the answer is absorbed;
+// a time inside the spring-forward gap returns the first pass.
+export function wallClockToUtc(day, hh, mm, tz) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || ''));
+  if (!m || !Number.isInteger(hh) || !Number.isInteger(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  const zone = tz || ET_ZONE;
+  const wanted = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), hh, mm);
+  let guess = wanted;
+  let first = null;
+  for (let pass = 0; pass < 2; pass++) {
+    const delta = wanted - wallClockUtcMs(guess, zone);
+    if (delta === 0) break;
+    guess += delta;
+    if (first === null) first = guess;
+  }
+  if (wallClockUtcMs(guess, zone) !== wanted && first !== null) guess = first;
+  return new Date(guess).toISOString();
+}
+// 'HH' (00..23) in Eastern time. etTimeStr prints '6:00 PM', so gates on
+// an hour must use this instead.
+export function etHour(iso) {
+  return marketHour(iso, 'ny');
+}
+export function marketHour(iso, market) {
+  return new Intl.DateTimeFormat('en-US', { timeZone: marketZone(market), hour: '2-digit', hourCycle: 'h23' })
+    .format(new Date(iso)).slice(0, 2);
+}
+// 'h:mm AM' in the market's zone (' PT' appended for Vegas, nothing for ET).
+export function marketTimeStr(iso, market) {
+  const text = new Date(iso).toLocaleTimeString('en-US', { timeZone: marketZone(market), hour: 'numeric', minute: '2-digit' });
+  return marketKey(market) === 'vegas' ? text + ' PT' : text;
+}
+// The same without a suffix and lowercase for the lock-screen card: '10:55a'.
+function cardTimeStr(ms, market) {
+  const text = new Date(ms).toLocaleTimeString('en-US', { timeZone: marketZone(market), hour: 'numeric', minute: '2-digit' });
+  return text.replace(/\s*AM$/i, 'a').replace(/\s*PM$/i, 'p');
+}
+const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+// 'YYYY-MM-DD' -> 'Sat Sep 12' by string arithmetic (no zone shifts).
+export function weekdayDayLabel(day) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(day || ''));
+  if (!m) return '';
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  return WEEKDAY_SHORT[d.getUTCDay()] + ' ' + formatDeliveryDay(day);
+}
+export function dayBefore(day) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(day || ''));
+  if (!m) return '';
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) - 1)).toISOString().slice(0, 10);
+}
+function weekdayOf(day) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(day || ''));
+  return m ? WEEKDAY_SHORT[new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay()] : '';
+}
+// 11100 s -> '3h 05m'; 900 s -> '15m'.
+export function hmsLabel(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0) / 60);
+  const mins = Math.round(total);
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h > 0 ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+// Minutes late -> '30 min' or '2h 47m'.
+function lateLabel(minutes) {
+  const mins = Math.max(0, Math.round(minutes));
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return m ? `${h}h ${String(m).padStart(2, '0')}m` : `${h}h`;
+}
+function collapseSpaces(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+// ── reading a clock time out of the window text ─────────────────────
+const MONTH_WORDS = 'jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december';
+// Removes dates, phone numbers and long digit runs so '9/12' can never be
+// read as nine and twelve o'clock. Returns the text plus whether a date
+// shape was removed (for the honest 'looks like a date' refusal).
+export function stripDateShapes(text) {
+  let out = ' ' + String(text || '') + ' ';
+  let dateStripped = false;
+  out = out.replace(/\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g, ' ');
+  out = out.replace(/\d{5,}/g, ' ');
+  // Slash dates (9/12, 09/12/2026) and dash dates WITH a year (9-12-2026)
+  // are dates. '8-9 am' is a time range and '3:30/4 pm' is a time range,
+  // so a number right after a ':' or a dash pair without a year is left
+  // alone for the clock tokenizer.
+  const dateShapes = [
+    /(?<![\d:])\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b(?![\d:])/g,
+    /(?<![\d:])\b\d{1,2}-\d{1,2}-\d{2,4}\b(?![\d:])/g,
+    /\b\d{4}-\d{2}-\d{2}\b/g,
+    new RegExp(`\\b(?:${MONTH_WORDS})\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?\\b`, 'g'),
+    new RegExp(`\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(?:of\\s+)?(?:${MONTH_WORDS})\\b`, 'g'),
+  ];
+  for (const shape of dateShapes) {
+    out = out.replace(shape, () => { dateStripped = true; return ' '; });
+  }
+  return { text: out, dateStripped };
+}
+const CLOCK_12 = /\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)?\b/g;
+const CLOCK_24 = /\b(1[3-9]|2[0-3]):([0-5]\d)\b/g;
+// All clock tokens in already-normalized, already-stripped text, in order.
+function clockTokens(text) {
+  const tokens = [];
+  for (const m of text.matchAll(CLOCK_12)) {
+    tokens.push({ start: m.index, end: m.index + m[0].length, hh: Number(m[1]), mm: Number(m[2] || 0), meridian: m[3] || null, is24: false });
+  }
+  for (const m of text.matchAll(CLOCK_24)) {
+    tokens.push({ start: m.index, end: m.index + m[0].length, hh: Number(m[1]), mm: Number(m[2]), meridian: null, is24: true });
+  }
+  tokens.sort((a, b) => a.start - b.start);
+  // A token with no am/pm borrows the am/pm of the NEXT token when only a
+  // range separator sits between them: '3:30/4 pm' means both are pm.
+  for (let i = 0; i + 1 < tokens.length; i++) {
+    const cur = tokens[i], next = tokens[i + 1];
+    if (cur.meridian || cur.is24 || !next.meridian) continue;
+    const between = text.slice(cur.end, next.start);
+    if (between.length <= 12 && /^[\s\/\-,&]*(?:to|and|or)?[\s\/\-,&]*$/.test(between)) cur.meridian = next.meridian;
+  }
+  return tokens;
+}
+function normalizeWindowText(text) {
+  return collapseSpaces(String(text || '').toLowerCase())
+    .replace(/\b([ap])\.m\.?/g, '$1m')
+    .replace(/\b([ap])m\./g, '$1m')
+    .replace(/\bnoon\b/g, '12:00 pm');
+}
+function to24(token) {
+  if (token.is24) return { hh: token.hh, mm: token.mm, assumed: false };
+  let hh = token.hh;
+  let assumed = false;
+  let meridian = token.meridian;
+  if (!meridian) {
+    assumed = true;
+    meridian = (hh >= 7 && hh <= 11) ? 'am' : 'pm';
+  }
+  if (meridian === 'am' && hh === 12) hh = 0;
+  if (meridian === 'pm' && hh !== 12) hh += 12;
+  return { hh, mm: token.mm, assumed };
+}
+export function clockLabel(hh, mm) {
+  const h12 = hh % 12 === 0 ? 12 : hh % 12;
+  return `${h12}:${String(mm).padStart(2, '0')} ${hh < 12 ? 'AM' : 'PM'}`;
+}
+// The one parser for "when must the coconuts be there". kind: exact |
+// range (earliest end wins) | deadline ("by 2 PM") | assumed (no AM/PM
+// given, never drives alerts) | none.
+export function parseArrivalTime(windowText, day, tz) {
+  const normalized = normalizeWindowText(windowText);
+  if (!normalized) return { ok: false, kind: 'none', reason: 'no clock time' };
+  if (/\bmidnight\b/.test(normalized)) return { ok: false, kind: 'none', reason: 'midnight' };
+  const stripped = stripDateShapes(normalized);
+  const tokens = clockTokens(stripped.text);
+  if (!tokens.length) {
+    return { ok: false, kind: 'none', reason: stripped.dateStripped ? 'looks like a date' : 'no clock time' };
+  }
+  const converted = tokens.map((t) => ({ ...t, ...to24(t) }));
+  const chosen = converted.reduce((best, t) => (t.hh * 60 + t.mm < best.hh * 60 + best.mm ? t : best));
+  let kind = 'exact';
+  if (converted.some((t) => t.assumed)) kind = 'assumed';
+  else if (converted.length >= 2) kind = 'range';
+  else if (/(?:\bby|\bbefore|\bno later than|\buntil)\s*$/.test(stripped.text.slice(Math.max(0, chosen.start - 14), chosen.start))) kind = 'deadline';
+  const arriveAtUtc = wallClockToUtc(day, chosen.hh, chosen.mm, tz || ET_ZONE);
+  return { ok: true, kind, hh: chosen.hh, mm: chosen.mm, arriveAtUtc, label: clockLabel(chosen.hh, chosen.mm) };
+}
+// true when two clock times differ by more than 15 minutes.
+export function windowsConflict(a, b) {
+  if (!a || !b || !Number.isInteger(a.hh) || !Number.isInteger(b.hh)) return false;
+  return Math.abs((a.hh * 60 + (a.mm || 0)) - (b.hh * 60 + (b.mm || 0))) > 15;
+}
+
+// ── where the drive ends ─────────────────────────────────────────────
+const TOWN_HINTS = ['shelter island', 'montauk', 'southampton', 'east hampton', 'sag harbor', 'bridgehampton',
+  'water mill', 'amagansett', 'westhampton', 'sagaponack', 'las vegas', 'henderson', 'miami', 'miami beach'];
+// Same address precedence as the app (lib/order-delivery-details.js):
+// the invoice's shipping address when it was read completely, else the
+// delivery notes, else the venue. Only a string that names a state, a
+// zip or a known town is handed to a router; '45 Ocean Ave' never is.
+export function departureDestination(order) {
+  const o = order || {};
+  const inv = o.invoice_fulfillment && typeof o.invoice_fulfillment === 'object' ? o.invoice_fulfillment : null;
+  const candidates = [
+    [inv && inv.read_status === 'complete' ? inv.address : '', 'invoice'],
+    [o.delivery_notes, 'delivery_notes'],
+    [o.venue, 'venue'],
+  ];
+  for (const [raw, source] of candidates) {
+    const address = collapseSpaces(raw).slice(0, 400);
+    if (!address) continue;
+    const lower = address.toLowerCase();
+    const usable = address.includes(',') && (
+      /\b(NY|NJ|CT|PA|FL|NV|CA)\b/i.test(address) || /\b\d{5}\b/.test(address) || TOWN_HINTS.some((t) => lower.includes(t)));
+    return { address, source, usable, reason: usable ? null : 'address incomplete' };
+  }
+  return { address: null, source: null, usable: false, reason: 'no address' };
+}
+
+// ── where the drive starts ───────────────────────────────────────────
+// The boxes live at the NJ garage, so every NY job starts there whoever
+// is clocked in. Other markets start where the crew clocked in.
+export const MARKET_BASES = { ny: { lat: GARAGE_LAT, lng: GARAGE_LNG, label: 'NJ garage' } };
+const finite = (v) => typeof v === 'number' && Number.isFinite(v);
+function firstName(name) {
+  return collapseSpaces(name).split(' ')[0] || 'the crew';
+}
+export function originFor({ market, openShifts, lastShift }) {
+  const key = marketKey(market);
+  const base = MARKET_BASES[key];
+  if (base) return { kind: 'garage', lat: base.lat, lng: base.lng, label: base.label, shiftId: null };
+  const open = (openShifts || [])
+    .filter((s) => s && !isAppReviewShift(s) && marketKey(s.market) === key && finite(s.clock_in_lat) && finite(s.clock_in_lng))
+    .sort((a, b) => String(a.clock_in_at).localeCompare(String(b.clock_in_at)));
+  if (open.length) {
+    const s = open[0];
+    return { kind: 'clock_in', lat: s.clock_in_lat, lng: s.clock_in_lng, label: `where ${firstName(s.worker_name)} clocked in`, shiftId: s.id };
+  }
+  if (lastShift && finite(lastShift.clock_in_lat) && finite(lastShift.clock_in_lng)) {
+    return { kind: 'last_clock_in', lat: lastShift.clock_in_lat, lng: lastShift.clock_in_lng, label: `last clock-in spot in ${marketTag(key)}`, shiftId: lastShift.id || null };
+  }
+  return { kind: 'none', lat: null, lng: null, label: null, shiftId: null };
+}
+
+// ── the arithmetic ───────────────────────────────────────────────────
+export const DEPARTURE_BUFFER_SECONDS = 3600;   // always
+export const FERRY_QUEUE_SECONDS = 1800;        // added when the route has a ferry
+export const ROUTE_CALLS_PER_TICK_MAX = 5;      // cost control per 5-minute tick
+export const DEPART_RADIUS_M = 400;             // this far from the garage after a pickup = departed
+export const NO_PICKUP_RADIUS_M = 2000;         // this far from the clock-in spot with no pickup = moving, no boxes
+export const ARRIVED_RADIUS_M = 300;            // this close to the venue = on site
+// leave-by = arrival minus drive minus buffer minus the ferry allowance,
+// floored to the whole minute. Null when any input is not a number.
+export function leaveByMs({ arriveAtMs, driveSeconds, hasFerry, bufferSeconds = DEPARTURE_BUFFER_SECONDS, ferrySeconds = FERRY_QUEUE_SECONDS }) {
+  if (!finite(arriveAtMs) || !finite(driveSeconds) || driveSeconds < 0 || !finite(bufferSeconds) || !finite(ferrySeconds)) return null;
+  const ms = arriveAtMs - driveSeconds * 1000 - bufferSeconds * 1000 - (hasFerry ? ferrySeconds * 1000 : 0);
+  return Math.floor(ms / 60000) * 60000;
+}
+// Whether this tick should ask the router again. Hourly from 30 hours
+// out, every 15 minutes inside 3 hours to leave-by, every 5 minutes
+// inside the last hour, every 15 (or 5 near arrival) once departed.
+export function refreshDue({ nowMs, arriveAtMs, leaveByMs: leaveMs, computedAtMs, state, movement, inputsChanged, routeFailures }) {
+  if (state === 'arrived' || state === 'closed') return false;
+  if (!finite(arriveAtMs)) return false;
+  if (nowMs > arriveAtMs + 60 * 60000) return false;
+  if (inputsChanged) return true;
+  const hoursToArrive = (arriveAtMs - nowMs) / 3600000;
+  if (hoursToArrive > 30) return false;
+  if (!finite(computedAtMs)) return true;
+  const sinceMin = (nowMs - computedAtMs) / 60000;
+  if (routeFailures > 0) return sinceMin >= (routeFailures <= 6 ? 15 : 60);
+  if (movement === 'departed') return sinceMin >= ((arriveAtMs - nowMs) <= 60 * 60000 ? 5 : 15);
+  const minutesToLeave = finite(leaveMs) ? (leaveMs - nowMs) / 60000 : hoursToArrive * 60;
+  if (minutesToLeave > 180) return sinceMin >= 60;
+  if (minutesToLeave > 60) return sinceMin >= 15;
+  return sinceMin >= 5;
+}
+// Sanity on a router answer before it is trusted: not in another state,
+// not shorter than the straight line, not an absurd duration.
+export function routeSanity({ meters, driveSeconds, endLat, endLng, originLat, originLng, marketCenter }) {
+  if (!finite(endLat) || !finite(endLng)) return { ok: false, reason: 'no_end_point' };
+  const center = marketCenter && finite(marketCenter.lat) ? marketCenter : { lat: originLat, lng: originLng };
+  if (finite(center.lat) && distMeters(endLat, endLng, center.lat, center.lng) > 250000) return { ok: false, reason: 'too_far' };
+  if (finite(originLat) && finite(originLng) && finite(meters) && meters < distMeters(originLat, originLng, endLat, endLng) * 0.9) return { ok: false, reason: 'shorter_than_straight_line' };
+  if (!finite(driveSeconds) || driveSeconds > 36000 || (driveSeconds < 60 && finite(meters) && meters > 5000)) return { ok: false, reason: 'implausible_duration' };
+  return { ok: true, reason: null };
+}
+
+// ── what the crew are doing ──────────────────────────────────────────
+// A garage pickup is "seen" when any point in the last six hours was
+// within 400 m of the garage, or two points at least five minutes apart
+// were both within 600 m (a drive-through at the fence edge).
+export function pickupSeenByGps(recentPoints, base) {
+  const pts = (recentPoints || []).filter((p) => p && finite(p.lat) && finite(p.lng));
+  const near = pts.filter((p) => distMeters(p.lat, p.lng, base.lat, base.lng) <= 600)
+    .map((p) => ({ ...p, ms: new Date(p.at).getTime(), d: distMeters(p.lat, p.lng, base.lat, base.lng) }));
+  if (near.some((p) => p.d <= 400)) return true;
+  for (let i = 0; i < near.length; i++) {
+    for (let j = i + 1; j < near.length; j++) {
+      if (Math.abs(near[i].ms - near[j].ms) >= 5 * 60000) return true;
+    }
+  }
+  return false;
+}
+export function movementState({ marketHasGarage, origin, dest, clockInPoint, newestPoint, recentPoints, nowMs, pickupSeenAt, pickupSource, hasOpenShift }) {
+  if (hasOpenShift === false || (!clockInPoint && !newestPoint)) return 'nobody';
+  const fresh = newestPoint && finite(newestPoint.lat) && finite(newestPoint.lng)
+    && finite(new Date(newestPoint.at).getTime()) && (nowMs - new Date(newestPoint.at).getTime()) <= STOP_ALERT_MIN * 60000;
+  if (!fresh) return 'unknown';
+  const d = (a, b) => distMeters(a.lat, a.lng, b.lat, b.lng);
+  if (dest && finite(dest.lat) && d(newestPoint, dest) <= ARRIVED_RADIUS_M) return 'arrived';
+  if (marketHasGarage) {
+    const garage = { lat: GARAGE_LAT, lng: GARAGE_LNG };
+    const claimed = pickupSource === 'claim';
+    const pickupSeen = !!pickupSeenAt || claimed || pickupSeenByGps(recentPoints, garage);
+    const fromGarage = d(newestPoint, garage);
+    if (fromGarage <= GARAGE_RADIUS_M) return 'at_origin';
+    if (pickupSeen && fromGarage > DEPART_RADIUS_M) return 'departed';
+    if (claimed && clockInPoint && d(newestPoint, clockInPoint) > NO_PICKUP_RADIUS_M) return 'departed';
+    if (!pickupSeen && clockInPoint && finite(clockInPoint.lat) && d(newestPoint, clockInPoint) > NO_PICKUP_RADIUS_M) return 'moving_no_pickup';
+    return 'at_origin';
+  }
+  if (!origin || !finite(origin.lat)) return 'unknown';
+  if (d(newestPoint, origin) <= 500 && dest && finite(dest.lat) && d(origin, dest) <= 500) return 'arrived';
+  if (d(newestPoint, origin) > 800) return 'departed';
+  return 'at_origin';
+}
+
+// ── which banner, if any, this tick ──────────────────────────────────
+const LATE_THRESHOLDS = [180, 120, 60, 30, 10];
+// Returns null when nothing is due. Otherwise { stage, index, send,
+// alsoStamp }: send is false when the job is silenced (the scan still
+// stamps so un-silencing never replays old nags); alsoStamp lists the
+// lower late thresholds to stamp silently. Stamps live in
+// order_departures.alerts as { stage: { at, queue_id } }.
+export function alertStage({ nowMs, leaveByMs: leaveMs, arriveAtMs, movement, etaMs, alerts, silenced, claimed }) {
+  const a = alerts && typeof alerts === 'object' ? alerts : {};
+  if (movement === 'arrived') return null;
+  const missedDue = finite(arriveAtMs) && nowMs >= arriveAtMs + 15 * 60000 && !a.missed;
+  const runningLate = () => {
+    if (!finite(etaMs) || !finite(arriveAtMs) || etaMs <= arriveAtMs + 15 * 60000) return null;
+    const stamp = a.running_late;
+    const stampAt = stamp && stamp.at ? new Date(stamp.at).getTime() : null;
+    if (stamp && finite(stampAt) && (nowMs - stampAt < 30 * 60000 || Math.abs(etaMs - Number(stamp.eta)) < 10 * 60000)) return null;
+    return { stage: 'running_late', index: Math.floor(nowMs / 60000), send: true, alsoStamp: [] };
+  };
+  if (movement === 'departed') {
+    const late = runningLate();
+    if (late) return late;
+    return missedDue ? { stage: 'missed', index: 0, send: true, alsoStamp: [], claim: !!claimed } : null;
+  }
+  if (claimed) {
+    // The boxes left the garage on the crew's word: no more nags, only
+    // the two safety signals.
+    const late = runningLate();
+    if (late) return late;
+    return missedDue ? { stage: 'missed', index: 0, send: true, alsoStamp: [], claim: true } : null;
+  }
+  if (movement === 'moving_no_pickup' && !a.moving_no_pickup) {
+    return { stage: 'moving_no_pickup', index: 0, send: !silenced, alsoStamp: [] };
+  }
+  if (missedDue) return { stage: 'missed', index: 0, send: true, alsoStamp: [] };
+  // Once the arrival time is a quarter hour gone the late ladder is
+  // over: "leaving now arrives at" means nothing any more, and ARRIVAL
+  // MISSED has already said it once.
+  if (finite(arriveAtMs) && nowMs >= arriveAtMs + 15 * 60000) return null;
+  if (!finite(leaveMs)) return null;
+  const m = (leaveMs - nowMs) / 60000;
+  const lateMin = -m;
+  for (const t of LATE_THRESHOLDS) {
+    if (lateMin >= t && !a['late_' + t]) {
+      const alsoStamp = LATE_THRESHOLDS.filter((lower) => lower < t && !a['late_' + lower]);
+      if (!a.leave_now) alsoStamp.push('leave_now');
+      if (!a.heads_up) alsoStamp.push('heads_up');
+      return { stage: 'late', index: t, send: !silenced, alsoStamp };
+    }
+  }
+  // Inside the last five minutes counts as "now": one tick wide, so a
+  // heads-up that never went out is skipped rather than fired late.
+  if (m <= 5 && !a.leave_now) return { stage: 'leave_now', index: 0, send: !silenced, alsoStamp: a.heads_up ? [] : ['heads_up'] };
+  if (m > 5 && m <= 60 && !a.heads_up) return { stage: 'heads_up', index: 0, send: !silenced, alsoStamp: [] };
+  return null;
+}
+// Stable queue id per order, arrival target, stage and index. A changed
+// arrival (Accept, owner edit) gives new ids so the stages fire again; a
+// retried tick re-inserts the same id, which enqueuePush ignores.
+export async function departureQueueId(orderId, arriveAtIso, stage, index) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(
+    'hc-departure-v1\0' + String(orderId) + '\0' + String(arriveAtIso) + '\0' + String(stage) + '\0' + String(index || 0)));
+  return uuidFromDigest(new Uint8Array(digest));
+}
+
+// ── the lock-screen card words (20 characters at most) ───────────────
+function venueTag(venue) {
+  const word = collapseSpaces(venue).split(' ')[0] || '';
+  return word.slice(0, 8);
+}
+export function cardStatus({ plan, nowMs, movement, etaMs, market }) {
+  const p = plan || {};
+  const tag = venueTag(p.venue || p.dest_address);
+  const withTag = (text) => (tag ? `${text} · ${tag}` : text).slice(0, 20);
+  const leaveMs = p.leave_by_at ? new Date(p.leave_by_at).getTime() : null;
+  const arriveMs = p.arrive_at ? new Date(p.arrive_at).getTime() : null;
+  if (movement === 'arrived') return withTag('On site');
+  if (movement === 'moving_no_pickup') return withTag('No pickup');
+  if (movement === 'departed') {
+    if (finite(etaMs) && finite(arriveMs) && etaMs > arriveMs) return withTag(`ETA ${cardTimeStr(etaMs, market)}`);
+    return 'Enroute';
+  }
+  if (!finite(leaveMs)) return '';
+  const lateMin = (nowMs - leaveMs) / 60000;
+  if (lateMin < 0) return `Leave by ${cardTimeStr(leaveMs, market)}`.slice(0, 20);
+  if (lateMin < 10) return withTag('LEAVE NOW');
+  const mins = Math.floor(lateMin);
+  const late = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, '0')}m`;
+  return withTag(`Late ${late}`);
+}
+
+// ── reading arrival times out of a coordinator's email or PDF ────────
+const TIME_KEYWORDS = ['coconut', 'coconuts', 'hamptons', 'vendor arrival', 'vendors arrive', 'vendor load', 'vendor set',
+  'deliver', 'delivery', 'drop off', 'drop-off', 'dropoff', 'arrival', 'arrive', 'arrives', 'load in', 'load-in', 'set up', 'setup'];
+const TIME_EXCLUDES = ['ceremony', 'cocktail hour', 'first dance', 'reception begins', 'toasts', 'cake cutting'];
+// Explicit clock tokens only (an am/pm on the token or borrowed across a
+// range separator, or 24-hour); a bare '2' is never a time here.
+function explicitClockTokens(text) {
+  const stripped = stripDateShapes(normalizeWindowText(text)).text;
+  return clockTokens(stripped).filter((t) => t.meridian || t.is24).map((t) => ({ ...t, ...to24(t) }));
+}
+function rankOf(line) {
+  const l = line.toLowerCase();
+  if (l.includes('coconut') || l.includes('hamptons')) return 0;
+  if (l.includes('vendor')) return 1;
+  return 2;
+}
+export function extractArrivalTimes(rawText) {
+  const lines = String(rawText || '').slice(0, 100000).split(/\r?\n/);
+  const entries = [];
+  let where = 'body';
+  for (const raw of lines) {
+    const head = /^=== ATTACHMENT: (.+?) \(/.exec(raw);
+    if (head) { where = 'attachment:' + head[1]; continue; }
+    entries.push({ text: raw, where });
+  }
+  // Column-major tables: N lines that are only a time, then N lines of
+  // descriptions. Pair them up before the keyword rule runs.
+  const isTimeOnly = (t) => /^\s*(?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s*(?:am|pm|a\.m\.|p\.m\.)\s*$/i.test(t) || /^\s*(?:1[3-9]|2[0-3]):[0-5]\d\s*$/.test(t);
+  const merged = [];
+  for (let i = 0; i < entries.length; i++) {
+    let n = 0;
+    while (i + n < entries.length && isTimeOnly(entries[i + n].text)) n++;
+    if (n >= 2) {
+      const descs = [];
+      let j = i + n;
+      while (j < entries.length && descs.length < n) {
+        if (entries[j].text.trim()) descs.push(entries[j]);
+        j++;
+      }
+      if (descs.length === n && descs.every((d) => !explicitClockTokens(d.text).length)) {
+        for (let k = 0; k < n; k++) merged.push({ text: entries[i + k].text.trim() + ' ' + descs[k].text.trim(), where: entries[i + k].where });
+        i = j - 1;
+        continue;
+      }
+    }
+    merged.push(entries[i]);
+  }
+  const found = [];
+  let previous = '';
+  for (const entry of merged) {
+    const line = collapseSpaces(entry.text);
+    if (!line) continue;
+    const tokens = explicitClockTokens(line);
+    const lower = line.toLowerCase();
+    if (tokens.length) {
+      const context = lower + ' ' + previous.toLowerCase();
+      const keyword = TIME_KEYWORDS.some((k) => context.includes(k));
+      const own = lower.includes('coconut') || lower.includes('hamptons');
+      const excluded = !own && TIME_EXCLUDES.some((k) => lower.includes(k));
+      if (keyword && !excluded) {
+        const earliest = tokens.reduce((best, t) => (t.hh * 60 + t.mm < best.hh * 60 + best.mm ? t : best));
+        found.push({ hh: earliest.hh, mm: earliest.mm, label: clockLabel(earliest.hh, earliest.mm), line: line.slice(0, 90), where: entry.where, rank: rankOf(line) });
+      }
+    }
+    previous = line;
+  }
+  found.sort((a, b) => a.rank - b.rank || (a.hh * 60 + a.mm) - (b.hh * 60 + b.mm));
+  const seen = new Set();
+  const out = [];
+  for (const f of found) {
+    const key = `${f.hh}:${f.mm}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ hh: f.hh, mm: f.mm, label: f.label, line: f.line, where: f.where });
+    if (out.length === 3) break;
+  }
+  return out;
+}
+
+// ── keeping a push body under Apple's limit ──────────────────────────
+// Cuts at line breaks only, so a multi-byte character is never split,
+// and says how many bullet lines were dropped.
+export function pushBodyByteCap(text, maxBytes) {
+  const encoder = new TextEncoder();
+  const bytes = (s) => encoder.encode(s).length;
+  const body = String(text || '');
+  if (bytes(body) <= maxBytes) return body;
+  const lines = body.split('\n');
+  const overflowFor = (n) => `… plus ${n} more in Calendar.`;
+  const kept = [];
+  for (let i = 0; i < lines.length; i++) {
+    const dropped = lines.slice(i).filter((l) => l.startsWith('•')).length;
+    const candidate = [...kept, lines[i]].join('\n') + '\n' + overflowFor(dropped);
+    if (bytes(candidate) > maxBytes) break;
+    kept.push(lines[i]);
+  }
+  if (!kept.length) {
+    // Even the first line is too long: cut it at a character boundary.
+    const chars = Array.from(lines[0]);
+    const suffix = '\n' + overflowFor(lines.filter((l) => l.startsWith('•')).length);
+    let take = chars.length;
+    while (take > 0 && bytes(chars.slice(0, take).join('') + suffix) > maxBytes) take--;
+    return chars.slice(0, take).join('') + suffix;
+  }
+  const droppedBullets = lines.slice(kept.length).filter((l) => l.startsWith('•')).length;
+  return kept.join('\n') + '\n' + overflowFor(droppedBullets);
+}
+
+// ── the banner words ─────────────────────────────────────────────────
+function surname(name) {
+  const parts = collapseSpaces(name).split(' ');
+  return parts[parts.length - 1] || 'Unnamed';
+}
+function jobTag(order) {
+  const venueWord = venueTag(order && (order.venue || order.delivery_notes));
+  return venueWord ? `${surname(order.client_name)} / ${venueWord}` : surname(order && order.client_name);
+}
+function providerName(source) {
+  return source === 'google_routes' ? 'Google' : 'Apple Maps';
+}
+function breakdown(plan, style) {
+  const drive = hmsLabel(plan.drive_seconds);
+  const ferry = !!plan.has_ferry;
+  if (style === 'short') return `${drive}${ferry ? ' + ferry' : ''}`;
+  if (style === 'team') return `${drive}${ferry ? ' incl. ferry' : ''} + 1h buffer`;
+  if (style === 'daybefore') return `${drive} predicted traffic${ferry ? ' incl. ferry' : ''}, +1h buffer${ferry ? ', +30m ferry' : ''}`;
+  return `${drive} with traffic${ferry ? ' incl. ferry' : ''}, +1h buffer${ferry ? ', +30m ferry' : ''}`;
+}
+// "On shift (NY): Jayden Martin, at the garage since 12:12 PM" and the
+// other shapes. Names only; never an email or a phone number.
+export function onShiftLine(ctx) {
+  const market = ctx.market;
+  const people = (ctx.onShift || []).map((w) => {
+    let text;
+    if (w.gpsStaleSinceIso) text = `${w.name}, GPS stale since ${marketTimeStr(w.gpsStaleSinceIso, market)}, cannot tell if moving`;
+    else if (w.movingSinceIso) text = `${w.name}, moving since ${marketTimeStr(w.movingSinceIso, market)}`;
+    else if (w.atGarage) text = `${w.name}, at the garage since ${marketTimeStr(w.clockInAtIso, market)}`;
+    else text = `${w.name}, clocked in at ${marketTimeStr(w.clockInAtIso, market)}, not seen at the garage`;
+    if ((ctx.unreachable || []).includes(w.name)) text += ' (no alerts on their phone)';
+    return text;
+  });
+  let line = people.length ? people.join('; ') : 'nobody clocked in';
+  if (ctx.ack && ctx.ack.kind === 'on_my_way') line += `. ${firstName(ctx.ack.name)} tapped On my way at ${marketTimeStr(ctx.ack.atIso, market)}`;
+  return line;
+}
+function altLine(plan, ctx) {
+  if (!plan.alt_arrive_at) return '';
+  const onFile = plan.window_text ? `on file ${plan.window_text}` : 'no clock time on file';
+  return `\nUnconfirmed: a coordinator email says ${marketTimeStr(plan.alt_arrive_at, ctx.market)} (${onFile}). This alarm uses ${marketTimeStr(plan.alt_arrive_at, ctx.market)}. Open Needs you to Accept or Keep.`;
+}
+function tails(plan, ctx) {
+  let text = altLine(plan, ctx);
+  if (ctx.multiStop > 1) text += `\n${ctx.multiStop} stops in ${marketTag(ctx.market)} today: each leave-by assumes it is the only stop.`;
+  if (ctx.unsilencedByTimeChange) text += '\nAlerts un-silenced: the time changed.';
+  return text;
+}
+// Every departure banner. ctx: { stage, index, nowMs, market, onShift,
+// unreachable, ack, claim, etaMs, gpsSeenIso, multiStop, unsilencedByTimeChange }.
+export function departureAlertTexts(plan, order, ctx) {
+  const p = plan || {};
+  const c = ctx || {};
+  const market = c.market || p.market;
+  const tag = jobTag(order);
+  const origin = p.origin_label || 'the garage';
+  const originCap = origin === 'NJ garage' ? 'NJ garage' : origin;
+  const arrive = p.arrive_at ? marketTimeStr(p.arrive_at, market) : 'the delivery time';
+  const leave = p.leave_by_at ? marketTimeStr(p.leave_by_at, market) : '';
+  const dest = p.dest_address || collapseSpaces(order && (order.venue || order.delivery_notes)) || 'the venue';
+  const mkt = marketTag(market);
+  const shift = onShiftLine({ ...c, market });
+  const mover = (c.onShift && c.onShift[0] && c.onShift[0].name) || 'The crew';
+  let title = '', body = '';
+  switch (c.stage) {
+    case 'heads_up': {
+      const m = finite(c.minutesToLeave) ? c.minutesToLeave : 60;
+      title = m >= 55 ? `Leave in 1 hour: ${tag}` : `Leave in ${Math.max(1, Math.round(m))} min: ${tag}`;
+      body = `Leave ${originCap} by ${leave} to arrive ${arrive}. ${breakdown(p)}. On shift (${mkt}): ${shift}.` + tails(p, { ...c, market });
+      break;
+    }
+    case 'leave_now':
+      title = `LEAVE NOW: ${tag}`;
+      body = `Leave-by ${leave} is now. Arrive ${arrive} at ${dest}. ${breakdown(p, 'short')}. On shift (${mkt}): ${shift}.` + tails(p, { ...c, market });
+      break;
+    case 'late': {
+      title = `Late ${lateLabel(c.index)}: ${tag}`;
+      const leavingNowMs = c.nowMs + (Number(p.drive_seconds) || 0) * 1000 + (p.has_ferry ? FERRY_QUEUE_SECONDS * 1000 : 0);
+      body = `Nobody has left the ${originCap}. Leaving now arrives ${marketTimeStr(leavingNowMs, market)} with traffic, needed ${arrive}. On shift (${mkt}): ${shift}.` + tails(p, { ...c, market });
+      break;
+    }
+    case 'moving_no_pickup':
+      title = `Moving, no pickup: ${tag}`;
+      body = `${mover} is moving but has not been seen at the ${originCap}, where the boxes are.`
+        + (finite(c.etaMs) ? ` ETA via the garage ${marketTimeStr(c.etaMs, market)}, needed ${arrive}.` : ` Needed ${arrive}.`)
+        + ` If they have the boxes, they should tap 'Left the garage with the boxes' in My Day.`;
+      break;
+    case 'running_late': {
+      title = `Running late: ${tag}`;
+      const arriveMs = p.arrive_at ? new Date(p.arrive_at).getTime() : c.etaMs;
+      body = `${mover} ETA ${marketTimeStr(c.etaMs, market)}, needed ${arrive} (${lateLabel((c.etaMs - arriveMs) / 60000)} late). Call the venue.`;
+      break;
+    }
+    case 'missed':
+      title = `ARRIVAL MISSED: ${tag}`;
+      if (c.claim) {
+        body = `${c.claim.name} said they left the garage at ${marketTimeStr(c.claim.atIso, market)}. It is ${marketTimeStr(c.nowMs, market)}, the coconuts were needed at ${arrive} at ${dest}, and no arrival has been seen`
+          + (c.gpsSeenIso ? ` (GPS ${marketTimeStr(c.gpsSeenIso, market)})` : ' (no GPS)') + '. Call the venue now.';
+      } else {
+        body = `It is ${marketTimeStr(c.nowMs, market)}. The coconuts were needed at ${arrive} at ${dest}, and nobody has left the ${originCap}. Call the venue now.`;
+      }
+      break;
+    case 'cannot_plan': {
+      title = `Cannot plan departure: ${surname(order && order.client_name)} (${weekdayDayLabel(p.plan_date)})`;
+      const w = p.window_text ? `"${p.window_text}"` : '';
+      if (p.state === 'needs_ampm') body = `Window ${w} has no AM or PM; set ${clockLabel(new Date(p.arrive_at).getUTCHours(), 0).replace(/ (AM|PM)$/, ' AM')} or the PM time in Needs you.`;
+      else if (p.state === 'no_time') body = w ? `Window reads ${w} and I cannot read a clock time from it. Fix it in Needs you.` : 'No delivery time on file. Set one in Needs you.';
+      else if (p.state === 'no_address') body = `Address "${p.dest_address || collapseSpaces(order && order.venue) || 'blank'}" is incomplete (no town or state); fix it on the invoice.`;
+      else if (p.state === 'no_route') body = `${providerName(p.route_source)} routing failed (${p.route_error || 'unknown error'}). Leave-by unknown until it works.`;
+      else if (p.state === 'no_origin') body = `No start point in ${mkt} yet; clock in there once.`;
+      else body = 'Cannot plan this departure yet.';
+      break;
+    }
+    case 'crew_ack': {
+      const first = firstName(c.ack && c.ack.name);
+      const at = c.ack && c.ack.atIso ? marketTimeStr(c.ack.atIso, market) : '';
+      if (c.ack && c.ack.kind === 'left_garage') {
+        title = `${first} left the garage: ${tag}`;
+        body = `${c.ack.name} tapped 'Left the garage with the boxes' at ${at}. Late nags stop; you get an ETA warning only if traffic slips. Not right? Undo in Needs you.`;
+      } else {
+        title = `${first} is on it: ${tag}`;
+        body = `${c.ack && c.ack.name} tapped On my way at ${at}. Late alerts keep running until the boxes leave the garage.`;
+      }
+      break;
+    }
+    default:
+      return null;
+  }
+  return { title, body, managerBody: body, teamBody: body };
+}
+// The 6 PM day-before message, one per market. plans is a Map or object
+// keyed by order id; pendingProposals, unreadLinked and unreachable are
+// plain lists. Returns owner/manager and crew bodies, both byte-capped.
+export function dayBeforeLines(market, orders, plans, pendingProposals, unreadLinked, unreachable, options) {
+  const opts = options || {};
+  const mkt = marketTag(market);
+  const day = opts.day || '';
+  const todayWd = weekdayOf(dayBefore(day));
+  const planOf = (id) => (plans && typeof plans.get === 'function') ? plans.get(id) : (plans || {})[id];
+  const jobs = (orders || []).filter((o) => o && o.stage !== 'cancelled');
+  const manage = [];
+  const team = [];
+  let plannedCount = 0;
+  for (const o of jobs) {
+    const p = planOf(o.id) || {};
+    const client = collapseSpaces(o.client_name) || 'Unnamed';
+    const dest = p.dest_address || collapseSpaces(o.delivery_notes || o.venue) || 'no address';
+    const qty = Number.isInteger(o.coconuts_qty) ? `${o.coconuts_qty} coconuts` : 'coconuts';
+    const w = p.window_text ? `"${p.window_text}"` : '';
+    if (p.state === 'planned' && p.leave_by_at) {
+      plannedCount++;
+      const arrive = marketTimeStr(p.arrive_at, market);
+      const leave = marketTimeStr(p.leave_by_at, market);
+      manage.push(`• ${client} · ${dest} · arrive ${arrive}${w ? ` (window ${w})` : ''} · leave ${p.origin_label || 'the garage'} by ${leave} (${breakdown(p, 'daybefore')}) · ${qty}: brand and box them TODAY (${todayWd})`);
+      let crew = `• ${client} · ${dest} · arrive ${arrive} · leave ${p.origin_label || 'the garage'} by ${leave} (${breakdown(p, 'team')}) · ${qty}: brand and box them TODAY (${todayWd})`;
+      if (p.alt_arrive_at) crew += ` · time not final (a coordinator email says ${marketTimeStr(p.alt_arrive_at, market)}, Sidd is deciding); the alarm uses ${leave}`;
+      team.push(crew);
+    } else if (p.state === 'no_time') {
+      manage.push(w ? `• NO TIME ON FILE: ${client} · ${dest} · window reads ${w} and I cannot read a clock time from it. Fix it in Needs you.`
+        : `• NO TIME ON FILE: ${client} · ${dest} · no delivery time on file. Fix it in Needs you.`);
+    } else if (p.state === 'needs_ampm') {
+      manage.push(`• AM OR PM? ${client} · ${dest} · window ${w} has no AM or PM, so no leave-by and no alerts until you settle it in Needs you.`);
+    } else if (p.state === 'no_address') {
+      manage.push(`• NO ADDRESS: ${client} (venue: ${p.dest_address || collapseSpaces(o.venue) || 'blank'}, incomplete) · add the full shipping address on the invoice.`);
+    } else if (p.state === 'no_route') {
+      manage.push(`• NO DRIVE TIME: ${client} · ${dest} · ${providerName(p.route_source)} routing failed (${p.route_error || 'unknown error'}). Leave-by unknown.`);
+    } else if (p.state === 'no_origin') {
+      manage.push(`• NO START POINT: ${client} · ${dest} · nobody has clocked in in ${mkt} yet; clock in there once.`);
+    } else {
+      manage.push(`• ${client} · ${dest} · departure not planned yet.`);
+    }
+  }
+  for (const pr of pendingProposals || []) {
+    manage.push(`• UNDECIDED EMAIL about tomorrow: ${surname(pr.client_name)}, a coordinator email says ${pr.proposed_label}, on file ${pr.on_file_window || 'no clock time'}. Tomorrow's alarm uses ${pr.proposed_label} until you decide (Needs you).`);
+  }
+  for (const u of unreadLinked || []) {
+    manage.push(`• UNREAD EMAIL about tomorrow: ${collapseSpaces(u.client_name) || 'a job'}, ${u.why || 'coordinator email, no arrival time found'}. Open it in Outlook.`);
+  }
+  if (plannedCount > 1) manage.push(`• ${plannedCount} stops in ${mkt} tomorrow: each leave-by assumes it is the only stop. Plan the order yourself.`);
+  if (unreachable && unreachable.length) {
+    manage.push(`• No alerts reach: ${unreachable.join(', ')} (phone not registered; ask them to open HC Field and allow notifications).`);
+  }
+  const title = `Tomorrow ${weekdayDayLabel(day)} (${mkt}): ${jobs.length} job${jobs.length === 1 ? '' : 's'}`;
+  return {
+    title,
+    manageBody: pushBodyByteCap(manage.join('\n'), 1500),
+    teamBody: pushBodyByteCap(team.join('\n'), 1500),
+  };
+}
+// ════════════════════════════════════════════════════════════════════
+// end of the departure plan pure functions
+// ════════════════════════════════════════════════════════════════════
+
 // The scan itself. Returns its counts (handy for tests and logs).
 // Exported for worker/test-delivery-confirmation.mjs.
 export async function runDeliveryConfirmationScan(env) {
