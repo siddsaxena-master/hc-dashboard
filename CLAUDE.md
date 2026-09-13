@@ -371,3 +371,17 @@ Probed from the droplet with the app's exact parameter names.
   RPC both 401/42501. 041 (notification_team_push_state) and 042
   (order_time_proposals) still 404: not applied. Do not paste 040 again; a
   re-run is harmless (idempotent) but pointless.
+- 2026-09-13 20:47 UTC: MIGRATION 041 IS LIVE (Sidd's "yes do it, run 041").
+  Pasted byte-for-byte (15,903 bytes, sha1 d03cd8f21be5032baf68d0ad1f31f0fcb0c922a7).
+  Verified: hc_sync_notification_device carries the team branch and the
+  ever_kept_team_token_at stamp, grants unchanged (anon none, authenticated
+  and service_role execute); notification_team_push_state one row, service
+  only; push_tokens rows untouched (3), 008 anon policy still present; 022 and
+  028 absent. From now on 016, 017 and 022 must NEVER run as written (see the
+  section above). 042 still 404.
+- SQL editor paste trap (seen on 041): a migration with `drop` or `revoke`
+  makes Supabase open a "Potential issue detected" dialog after Run, and the
+  Chrome extension can go blind (page-script calls time out) while it is up.
+  The database tells the truth: probe the new object from the droplet. If the
+  page is blind, send the Return key (the dialog's default is "Run query");
+  never click Run a second time without knowing the state.
