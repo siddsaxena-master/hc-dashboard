@@ -28,6 +28,23 @@
   `GET https://omdcfphbwuwsrffdszlg.supabase.co/rest/v1/<table>?limit=1`
   with the anon key from index.html — expect HTTP 200.
 
+## NEVER RUN 021 AFTER 015c (added 2026-09-10)
+
+Migration 015c's header warns that 021 must not follow it. That warning is a
+COMMENT ONLY: 015c installs no marker, no version row and no guard function, so
+nothing stops it. Proved by execution in PGlite: after 015c, migrations 016, 017
+and 018 apply cleanly and then 021 applies silently, replacing the corrected
+hc_authorize_notification_device with a weaker one (no `for update of fw` roster
+lock, no ever_issued_at write).
+
+021 cannot run today because its own preflight demands 016/017/018, none applied.
+The trap is for a future session following the numbered order. Same shape as the
+027-after-029 trap. Fix properly by making 021 abort when
+notification_device_security_state.ever_issued_at exists.
+
+Also: 015c aborts on PostgreSQL 18 (fails safe, writes nothing). Production is
+PostgreSQL 17.6 as of 2026-09-10. Run `select version()` before any future run.
+
 ## HC Field authentication rollout
 
 - Never run migration 014. Migration 015 supersedes it and removes 014's
