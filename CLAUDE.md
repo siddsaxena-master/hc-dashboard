@@ -362,3 +362,12 @@ Probed from the droplet with the app's exact parameter names.
   continues on feature/departure-plan cut from it. main has no field-ops code.
 - Postgres 17.6. Cloudflare plan tier and Google Cloud billing: not checked
   (Sidd's accounts).
+- 2026-09-13 evening: MIGRATION 040 IS LIVE (Sidd's "yes do it, run 040").
+  Pasted byte-for-byte (19,181 bytes, sha1 db63d7774dfd9123a879ecc15d3fe427cb47fcd3),
+  "Success. No rows returned". Verified: RLS on, one select policy for
+  authenticated, anon has nothing, service_role writes, hc_departure_action
+  executable by authenticated only (anon and public false), 42 columns, 3
+  indexes, 0 rows; from the droplet: service GET 200 `[]`, no-bearer GET and
+  RPC both 401/42501. 041 (notification_team_push_state) and 042
+  (order_time_proposals) still 404: not applied. Do not paste 040 again; a
+  re-run is harmless (idempotent) but pointless.
