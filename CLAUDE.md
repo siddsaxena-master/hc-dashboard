@@ -228,3 +228,36 @@ PostgreSQL 17.6 as of 2026-09-10. Run `select version()` before any future run.
 index.html has the one-line pending-payment fix described above staged
 locally, awaiting Sidd's "yes do it" to push + deploy (remember the
 sw.js cache bump when it goes).
+
+## Departure plan, stage 0 truth checks (recorded 2026-09-13, read-only)
+
+Plan: `../DEPARTURE-PLAN-2026-09-12.md` (original + the app-only revision).
+Probed from the droplet with the app's exact parameter names.
+
+- `hc_set_delivery_request(p_order_id,p_window)` = 401: migration 038 IS live.
+- `hc_authorize_notification_device(p_device_id)` = 401: migration 015c IS live
+  (applied 2026-09-10). Do not paste it again.
+- `hc_enforce_notification_destination_authorization` = 404 (022 absent) and
+  `hc_sync_notification_device_pre_mfa_028` = 404 (028 absent): 041's preflight
+  can pass. 016/017/022 must NEVER run after 041 as written; 028 only after 041.
+- push_tokens columns: apns_token, device_id, email, platform, updated_at.
+  Rows on 2026-09-13: Sidd (device id set, refreshed 04:15Z), Jayden (device id
+  set, refreshed 00:54Z, he is role MANAGER not team), Veronika (device id NULL,
+  legacy 2026-08-05 row). Lian (team, vegas) has NO row: that is what 041 fixes.
+- field_workers: App Review team/ny, Hashim Nadir team/ny, Jayden Martin
+  MANAGER/ny, Lian Alpuerto team/vegas, Sidd owner/ny (+ one inactive duplicate),
+  Veronika Bo team/ny (unpaid tester, deliberate $0/hr).
+- push_queue columns: id, kind, outbox_type, payload, attempts, claimed_at,
+  created_at, next_attempt_at, done_at, last_error, dead_lettered_at,
+  dead_letter_reason. There is NO delivered_at; done_at is the success stamp.
+- Deployed droplet drainer: /opt/jarvis-invoice-bot/pushdrain.py = 26,084 bytes,
+  sha1 cb11c963b3226d032cd16ee6e990dbc519081787 (the 2026-08-04 original). It
+  imports cryptography, has no la_update handling, forwards neither
+  apns-collapse-id nor apns-expiration, and cannot carry content.data. The repo
+  copy is 67,068 bytes, sha1 563c1acabdb2aee522c09350b56ef980b8c0ceae. Swap it
+  before the departure worker deploy (stage 1), Sidd watching.
+- No ghost 'Canelle' inquiry rows; only the real order 567ba3a6.
+- Worker branch fix/worker-intake-and-vegas tip db94db4; the departure work
+  continues on feature/departure-plan cut from it. main has no field-ops code.
+- Postgres 17.6. Cloudflare plan tier and Google Cloud billing: not checked
+  (Sidd's accounts).
