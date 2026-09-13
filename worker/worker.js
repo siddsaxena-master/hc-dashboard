@@ -916,6 +916,10 @@ async function runScheduled(event, env, alsoNotify = true) {
       catch (e) { hourlyErr = e; console.error('runReconfirmationScan error:', e); }
       try { await runDebriefScan(env); }
       catch (e) { if (!hourlyErr) hourlyErr = e; console.error('runDebriefScan error:', e); }
+      // The 6 PM day-before departure message (per market, in its own
+      // zone). Fully wrapped inside; isolated here anyway.
+      try { await runDayBeforeDepartureScan(env); }
+      catch (e) { if (!hourlyErr) hourlyErr = e; console.error('runDayBeforeDepartureScan error:', e); }
       if (hourlyErr) throw hourlyErr;
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
@@ -940,6 +944,10 @@ async function runScheduled(event, env, alsoNotify = true) {
       await runClockInAlertScan(env);
       // Stillness watch is the last field-ops scan and is fully wrapped.
       await runShiftStatusScan(env);
+      // Departure plan (leave-by, LEAVE NOW, late, arrival missed) runs
+      // after everything above and is fully wrapped, so a route-budget or
+      // router failure can only ever hurt itself.
+      await runDeparturePlanScan(env);
       // Graph returns after durable enqueue. Classification and order creation
       // run last and are bounded to two fresh leases, so slow provider work
       // cannot delay the field-ops scans above.
@@ -3829,6 +3837,8 @@ async function runShiftStatusScan(env) {
     if (!shifts || !shifts.length) return;
 
     const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+    // The departure plan's lock-screen words per market, read once per tick.
+    const cardByMarket = new Map();
 
     for (const row of shifts) {
       // Apple App Review noise: skip entirely (see isAppReviewShift).
@@ -3858,6 +3868,16 @@ async function runShiftStatusScan(env) {
           } else if (ageMin >= STOP_ALERT_MIN) {
             laStatus = 'Stopped';
             laMins = Math.floor(ageMin / 5) * 5; // bucket = what we render, "Stopped 15m", "Stopped 20m"...
+          }
+          // When a departure plan exists for this market today, the card
+          // says "Leave by 10:55a", "LEAVE NOW · Pridwin", "Late 30m · ..."
+          // or "ETA 4:45p · ..." instead. "Stopped" always wins: a stale
+          // GPS is a safety signal.
+          if (laStatus !== 'Stopped') {
+            const mk = marketKey(row.market);
+            if (!cardByMarket.has(mk)) cardByMarket.set(mk, await departureCardStatusForMarket(env, mk, Date.now()));
+            const planWords = cardByMarket.get(mk);
+            if (planWords) laStatus = planWords;
           }
           await updateShiftLiveActivity(
             env, row.id, laStatus, laMins, p.at, row.market,
@@ -4226,9 +4246,23 @@ export async function enqueuePush(env, kind, payload, requestedQueueId = null) {
     ...(payload || {}),
     headers: {
       ...((payload && payload.headers) || {}),
-      collapse_id: queueId,
+      // A caller's collapse id (e.g. 'dep-<order>' so each departure banner
+      // replaces the last on the lock screen) is kept; otherwise the queue
+      // id itself, as before. The only collapse-id trigger returns early for
+      // every kind but la_start (018:323-325), so this is safe on alert rows.
+      collapse_id: (payload && payload.headers && payload.headers.collapse_id) || queueId,
     },
   };
+  // Apple refuses alert payloads over 4 KB. Trim the body, never drop the row.
+  if (kind === 'alert' && queuePayload.aps && queuePayload.aps.alert && typeof queuePayload.aps.alert.body === 'string') {
+    const encoded = () => new TextEncoder().encode(JSON.stringify({ aps: queuePayload.aps, body: queuePayload.body || null })).length;
+    if (encoded() > 3800) {
+      const bodyBytes = new TextEncoder().encode(queuePayload.aps.alert.body).length;
+      const allowed = Math.max(200, 3800 - (encoded() - bodyBytes) - 40);
+      queuePayload.aps = { ...queuePayload.aps, alert: { ...queuePayload.aps.alert, body: pushBodyByteCap(queuePayload.aps.alert.body, allowed) } };
+      console.error('push body truncated to fit the Apple payload limit:', queueId);
+    }
+  }
   const row = {
     id: queueId,
     kind: kind,
@@ -5242,6 +5276,620 @@ export function dayBeforeLines(market, orders, plans, pendingProposals, unreadLi
 // end of the departure plan pure functions
 // ════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════
+// DEPARTURE PLAN, the wiring (2026-09-13): the router, the market-wide
+// push, and the two scans (every five minutes, and the 6 PM day-before
+// message). Uses the pure functions above. NO Telegram anywhere here:
+// every message is an HC Field banner (Sidd's rule, 2026-09-13).
+// ════════════════════════════════════════════════════════════════════
+
+// ── routing: Apple Maps Server API first, Google Routes as the fallback ──
+// Sidd chose Apple Maps (free 25,000 calls a day on the developer account
+// HC already runs; expectedTravelTimeSeconds carries live traffic). The
+// three Apple secrets are APPLE_MAPS_KEY_ID, APPLE_MAPS_TEAM_ID and
+// APPLE_MAPS_PRIVATE_KEY (the .p8 text). GOOGLE_ROUTES_API_KEY alone
+// selects Google. Neither set: every plan says "routing unavailable".
+const APPLE_MAPS_API = 'https://maps-api.apple.com/v1';
+const appleMapsTokenCache = { token: null, expiresAt: 0 };
+export function routeProvider(env) {
+  if (env && env.APPLE_MAPS_KEY_ID && env.APPLE_MAPS_TEAM_ID && env.APPLE_MAPS_PRIVATE_KEY) return 'apple_maps';
+  if (env && env.GOOGLE_ROUTES_API_KEY) return 'google_routes';
+  return 'none';
+}
+function pemToPkcs8(pem) {
+  const b64 = String(pem || '').replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+function b64urlBytes(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+const b64urlText = (text) => b64urlBytes(new TextEncoder().encode(text));
+// A 30-minute ES256 token signed with the Maps key, the same shape the
+// drainer mints for Apple push (pushdrain.py _apns_jwt).
+export async function appleMapsJwt(env, nowMs) {
+  const iat = Math.floor((nowMs || Date.now()) / 1000);
+  const header = b64urlText(JSON.stringify({ alg: 'ES256', kid: env.APPLE_MAPS_KEY_ID, typ: 'JWT' }));
+  const claims = b64urlText(JSON.stringify({ iss: env.APPLE_MAPS_TEAM_ID, iat, exp: iat + 1800 }));
+  const key = await crypto.subtle.importKey('pkcs8', pemToPkcs8(env.APPLE_MAPS_PRIVATE_KEY), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, new TextEncoder().encode(header + '.' + claims));
+  return header + '.' + claims + '.' + b64urlBytes(new Uint8Array(signature));
+}
+async function appleMapsAccessToken(env, nowMs) {
+  if (appleMapsTokenCache.token && appleMapsTokenCache.expiresAt > nowMs + 60000) return appleMapsTokenCache.token;
+  const jwt = await appleMapsJwt(env, nowMs);
+  const resp = await webhookFetch(APPLE_MAPS_API + '/token', { headers: { Authorization: 'Bearer ' + jwt } }, 10000);
+  if (!resp.ok) throw new Error('apple token ' + resp.status);
+  const data = await resp.json();
+  if (!data || !data.accessToken) throw new Error('apple token: no accessToken');
+  appleMapsTokenCache.token = data.accessToken;
+  appleMapsTokenCache.expiresAt = nowMs + Math.max(60, Number(data.expiresInSeconds) || 1800) * 1000;
+  return data.accessToken;
+}
+async function appleGet(env, path, params, nowMs) {
+  const token = await appleMapsAccessToken(env, nowMs);
+  const qs = Object.entries(params).map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(String(v))).join('&');
+  const resp = await webhookFetch(APPLE_MAPS_API + path + '?' + qs, { headers: { Authorization: 'Bearer ' + token } }, 10000);
+  if (!resp.ok) throw new Error('apple ' + path + ' ' + resp.status);
+  return resp.json();
+}
+// Reads a ferry out of an Apple directions answer: any step whose
+// instruction mentions a ferry, or a route named after one.
+export function appleDirectionsHasFerry(directions) {
+  const steps = (directions && directions.steps) || [];
+  if (steps.some((s) => /ferry/i.test(String((s && s.instructions) || '')))) return true;
+  const routes = (directions && directions.routes) || [];
+  return routes.some((r) => /ferry/i.test(String((r && r.name) || '')));
+}
+async function computeRouteApple(env, input) {
+  const now = input.nowMs || Date.now();
+  let destLat = input.destLat, destLng = input.destLng;
+  if (!finite(destLat) || !finite(destLng)) {
+    const geo = await appleGet(env, '/geocode', { q: input.destAddress, limitToCountries: 'US', lang: 'en-US' }, now);
+    const hit = geo && Array.isArray(geo.results) && geo.results[0];
+    if (!hit || !hit.coordinate) return { ok: false, provider: 'apple_maps', error: 'geocode: no result' };
+    destLat = Number(hit.coordinate.latitude); destLng = Number(hit.coordinate.longitude);
+  }
+  const origin = `${input.originLat},${input.originLng}`;
+  const dest = `${destLat},${destLng}`;
+  let hasFerry = input.hasFerry;
+  let meters = input.meters;
+  if (input.needDirections || typeof hasFerry !== 'boolean') {
+    const dir = await appleGet(env, '/directions', { origin, destination: dest, transportType: 'Automobile' }, now);
+    const route = dir && Array.isArray(dir.routes) && dir.routes[0];
+    if (!route) return { ok: false, provider: 'apple_maps', error: 'directions: no route', destLat, destLng };
+    hasFerry = appleDirectionsHasFerry(dir);
+    meters = Number(route.distanceMeters);
+  }
+  const eta = await appleGet(env, '/etas', { origin, destinations: dest, transportType: 'Automobile' }, now);
+  const first = eta && Array.isArray(eta.etas) && eta.etas[0];
+  if (!first || !finite(Number(first.expectedTravelTimeSeconds))) return { ok: false, provider: 'apple_maps', error: 'etas: no answer', destLat, destLng };
+  return {
+    ok: true, provider: 'apple_maps', destLat, destLng,
+    driveSeconds: Math.round(Number(first.expectedTravelTimeSeconds)),
+    staticSeconds: finite(Number(first.staticTravelTimeSeconds)) ? Math.round(Number(first.staticTravelTimeSeconds)) : null,
+    meters: finite(Number(first.distanceMeters)) ? Math.round(Number(first.distanceMeters)) : (finite(meters) ? meters : null),
+    hasFerry: !!hasFerry,
+  };
+}
+async function computeRouteGoogle(env, input) {
+  const body = {
+    origin: { location: { latLng: { latitude: input.originLat, longitude: input.originLng } } },
+    destination: finite(input.destLat) ? { location: { latLng: { latitude: input.destLat, longitude: input.destLng } } } : { address: input.destAddress },
+    travelMode: 'DRIVE', routingPreference: 'TRAFFIC_AWARE_OPTIMAL',
+    departureTime: new Date((input.nowMs || Date.now()) + 60000).toISOString(),
+  };
+  const resp = await webhookFetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json', 'X-Goog-Api-Key': env.GOOGLE_ROUTES_API_KEY,
+      'X-Goog-FieldMask': 'routes.duration,routes.staticDuration,routes.distanceMeters,routes.legs.endLocation,routes.legs.steps.navigationInstruction.maneuver',
+    },
+    body: JSON.stringify(body),
+  }, 10000);
+  if (!resp.ok) return { ok: false, provider: 'google_routes', error: 'computeRoutes ' + resp.status };
+  const data = await resp.json();
+  const route = data && Array.isArray(data.routes) && data.routes[0];
+  if (!route) return { ok: false, provider: 'google_routes', error: 'computeRoutes: no route' };
+  const secs = (v) => (typeof v === 'string' ? Number(v.replace(/s$/, '')) : Number(v));
+  const leg = route.legs && route.legs[0];
+  const end = leg && leg.endLocation && leg.endLocation.latLng;
+  const hasFerry = !!(leg && (leg.steps || []).some((s) => /FERRY/i.test(String((s.navigationInstruction && s.navigationInstruction.maneuver) || ''))));
+  return {
+    ok: true, provider: 'google_routes',
+    destLat: end ? Number(end.latitude) : input.destLat, destLng: end ? Number(end.longitude) : input.destLng,
+    driveSeconds: Math.round(secs(route.duration)), staticSeconds: finite(secs(route.staticDuration)) ? Math.round(secs(route.staticDuration)) : null,
+    meters: finite(Number(route.distanceMeters)) ? Number(route.distanceMeters) : null, hasFerry,
+  };
+}
+// One drive-time answer, or an honest error. Never throws.
+export async function computeRoute(env, input) {
+  const provider = routeProvider(env);
+  try {
+    if (provider === 'apple_maps') return await computeRouteApple(env, input);
+    if (provider === 'google_routes') return await computeRouteGoogle(env, input);
+    return { ok: false, provider: 'none', error: 'key missing' };
+  } catch (e) {
+    return { ok: false, provider, error: String(e && e.message ? e.message : e).slice(0, 160) };
+  }
+}
+
+// ── a banner for a whole market ──────────────────────────────────────
+// Recipients (Sidd's rule): owners always; managers of that market; the
+// clocked-in team in that market; every ACTIVE team phone in the market
+// when nobody is clocked in. App Review and inactive rows never. Emails
+// are only ever used to look up tokens; none travels in a banner.
+export async function resolveMarketRecipients(env, market, opts = {}) {
+  // A blank market fails closed: owners only, the rule every other market
+  // send follows (partitionRecipients). Never guess a market for a manager
+  // or a crew phone.
+  const rawKey = String(market || '').trim().toLowerCase();
+  const key = rawKey ? marketKey(rawKey) : null;
+  const mode = key ? (opts.recipients || 'all') : 'owners';
+  const exclude = String(opts.exclude || '').trim().toLowerCase();
+  // A different query string from the owner/manager one sendPushToOwners
+  // uses (test-notification-security.mjs pins that string's count).
+  const roster = await fetchSb(env, 'field_workers?select=email,name,role,market,active&active=eq.true&limit=200') || [];
+  const clean = (e) => String(e || '').trim().toLowerCase();
+  const rows = roster.map((r) => ({ email: clean(r.email), name: collapseSpaces(r.name), role: String(r.role || '').trim().toLowerCase(), market: marketKey(r.market) }))
+    .filter((r) => r.email && r.email !== APPREVIEW_EMAIL && r.email !== exclude);
+  const owners = rows.filter((r) => r.role === 'owner');
+  const managers = opts.ownersOnly ? [] : rows.filter((r) => r.role === 'manager' && r.market === key);
+  let crew = [];
+  let clockedIn = [];
+  if (mode === 'all' || mode === 'crew') {
+    const since = new Date((opts.nowMs || Date.now()) - 24 * 3600000).toISOString();
+    const shifts = await fetchSb(env, 'shifts?select=id,worker_name,worker_email,market,clock_in_at&clock_out_at=is.null&clock_in_at=gte.' + since + '&order=clock_in_at.asc&limit=50') || [];
+    const byEmail = new Map(rows.map((r) => [r.email, r]));
+    clockedIn = shifts.filter((s) => s && !isAppReviewShift(s)).map((s) => ({ email: clean(s.worker_email), market: s.market ? marketKey(s.market) : (byEmail.get(clean(s.worker_email)) || {}).market, name: s.worker_name, clockInAt: s.clock_in_at, id: s.id }))
+      .filter((s) => s.email && s.market === key);
+    const teamRows = rows.filter((r) => r.role === 'team' && r.market === key);
+    const clockedSet = new Set(clockedIn.map((s) => s.email));
+    const clockedTeam = teamRows.filter((r) => clockedSet.has(r.email));
+    crew = clockedTeam.length ? clockedTeam : (opts.onlyClockedIn ? [] : teamRows);
+  }
+  const people = [];
+  const seen = new Set();
+  for (const r of [...owners, ...managers, ...crew]) { if (!seen.has(r.email)) { seen.add(r.email); people.push(r); } }
+  const emails = people.map((r) => r.email);
+  const inList = emails.map((e) => encodeURIComponent('"' + e + '"')).join(',');
+  const tokenRows = emails.length ? (await fetchSb(env, 'push_tokens?select=email,apns_token&email=in.(' + inList + ')') || []) : [];
+  const tokensByEmail = new Map();
+  for (const t of tokenRows) {
+    const e = clean(t.email);
+    if (t.apns_token && seen.has(e)) tokensByEmail.set(e, t.apns_token);
+  }
+  const reached = emails.filter((e) => tokensByEmail.has(e));
+  const unreachable = emails.filter((e) => !tokensByEmail.has(e));
+  return { market: key, people, owners, managers, crew, clockedIn, tokensByEmail, reached, unreachable };
+}
+async function derivedQueueId(queueId, suffix) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(queueId) + '\0' + suffix));
+  return uuidFromDigest(new Uint8Array(digest));
+}
+// Queues the banner. opts: recipients 'manage' | 'crew' | 'all', ownersOnly,
+// onlyClockedIn, teamBody, managerBody, queueId, collapseId, threadId,
+// kind, orderId, day, expiration (epoch seconds), data, resolved (a
+// resolveMarketRecipients result to reuse). Returns { queued, reached,
+// unreachable, tokens }. Zero tokens: nothing is queued.
+export async function sendPushToMarket(env, market, title, body, opts = {}) {
+  try {
+    const r = opts.resolved || await resolveMarketRecipients(env, market, opts);
+    const groups = { owner: [], manager: [], team: [] };
+    for (const p of r.people) {
+      const token = r.tokensByEmail.get(p.email);
+      if (token) groups[p.role === 'owner' ? 'owner' : p.role === 'manager' ? 'manager' : 'team'].push(token);
+    }
+    const total = groups.owner.length + groups.manager.length + groups.team.length;
+    if (!total) return { queued: false, reached: r.reached, unreachable: r.unreachable, tokens: 0 };
+    const headers = { topic: 'com.hamptonscoconuts.field', push_type: 'alert', priority: 10 };
+    if (opts.collapseId) headers.collapse_id = String(opts.collapseId).slice(0, 64);
+    if (finite(opts.expiration)) headers.expiration = Math.floor(opts.expiration);
+    const data = { v: 1, kind: opts.kind || 'alert', order_id: opts.orderId || null, day: opts.day || null, market: r.market, ...(opts.data || {}) };
+    const payload = (tokens, text) => {
+      const aps = { alert: { title, body: text }, sound: 'default' };
+      if (opts.threadId) aps['thread-id'] = String(opts.threadId);
+      if (opts.timeSensitive) aps['interruption-level'] = 'time-sensitive';
+      return { tokens: [...new Set(tokens)], headers, aps, body: data, telegram_text: null, fallback_chat_ids: [] };
+    };
+    const managerBody = opts.managerBody || body;
+    const teamBody = opts.teamBody || body;
+    let queued = false;
+    if (managerBody === body && teamBody === body) {
+      queued = !!(await enqueuePush(env, 'alert', payload([...groups.owner, ...groups.manager, ...groups.team], body), opts.queueId || null));
+    } else {
+      const sends = [
+        [groups.owner, body, opts.queueId || null],
+        [groups.manager, managerBody, opts.queueId ? await derivedQueueId(opts.queueId, 'manager') : null],
+        [groups.team, teamBody, opts.queueId ? await derivedQueueId(opts.queueId, 'team') : null],
+      ];
+      // Same words share one row so a phone registered twice never hears it twice.
+      const merged = new Map();
+      for (const [tokens, text, id] of sends) {
+        if (!tokens.length) continue;
+        const cur = merged.get(text);
+        if (cur) cur.tokens.push(...tokens); else merged.set(text, { tokens: [...tokens], id });
+      }
+      for (const [text, { tokens, id }] of merged) {
+        queued = !!(await enqueuePush(env, 'alert', payload(tokens, text), id)) || queued;
+      }
+    }
+    return { queued, reached: r.reached, unreachable: r.unreachable, tokens: total };
+  } catch (e) {
+    console.error('sendPushToMarket error:', e);
+    return { queued: false, reached: [], unreachable: [], tokens: 0 };
+  }
+}
+
+// ── the five-minute departure scan ───────────────────────────────────
+const NAG_STAGE_KEYS = ['heads_up', 'leave_now', 'late_10', 'late_30', 'late_60', 'late_120', 'late_180', 'moving_no_pickup'];
+function stageKey(stage, index) {
+  return stage === 'late' ? 'late_' + index : stage;
+}
+function dayInZone(ms, market) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: marketZone(market), year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+}
+// Merge-upsert of the plan itself. The claim, pickup, silence and ack
+// fields are NEVER in this body: those are written only by the guarded
+// PATCHes below or by the phone's RPC.
+async function upsertDeparturePlan(env, row) {
+  const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_departures?on_conflict=order_id', {
+    method: 'POST',
+    headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=representation' }),
+    body: JSON.stringify(row),
+  }, 15000);
+  if (!resp.ok) { console.error('departure upsert failed:', row.order_id, resp.status, (await resp.text()).slice(0, 200)); return null; }
+  const rows = await resp.json();
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+async function patchDeparture(env, orderId, guard, body) {
+  const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_departures?order_id=eq.' + encodeURIComponent(orderId) + (guard ? '&' + guard : ''), {
+    method: 'PATCH',
+    headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+    body: JSON.stringify(body),
+  }, 15000);
+  if (!resp.ok) { console.error('departure patch failed:', orderId, resp.status); return null; }
+  const rows = await resp.json();
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+// Points for one open shift this tick: newest first, six hours back.
+async function shiftTrail(env, shiftId, nowMs, cache) {
+  if (cache.has(shiftId)) return cache.get(shiftId);
+  const since = new Date(nowMs - 6 * 3600000).toISOString();
+  const pts = await fetchSb(env, 'shift_locations?select=at,lat,lng&shift_id=eq.' + encodeURIComponent(shiftId) + '&at=gte.' + since + '&order=at.desc&limit=240');
+  const trail = { newest: pts && pts.length ? pts[0] : null, recent: pts || [], readOk: !!pts };
+  cache.set(shiftId, trail);
+  return trail;
+}
+export async function runDeparturePlanScan(env) {
+  const counts = { seen: 0, planned: 0, refreshed: 0, routeCalls: 0, noTime: 0, noAddress: 0, noRoute: 0, needsAmpm: 0, alerts: 0, noRecipients: 0, failed: 0 };
+  try {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    // Today and tomorrow in Eastern time bound the read; each order's own
+    // plan_date is then taken in its market's zone.
+    const todayEt = dayInZone(nowMs, 'ny');
+    const dayAfter = new Date(Date.UTC(...todayEt.split('-').map(Number).map((v, i) => (i === 1 ? v - 1 : v))) + 3 * 86400000).toISOString().slice(0, 10);
+    const orders = await fetchSb(env, 'orders?select=id,client_name,venue,delivery_notes,delivery_at_utc,event_start_at,stage,market,coconuts_qty,delivery_request,invoice_fulfillment' +
+      '&stage=in.(quoted,invoiced,deposit_paid,paid_full)' +
+      '&delivery_at_utc=gte.' + todayEt + 'T00:00:00Z&delivery_at_utc=lt.' + dayAfter + 'T00:00:00Z' +
+      '&order=delivery_at_utc.asc,id.asc&limit=200');
+    if (!orders) return counts;
+    const existing = await fetchSb(env, 'order_departures?select=*&plan_date=gte.' + todayEt + '&plan_date=lte.' + dayAfter + '&limit=400') || [];
+    const plans = new Map(existing.map((p) => [p.order_id, p]));
+    const since24 = new Date(nowMs - 24 * 3600000).toISOString();
+    const openShifts = (await fetchSb(env, 'shifts?select=id,worker_name,worker_email,market,clock_in_at,clock_in_lat,clock_in_lng&clock_out_at=is.null&clock_in_at=gte.' + since24 + '&order=clock_in_at.asc&limit=50') || [])
+      .filter((s) => !isAppReviewShift(s));
+    const lastShiftByMarket = new Map();
+    const trails = new Map();
+    const recipientsCache = new Map();
+    // Route calls go to the soonest arrival first.
+    const work = orders.map((o) => ({ o, plan: plans.get(o.id) || null })).filter(({ o }) => o.delivery_at_utc);
+    work.sort((a, b) => String(a.o.delivery_at_utc).localeCompare(String(b.o.delivery_at_utc)));
+    const plannedByMarketDay = new Map();
+    for (const { o, plan } of work) {
+      counts.seen++;
+      try {
+        const market = marketKey(o.market);
+        const day = String(o.delivery_at_utc).slice(0, 10);
+        const dr = o.delivery_request && typeof o.delivery_request === 'object' ? o.delivery_request : null;
+        const inv = o.invoice_fulfillment && typeof o.invoice_fulfillment === 'object' ? o.invoice_fulfillment : null;
+        let windowText = '', arriveSource = 'none';
+        if (dr && dr.status === 'confirmed' && String(dr.window || '').trim()) { windowText = String(dr.window).trim(); arriveSource = 'delivery_request'; }
+        else if (inv && String(inv.delivery_window || '').trim()) { windowText = String(inv.delivery_window).trim(); arriveSource = 'invoice_window'; }
+        const parsed = windowText ? parseArrivalTime(windowText, day, marketZone(market)) : { ok: false, kind: 'none', reason: 'no clock time' };
+        const dest = departureDestination(o);
+        const marketHasGarage = !!MARKET_BASES[market];
+        if (!marketHasGarage && !lastShiftByMarket.has(market)) {
+          const since60 = new Date(nowMs - 60 * 86400000).toISOString();
+          const last = await fetchSb(env, 'shifts?select=id,clock_in_lat,clock_in_lng,clock_in_at,worker_email&market=eq.' + encodeURIComponent(market) + '&clock_in_at=gte.' + since60 + '&order=clock_in_at.desc&limit=3');
+          lastShiftByMarket.set(market, (last || []).find((s) => !isAppReviewShift(s) && finite(s.clock_in_lat)) || null);
+        }
+        const origin = originFor({ market, openShifts, lastShift: lastShiftByMarket.get(market) || null });
+        const prev = plan || {};
+        const row = {
+          order_id: o.id, plan_date: day, market,
+          window_text: windowText || null,
+          arrive_source: arriveSource,
+          arrive_kind: parsed.ok ? parsed.kind : 'none',
+          arrive_at: parsed.ok ? parsed.arriveAtUtc : null,
+          origin_kind: origin.kind, origin_lat: origin.lat, origin_lng: origin.lng, origin_label: origin.label, origin_shift_id: origin.shiftId,
+          dest_source: dest.source, dest_address: dest.address,
+          buffer_seconds: DEPARTURE_BUFFER_SECONDS, ferry_seconds: FERRY_QUEUE_SECONDS,
+          updated_at: nowIso,
+        };
+        // Carry the last good route unless the destination text changed.
+        const destChanged = prev.dest_address !== dest.address;
+        row.dest_lat = destChanged ? null : (prev.dest_lat ?? null);
+        row.dest_lng = destChanged ? null : (prev.dest_lng ?? null);
+        row.drive_seconds = destChanged ? null : (prev.drive_seconds ?? null);
+        row.static_seconds = destChanged ? null : (prev.static_seconds ?? null);
+        row.distance_meters = destChanged ? null : (prev.distance_meters ?? null);
+        row.has_ferry = destChanged ? false : !!prev.has_ferry;
+        row.route_source = destChanged ? 'none' : (prev.route_source || 'none');
+        row.route_error = destChanged ? null : (prev.route_error || null);
+        row.computed_at = destChanged ? null : (prev.computed_at || null);
+        // Honest states first.
+        if (!parsed.ok) { row.state = 'no_time'; counts.noTime++; }
+        else if (parsed.kind === 'assumed') { row.state = 'needs_ampm'; counts.needsAmpm++; }
+        else if (!dest.usable) { row.state = 'no_address'; counts.noAddress++; }
+        else if (origin.kind === 'none') { row.state = 'no_origin'; }
+        else row.state = 'pending';
+        if (prev.state === 'closed' || prev.state === 'arrived') row.state = prev.state;
+        const arriveMs = row.arrive_at ? new Date(row.arrive_at).getTime() : null;
+        const arriveChanged = !!prev.arrive_at && !!row.arrive_at && new Date(prev.arrive_at).getTime() !== arriveMs;
+        // The route, when due and when we still have budget.
+        if (row.state === 'pending' || (row.state === 'planned')) {
+          const inputsChanged = destChanged || prev.window_text !== row.window_text || prev.origin_kind !== row.origin_kind || prev.origin_label !== row.origin_label || prev.market !== market;
+          const failures = row.route_error && row.computed_at && dayInZone(new Date(row.computed_at).getTime(), market) === dayInZone(nowMs, market) ? Number(prev.route_failures_today || 1) : 0;
+          const due = refreshDue({ nowMs, arriveAtMs: arriveMs, leaveByMs: prev.leave_by_at ? new Date(prev.leave_by_at).getTime() : null, computedAtMs: row.computed_at ? new Date(row.computed_at).getTime() : null, state: prev.state || 'pending', movement: prev.movement || 'nobody', inputsChanged, routeFailures: failures });
+          if (due && counts.routeCalls < ROUTE_CALLS_PER_TICK_MAX) {
+            counts.routeCalls++;
+            const answer = await computeRoute(env, { originLat: origin.lat, originLng: origin.lng, destAddress: dest.address, destLat: row.dest_lat, destLng: row.dest_lng, hasFerry: destChanged ? undefined : prev.has_ferry, meters: row.distance_meters, needDirections: destChanged || !finite(prev.dest_lat), nowMs });
+            row.computed_at = nowIso;
+            if (answer.ok) {
+              const sane = routeSanity({ meters: answer.meters, driveSeconds: answer.driveSeconds, endLat: answer.destLat, endLng: answer.destLng, originLat: origin.lat, originLng: origin.lng, marketCenter: marketHasGarage ? { lat: GARAGE_LAT, lng: GARAGE_LNG } : { lat: origin.lat, lng: origin.lng } });
+              if (sane.ok) {
+                row.dest_lat = answer.destLat; row.dest_lng = answer.destLng;
+                row.drive_seconds = answer.driveSeconds; row.static_seconds = answer.staticSeconds; row.distance_meters = answer.meters;
+                row.has_ferry = answer.hasFerry; row.route_source = answer.provider; row.route_error = null;
+                counts.refreshed++;
+              } else {
+                row.route_source = 'none'; row.route_error = sane.reason; row.drive_seconds = null; row.state = 'no_address';
+              }
+            } else {
+              row.route_source = 'none'; row.route_error = answer.error;
+              if (!finite(row.drive_seconds)) row.state = 'no_route';
+            }
+          }
+          if (row.state === 'pending' && finite(row.drive_seconds)) row.state = 'planned';
+          else if (row.state === 'pending' && row.route_error && !finite(row.drive_seconds)) row.state = 'no_route';
+        }
+        if (row.state === 'no_route') counts.noRoute++;
+        // Leave-by and ETA.
+        row.leave_by_at = null; row.eta_at = null;
+        if (finite(arriveMs) && finite(row.drive_seconds)) {
+          const leaveMs = leaveByMs({ arriveAtMs: arriveMs, driveSeconds: row.drive_seconds, hasFerry: row.has_ferry });
+          row.leave_by_at = leaveMs ? new Date(leaveMs).toISOString() : null;
+        }
+        // Movement from the open shifts in this market.
+        const marketShifts = openShifts.filter((s) => marketKey(s.market) === market);
+        let movement = 'nobody';
+        let mover = null;
+        const onShift = [];
+        const clockedInEmails = [];
+        const garage = { lat: GARAGE_LAT, lng: GARAGE_LNG };
+        const destPoint = finite(row.dest_lat) ? { lat: row.dest_lat, lng: row.dest_lng } : null;
+        for (const s of marketShifts) {
+          const trail = await shiftTrail(env, s.id, nowMs, trails);
+          if (!trail.readOk) continue;
+          const clockInPoint = finite(s.clock_in_lat) ? { lat: s.clock_in_lat, lng: s.clock_in_lng } : null;
+          const newest = trail.newest || (clockInPoint ? { ...clockInPoint, at: s.clock_in_at } : null);
+          const state = movementState({ marketHasGarage, origin: { lat: origin.lat, lng: origin.lng }, dest: destPoint, clockInPoint, newestPoint: newest, recentPoints: trail.recent, nowMs, pickupSeenAt: prev.pickup_seen_at || null, pickupSource: prev.pickup_source || null, hasOpenShift: true });
+          const staleMs = newest ? new Date(newest.at).getTime() : null;
+          const entry = { name: s.worker_name, clockInAtIso: s.clock_in_at, atGarage: !!newest && distMeters(newest.lat, newest.lng, garage.lat, garage.lng) <= GARAGE_RADIUS_M };
+          if (state === 'unknown' && finite(staleMs)) entry.gpsStaleSinceIso = new Date(staleMs).toISOString();
+          if (state === 'departed' || state === 'moving_no_pickup') entry.movingSinceIso = newest ? newest.at : s.clock_in_at;
+          onShift.push(entry);
+          clockedInEmails.push(String(s.worker_email || '').toLowerCase());
+          // The strongest signal wins: arrived > departed > moving_no_pickup > at_origin > unknown > nobody.
+          const rank = { nobody: 0, unknown: 1, at_origin: 2, moving_no_pickup: 3, departed: 4, arrived: 5 };
+          if (rank[state] > rank[movement]) { movement = state; mover = s; }
+          // GPS pickup: stamp once, guarded on the column still being null.
+          if (marketHasGarage && !prev.pickup_seen_at && pickupSeenByGps(trail.recent, garage)) {
+            const stamped = await patchDeparture(env, o.id, 'pickup_seen_at=is.null', { pickup_seen_at: nowIso, pickup_source: 'gps', en_route_shift_id: s.id, updated_at: nowIso });
+            if (stamped) { prev.pickup_seen_at = stamped.pickup_seen_at; prev.pickup_source = 'gps'; }
+          }
+        }
+        row.movement = movement;
+        if (mover && (movement === 'departed' || movement === 'moving_no_pickup')) row.en_route_shift_id = mover.id;
+        if (movement === 'departed' && finite(row.drive_seconds)) {
+          // ETA from where the mover is now, using the stored drive time
+          // scaled by the straight-line share of the trip that is left.
+          const trail = trails.get(mover.id);
+          const here = trail && trail.newest;
+          if (here && destPoint && finite(row.distance_meters) && row.distance_meters > 0) {
+            const leftMeters = Math.min(row.distance_meters, distMeters(here.lat, here.lng, destPoint.lat, destPoint.lng) * 1.25);
+            const etaMs = nowMs + Math.round(row.drive_seconds * (leftMeters / row.distance_meters)) * 1000 + (row.has_ferry ? FERRY_QUEUE_SECONDS * 1000 : 0);
+            row.eta_at = new Date(etaMs).toISOString();
+          }
+        }
+        if (movement === 'arrived' && row.state === 'planned') row.state = 'arrived';
+        const saved = await upsertDeparturePlan(env, row);
+        if (!saved) { counts.failed++; continue; }
+        if (row.state === 'planned') counts.planned++;
+        const mdKey = market + '|' + day;
+        plannedByMarketDay.set(mdKey, (plannedByMarketDay.get(mdKey) || 0) + (row.state === 'planned' ? 1 : 0));
+        // A changed arrival target resets the stamps and lifts a silence.
+        let alerts = saved.alerts && typeof saved.alerts === 'object' ? saved.alerts : {};
+        let unsilencedByTimeChange = false;
+        if (arriveChanged) {
+          const reset = { unsilenced_note: !!saved.silenced_at };
+          const after = await patchDeparture(env, o.id, null, { alerts: reset, silenced_at: null, silenced_by: null, updated_at: nowIso });
+          if (after) { alerts = after.alerts || reset; saved.silenced_at = null; }
+          unsilencedByTimeChange = !!reset.unsilenced_note;
+        }
+        // The crew's tap echo, once per tap.
+        if (saved.ack_at && (!alerts.ack || alerts.ack.at !== saved.ack_at)) {
+          const ackKind = saved.pickup_source === 'claim' && saved.pickup_seen_at && new Date(saved.pickup_seen_at).getTime() >= new Date(saved.ack_at).getTime() - 5000 ? 'left_garage' : 'on_my_way';
+          const texts = departureAlertTexts(row, o, { market, stage: 'crew_ack', nowMs, onShift, unreachable: [], ack: { kind: ackKind, name: saved.ack_name || 'The crew', atIso: saved.ack_at } });
+          const id = await derivedQueueId('hc-ack-v1\0' + o.id, saved.ack_at);
+          const sent = await sendPushToMarket(env, market, texts.title, texts.body, { recipients: 'manage', queueId: id, collapseId: 'dep-' + o.id, threadId: o.id, kind: 'ack', orderId: o.id, day, data: { ack_name: saved.ack_name || null } });
+          if (sent.queued) {
+            const after = await patchDeparture(env, o.id, null, { alerts: { ...alerts, ack: { at: saved.ack_at, queue_id: id } }, updated_at: nowIso });
+            if (after) alerts = after.alerts;
+          }
+        }
+        // Cannot-plan nag, once per day per order, inside 48 hours.
+        if (['no_time', 'needs_ampm', 'no_address', 'no_route', 'no_origin'].includes(row.state)) {
+          const dayTag = dayInZone(nowMs, market);
+          if (alerts.cannot_plan !== dayTag) {
+            const texts = departureAlertTexts({ ...row, ...saved }, o, { market, stage: 'cannot_plan', nowMs, onShift, unreachable: [] });
+            const id = await derivedQueueId('hc-cannotplan-v1\0' + o.id, dayTag);
+            const sent = await sendPushToMarket(env, market, texts.title, texts.body, { recipients: 'manage', queueId: id, collapseId: 'plan-' + o.id, threadId: o.id, kind: 'cannot_plan', orderId: o.id, day, data: { state: row.state } });
+            if (sent.queued) {
+              const after = await patchDeparture(env, o.id, null, { alerts: { ...alerts, cannot_plan: dayTag }, updated_at: nowIso });
+              if (after) alerts = after.alerts;
+            }
+          }
+          continue;
+        }
+        if (row.state !== 'planned' || !row.leave_by_at) continue;
+        // Which banner, if any.
+        const claimed = saved.pickup_source === 'claim';
+        const etaMs = row.eta_at ? new Date(row.eta_at).getTime() : null;
+        const stage = alertStage({ nowMs, leaveByMs: new Date(row.leave_by_at).getTime(), arriveAtMs: arriveMs, movement, etaMs, alerts, silenced: !!saved.silenced_at, claimed });
+        if (!stage) continue;
+        const key = stageKey(stage.stage, stage.index);
+        const stampAll = (extra) => {
+          const next = { ...alerts, ...extra };
+          for (const k of stage.alsoStamp || []) { const kk = typeof k === 'number' ? 'late_' + k : k; if (!next[kk]) next[kk] = { at: nowIso, silent: true }; }
+          return next;
+        };
+        if (!stage.send) {
+          // Silenced: remember it happened, send nothing.
+          const after = await patchDeparture(env, o.id, 'alerts->>' + key + '=is.null', { alerts: stampAll({ [key]: { at: nowIso, silent: true } }), updated_at: nowIso });
+          if (after) alerts = after.alerts;
+          continue;
+        }
+        // Recipients BEFORE the claim: nobody reachable means no claim.
+        if (!recipientsCache.has(market)) recipientsCache.set(market, await resolveMarketRecipients(env, market, { recipients: 'all', nowMs }));
+        const resolved = recipientsCache.get(market);
+        if (!resolved.reached.length) {
+          counts.noRecipients++;
+          await patchDeparture(env, o.id, null, { alerts: { ...alerts, no_recipients_at: nowIso }, updated_at: nowIso });
+          continue;
+        }
+        const arriveIso = row.arrive_at;
+        const queueId = stage.stage === 'running_late'
+          ? await derivedQueueId('hc-departure-v1\0' + o.id + '\0' + arriveIso + '\0running_late', String(stage.index))
+          : await departureQueueId(o.id, arriveIso, stage.stage, stage.index);
+        const stamp = stage.stage === 'running_late' ? { at: nowIso, eta: etaMs, queue_id: queueId } : { at: nowIso, queue_id: queueId };
+        const claimedRow = await patchDeparture(env, o.id, stage.stage === 'running_late' ? null : 'alerts->>' + key + '=is.null', { alerts: stampAll({ [key]: stamp }), updated_at: nowIso });
+        if (!claimedRow) continue; // lost the race or the write: nothing is sent
+        alerts = claimedRow.alerts;
+        const unreachableNames = onShift.filter((w, i) => resolved.unreachable.includes(clockedInEmails[i])).map((w) => w.name);
+        const ctx = {
+          market, stage: stage.stage, index: stage.index, nowMs, onShift, unreachable: unreachableNames, etaMs,
+          minutesToLeave: (new Date(row.leave_by_at).getTime() - nowMs) / 60000,
+          multiStop: plannedByMarketDay.get(mdKey) || 0, unsilencedByTimeChange: !!alerts.unsilenced_note,
+          claim: claimed && stage.claim ? { name: saved.ack_name || (mover && mover.worker_name) || 'The crew', atIso: saved.pickup_seen_at } : null,
+          gpsSeenIso: mover && trails.get(mover.id) && trails.get(mover.id).newest ? trails.get(mover.id).newest.at : null,
+          ack: saved.ack_at && !claimed ? { kind: 'on_my_way', name: saved.ack_name || 'The crew', atIso: saved.ack_at } : null,
+        };
+        const texts = departureAlertTexts(row, o, ctx);
+        if (!texts) continue;
+        const expiration = stage.stage === 'heads_up' ? Math.floor(new Date(row.leave_by_at).getTime() / 1000)
+          : stage.stage === 'missed' ? null
+          : stage.stage === 'running_late' ? Math.floor((arriveMs + 3 * 3600000) / 1000)
+          : Math.floor(arriveMs / 1000);
+        const sent = await sendPushToMarket(env, market, texts.title, texts.body, {
+          resolved, queueId, collapseId: 'dep-' + o.id, threadId: o.id, kind: stage.stage, orderId: o.id, day,
+          expiration, timeSensitive: stage.stage === 'leave_now' || stage.stage === 'late' || stage.stage === 'missed',
+          data: { index: stage.index, leave_by_at: row.leave_by_at, arrive_at: row.arrive_at },
+        });
+        if (sent.queued) counts.alerts++;
+        else {
+          counts.failed++;
+          // The stamp stays; the next tick sees a stamp with no queue row and retries via re-fire.
+          await patchDeparture(env, o.id, null, { alerts: { ...alerts, [key]: { ...stamp, undelivered: true } }, updated_at: nowIso });
+        }
+        if (alerts.unsilenced_note) await patchDeparture(env, o.id, null, { alerts: { ...alerts, unsilenced_note: false }, updated_at: nowIso });
+      } catch (e) {
+        counts.failed++;
+        console.error('departure scan failed on order ' + (o && o.id) + ':', e);
+      }
+    }
+  } catch (e) {
+    console.error('runDeparturePlanScan error:', e);
+  }
+  console.log('departure scan: ' + JSON.stringify(counts));
+  return counts;
+}
+
+// ── the 6 PM day-before message, per market ──────────────────────────
+// Runs on the hourly cron. Each market sends during its own 18:00 to
+// 21:00 window; the stable queue id makes a repeat a no-op, so a missed
+// 18:00 tick is caught at 19:00 and never sent twice.
+export async function runDayBeforeDepartureScan(env) {
+  const counts = { markets: 0, sent: 0, skipped: 0, failed: 0 };
+  try {
+    const nowMs = Date.now();
+    for (const market of Object.keys(MARKET_TZ)) {
+      if (market === 'other') continue;
+      const hour = marketHour(nowMs, market);
+      if (!['18', '19', '20', '21'].includes(hour)) continue;
+      const today = dayInZone(nowMs, market);
+      const tomorrow = new Date(Date.UTC(...today.split('-').map(Number).map((v, i) => (i === 1 ? v - 1 : v))) + 86400000).toISOString().slice(0, 10);
+      const nextDay = new Date(Date.UTC(...tomorrow.split('-').map(Number).map((v, i) => (i === 1 ? v - 1 : v))) + 86400000).toISOString().slice(0, 10);
+      const orders = await fetchSb(env, 'orders?select=id,client_name,venue,delivery_notes,delivery_at_utc,stage,market,coconuts_qty' +
+        '&stage=in.(quoted,invoiced,deposit_paid,paid_full)&market=eq.' + encodeURIComponent(market) +
+        '&delivery_at_utc=gte.' + tomorrow + 'T00:00:00Z&delivery_at_utc=lt.' + nextDay + 'T00:00:00Z&order=delivery_at_utc.asc&limit=100');
+      if (!orders || !orders.length) continue;
+      counts.markets++;
+      const plans = new Map(((await fetchSb(env, 'order_departures?select=*&plan_date=eq.' + tomorrow + '&market=eq.' + encodeURIComponent(market) + '&limit=200')) || []).map((p) => [p.order_id, p]));
+      const resolved = await resolveMarketRecipients(env, market, { recipients: 'all', nowMs });
+      const unreachableNames = resolved.people.filter((p) => resolved.unreachable.includes(p.email)).map((p) => p.name || 'a crew member');
+      const text = dayBeforeLines(market, orders, plans, [], [], unreachableNames, { day: tomorrow });
+      const manageId = await derivedQueueId('hc-daybefore-v1\0' + market + '\0' + tomorrow, 'manage');
+      const teamId = await derivedQueueId('hc-daybefore-v1\0' + market + '\0' + tomorrow, 'team');
+      const manage = await sendPushToMarket(env, market, text.title, text.manageBody, { recipients: 'manage', queueId: manageId, collapseId: 'day-' + market + '-' + tomorrow, threadId: 'day-' + market + '-' + tomorrow, kind: 'day_before', day: tomorrow });
+      let team = { queued: false };
+      if (text.teamBody) {
+        team = await sendPushToMarket(env, market, text.title, text.teamBody, { recipients: 'crew', queueId: teamId, collapseId: 'day-' + market + '-' + tomorrow + '-team', threadId: 'day-' + market + '-' + tomorrow, kind: 'day_before', day: tomorrow, resolved: { ...resolved, people: resolved.crew } });
+      }
+      if (manage.queued || team.queued) counts.sent++; else counts.skipped++;
+    }
+  } catch (e) {
+    counts.failed++;
+    console.error('runDayBeforeDepartureScan error:', e);
+  }
+  return counts;
+}
+// The lock-screen card words for a market today: the soonest planned
+// job's status, or null when there is no plan. Read once per tick by the
+// shift status scan.
+export async function departureCardStatusForMarket(env, market, nowMs) {
+  try {
+    const today = dayInZone(nowMs, market);
+    const rows = await fetchSb(env, 'order_departures?select=order_id,leave_by_at,arrive_at,dest_address,movement,eta_at,state&plan_date=eq.' + today + '&market=eq.' + encodeURIComponent(marketKey(market)) + '&state=in.(planned,arrived)&order=leave_by_at.asc.nullslast&limit=5');
+    const plan = (rows || []).find((r) => r.leave_by_at) || (rows || [])[0];
+    if (!plan) return null;
+    return cardStatus({ plan: { ...plan, venue: plan.dest_address }, nowMs, movement: plan.movement, etaMs: plan.eta_at ? new Date(plan.eta_at).getTime() : null, market });
+  } catch (e) {
+    console.error('departureCardStatusForMarket error:', e);
+    return null;
+  }
+}
+// ════════════════════════════════════════════════════════════════════
+// end of the departure plan wiring
+// ════════════════════════════════════════════════════════════════════
+
+
 // The scan itself. Returns its counts (handy for tests and logs).
 // Exported for worker/test-delivery-confirmation.mjs.
 export async function runDeliveryConfirmationScan(env) {
@@ -5288,8 +5936,13 @@ export async function runDeliveryConfirmationScan(env) {
           continue;
         }
         const queueId = await deliveryConfirmationQueueId(row.id, msg.checkedAt);
-        const queued = await sendPushToOwners(env, msg.title, msg.body, msg.telegramText, chatIds,
-          { market: row.market, queueId: queueId });
+        // Owner, same-market managers and that market's crew, all through
+        // the phone (Sidd's rule, 2026-09-13): no Telegram copy any more.
+        const sent = await sendPushToMarket(env, row.market, msg.title, msg.body, {
+          recipients: 'all', queueId: queueId, collapseId: 'dep-' + row.id, threadId: row.id,
+          kind: 'confirmed', orderId: row.id, day: (row.delivery_request && row.delivery_request.date) || null,
+        });
+        const queued = sent.queued;
         if (!queued) {
           // Nothing reached the queue, so nothing gets stamped: the row
           // comes back next tick, and the same queue id keeps that safe.
@@ -5371,9 +6024,10 @@ export function buildLiveActivityContentState(
   if (Number.isFinite(reportMs)) {
     state.lastReportISO = new Date(reportMs).toISOString();
   }
-  const marketKey = String(market || '').trim().toLowerCase();
-  if (marketKey === 'ny') state.marketLabel = 'NJ';
-  else if (marketKey === 'miami') state.marketLabel = 'Miami';
+  const marketWord = String(market || '').trim().toLowerCase();
+  if (marketWord === 'ny') state.marketLabel = 'NJ';
+  else if (marketWord === 'miami') state.marketLabel = 'Miami';
+  else if (marketWord === 'vegas') state.marketLabel = 'Vegas'; // parity with App.js
   return state;
 }
 

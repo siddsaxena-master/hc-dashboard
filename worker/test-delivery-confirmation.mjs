@@ -107,7 +107,13 @@ function harness(opts = {}) {
       }));
     }
     if (method === 'GET' && url.startsWith(SB + '/rest/v1/field_workers?')) {
-      return reply(200, STAFF);
+      return reply(200, STAFF.map((s) => ({ ...s, active: true, name: s.email.split('@')[0] })));
+    }
+    // The market-wide send reads open shifts to find the clocked-in crew.
+    // Nobody is clocked in here, so every active team phone in the market
+    // is a recipient (Sidd's rule, 2026-09-13).
+    if (method === 'GET' && url.startsWith(SB + '/rest/v1/shifts?')) {
+      return reply(200, []);
     }
     if (method === 'GET' && url.startsWith(SB + '/rest/v1/push_tokens?')) {
       // Honor the email=in.("a","b") filter exactly like PostgREST would,
@@ -191,12 +197,17 @@ test('one confirmed row: one push with the right title, body, market, and one gu
   assert.equal(q.kind, 'alert');
   assert.equal(q.payload.aps.alert.title, 'Delivery time confirmed');
   assert.equal(q.payload.aps.alert.body, 'Acme Beach Club · Sep 11 · 2:00 PM');
-  assert.equal(q.payload.telegram_text, 'Delivery time confirmed: Acme Beach Club · Sep 11 · 2:00 PM');
-  assert.deepEqual(q.payload.fallback_chat_ids, ['111', '222']);
+  // No Telegram copy any more (Sidd, 2026-09-13: everything through the app).
+  assert.equal(q.payload.telegram_text, null);
+  assert.deepEqual(q.payload.fallback_chat_ids, []);
   assert.equal(q.payload.headers.topic, 'com.hamptonscoconuts.field');
-  assert.equal(q.payload.headers.collapse_id, q.id);
-  // Owner plus the NY manager; never the Miami manager, never the crew.
-  assert.deepEqual([...q.payload.tokens].sort(), ['ny-manager-token', 'owner-token']);
+  // Each order's banners share one collapse id so the newest replaces the last.
+  assert.equal(q.payload.headers.collapse_id, 'dep-' + ORDER_ID);
+  assert.equal(q.payload.body.kind, 'confirmed');
+  assert.equal(q.payload.body.order_id, ORDER_ID);
+  // Owner, the NY manager, and the NY crew (nobody is clocked in, so every
+  // active NY team phone); never the Miami manager.
+  assert.deepEqual([...q.payload.tokens].sort(), ['crew-token', 'ny-manager-token', 'owner-token']);
 
   // Exactly one stamp, guarded on id AND the checked_at we read, asking
   // for the changed rows back, writing the whole object plus notified_at.
@@ -329,7 +340,8 @@ test('the banner never carries an email address or a phone number', async () => 
   })] });
   await runScan(h);
   const q = h.queuePosts()[0].body.payload;
-  for (const text of [q.aps.alert.title, q.aps.alert.body, q.telegram_text]) {
+  assert.equal(q.telegram_text, null);
+  for (const text of [q.aps.alert.title, q.aps.alert.body]) {
     assert.doesNotMatch(text, EMAIL_RE);
     assert.doesNotMatch(text, PHONE_RE);
   }

@@ -44,3 +44,17 @@ crons = [
 #     curl -H "X-Setup-Secret: <value>" https://<worker-url>/setup-telegram-webhook
 #   Between the deploy and that call, Telegram deliveries get 401 and are
 #   retried, so do not stop halfway.
+# DEPARTURE PLAN ROUTING (2026-09-13, Sidd chose Apple Maps). Set the three
+# Apple values from the developer account's Maps key (Certificates,
+# Identifiers & Profiles > Keys > a key with the Maps service; Identifiers >
+# a Maps ID). Sidd pastes them himself from his own terminal:
+# APPLE_MAPS_KEY_ID - the 10-character key id from the .p8 file name
+# APPLE_MAPS_TEAM_ID - the Apple developer team id
+# APPLE_MAPS_PRIVATE_KEY - the whole .p8 file text (BEGIN/END lines included)
+# GOOGLE_ROUTES_API_KEY - optional fallback; used only when the Apple trio is
+#   absent. Without either, every plan says "routing unavailable" and sends
+#   no leave-by alerts; it never invents a drive time.
+# Migrations 040 (order_departures) and 041 (crew push tokens) must be live
+# and the droplet drainer swapped BEFORE this Worker is deployed with the
+# departure scan. Deploy from feature/departure-plan (or its merge), never
+# from main (main has none of the field-ops code).
