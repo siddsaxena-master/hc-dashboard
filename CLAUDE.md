@@ -256,6 +256,60 @@ scenario "THE TRAP DEMONSTRATED"). Rules:
   nobody is clocked in; App Review and inactive rows never) is written as SQL
   inside the 041 rehearsal and the worker query must match it.
 
+## Departure plan: the worker's leave-by and LEAVE NOW banners (2026-09-13)
+
+Built on `feature/departure-plan` after the Pridwin wedding miss. Spec:
+`../DEPARTURE-PLAN-2026-09-12.md`. Rule from Sidd: no Telegram anywhere in
+this feature; every message is an HC Field banner.
+
+- `runDeparturePlanScan` runs LAST in the 5-minute chain. For every order in
+  the next two days (stages quoted, invoiced, deposit_paid, paid_full) it
+  reads the confirmed `delivery_request.window` (else the invoice window),
+  parses a clock time, picks the destination (invoice address, then
+  delivery_notes, then venue; incomplete addresses never reach a router),
+  picks the start (NJ garage for ny; the clocked-in spot for vegas/miami),
+  asks the router when `refreshDue` says so (at most 5 route calls a tick),
+  writes ONE `order_departures` row per order, reads the crew's GPS trail
+  for movement, and sends at most one banner per order per tick through
+  `sendPushToMarket`. Honest states: no_time, needs_ampm, no_address,
+  no_route, no_origin (one "Cannot plan" banner a day to owner + manager).
+- Router: Apple Maps Server API (secrets APPLE_MAPS_KEY_ID, APPLE_MAPS_TEAM_ID,
+  APPLE_MAPS_PRIVATE_KEY), Google Routes only as a fallback
+  (GOOGLE_ROUTES_API_KEY). No key: `route_error 'key missing'`, no alerts,
+  never a guessed number. Ferry = a directions step mentioning "ferry";
+  verify with ONE real Shelter Island call after the key lands.
+- Cadence: hourly from 30 h out, every 15 min inside 3 h to leave-by, every
+  5 min inside the last hour or once departed. Buffers 60 min + 30 min ferry.
+- Stages and stamps (`order_departures.alerts`): heads_up (60 min before),
+  leave_now (inside 5 min), late_10/30/60/120/180, moving_no_pickup,
+  running_late (departed, ETA 15+ min late, repeated only when the ETA moves
+  10+ min after 30 min), missed (arrival + 15 min). Silenced jobs stamp but
+  never send the nag stages; missed and running_late always send. A changed
+  arrival time resets the stamps and lifts the silence. Recipients are
+  resolved BEFORE the claim; zero phones = no claim + `no_recipients_at`.
+- Recipients: owners always; same-market managers; the clocked-in team in
+  that market, or every ACTIVE team phone in the market when nobody is
+  clocked in; App Review and inactive rows never; a blank market = owners
+  only. Crew phones need migration 041 to hold a token.
+- `runDayBeforeDepartureScan` runs on the hourly cron: per market, at that
+  market's 18:00 to 21:00, one owner/manager body and one crew body, stable
+  queue ids so a repeat is a no-op.
+- The lock-screen card: `runShiftStatusScan` prints the plan's words
+  ("Leave by 10:55a", "LEAVE NOW · Pridwin", "Late 30m · Pridwin",
+  "ETA 4:45p · Pridwin"); "Stopped" always wins.
+- The crew's taps (on_my_way, left_garage, silence, unsilence,
+  reset_departure) come through `hc_departure_action` (migration 040); the
+  scan echoes each tap to owner + manager once.
+- Tests: `node worker/test-departure-plan.mjs` (pure functions, shared
+  vectors in `worker/test-vectors/window-parse.json`) and
+  `node worker/test-departure-scan.mjs` (the scan against a fake network).
+- Deploy order, each after Sidd's exact "yes do it": migration 040, then 041,
+  then the droplet drainer swap (the deployed 26 KB copy cannot pass
+  `payload.body` or collapse ids to Apple), then `npx wrangler deploy` from
+  feature/departure-plan (NEVER main), then the Apple Maps secrets. Until the
+  secrets exist the scan reports "routing unavailable" and sends nothing but
+  the once-a-day cannot-plan banner.
+
 ## Departure plan, stage 0 truth checks (recorded 2026-09-13, read-only)
 
 Plan: `../DEPARTURE-PLAN-2026-09-12.md` (original + the app-only revision).
