@@ -920,6 +920,10 @@ async function runScheduled(event, env, alsoNotify = true) {
       // zone). Fully wrapped inside; isolated here anyway.
       try { await runDayBeforeDepartureScan(env); }
       catch (e) { if (!hourlyErr) hourlyErr = e; console.error('runDayBeforeDepartureScan error:', e); }
+      // Undecided proposed times: the owner's "Still waiting" banner, on
+      // the D-K cadence with quiet hours. Fully wrapped inside.
+      try { await runStillWaitingScan(env); }
+      catch (e) { if (!hourlyErr) hourlyErr = e; console.error('runStillWaitingScan error:', e); }
       if (hourlyErr) throw hourlyErr;
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
@@ -944,6 +948,9 @@ async function runScheduled(event, env, alsoNotify = true) {
       await runClockInAlertScan(env);
       // Stillness watch is the last field-ops scan and is fully wrapped.
       await runShiftStatusScan(env);
+      // Proposed times from coordinator emails (042) are read first so the
+      // departure plan sees a new proposal on the same tick.
+      await runProposalScan(env);
       // Departure plan (leave-by, LEAVE NOW, late, arrival missed) runs
       // after everything above and is fully wrapped, so a route-budget or
       // router failure can only ever hurt itself.
@@ -1283,7 +1290,7 @@ async function runIntakeNagScan(env) {
     // in-flight rows and window them here - this queue is small.
     const inFlight = await fetchIntake(env,
       'select=id,from_addr,status,created_at,reviewed_at' +
-      '&status=in.(pending_review,approved)&order=created_at.asc');
+      '&status=in.(pending_review,approved)&order=created_at.asc&limit=500');
     if (!inFlight || !inFlight.length) continue;
     const rows = inFlight.filter(r => {
       const since = new Date(intakeWaitingSince(r)).getTime();
@@ -1493,7 +1500,7 @@ async function runIntakeCardScan(env) {
   // for review, no card sent yet, Jarvis has classified it, and the
   // classifier thought it is (or might be) an order.
   const rows = await fetchIntake(env,
-    'select=id,from_addr,subject,raw_text,classification,created_at,external_invoice_id' +
+    'select=id,from_addr,subject,raw_text,classification,created_at,external_invoice_id,order_id' +
     '&status=eq.pending_review' +
     '&telegram_message_id=is.null' +
     '&classified_at=not.is.null' +
@@ -1540,6 +1547,12 @@ async function runIntakeCardScan(env) {
       if (row.external_invoice_id) {
         notes.push('Heads up: invoice #' + row.external_invoice_id +
           ' was created from this email earlier and then voided.');
+      }
+      // Jarvis tied this email to a booked job (2026-09-13). Any time it
+      // proposes is decided in the app, never here (Sidd: no Telegram for
+      // that), so the card only points the way.
+      if (row.order_id) {
+        notes.push('Linked to a booked job. A changed delivery time is decided in the HC Field app (Needs you), not here.');
       }
       // The summary is written BY A MODEL FROM the sender's own email, so
       // a determined sender can influence its wording. Label it, and put
@@ -5581,6 +5594,18 @@ export async function runDeparturePlanScan(env) {
     if (!orders) return counts;
     const existing = await fetchSb(env, 'order_departures?select=*&plan_date=gte.' + todayEt + '&plan_date=lte.' + dayAfter + '&limit=400') || [];
     const plans = new Map(existing.map((p) => [p.order_id, p]));
+    // Undecided proposed times (042): the EARLIEST pending proposal per
+    // order drives the alarm until the owner decides. A missing table
+    // (042 not applied yet) simply means no proposals.
+    const orderIds = orders.map((o) => o.id);
+    const pendingProposals = orderIds.length
+      ? (await fetchSb(env, 'order_time_proposals?select=order_id,intake_id,proposed_arrive_at,proposed_label&status=eq.pending&order_id=in.(' + orderIds.map((id) => encodeURIComponent('"' + id + '"')).join(',') + ')&limit=400') || [])
+      : [];
+    const altByOrder = new Map();
+    for (const pr of pendingProposals) {
+      const cur = altByOrder.get(pr.order_id);
+      if (!cur || new Date(pr.proposed_arrive_at).getTime() < new Date(cur.proposed_arrive_at).getTime()) altByOrder.set(pr.order_id, pr);
+    }
     const since24 = new Date(nowMs - 24 * 3600000).toISOString();
     const openShifts = (await fetchSb(env, 'shifts?select=id,worker_name,worker_email,market,clock_in_at,clock_in_lat,clock_in_lng&clock_out_at=is.null&clock_in_at=gte.' + since24 + '&order=clock_in_at.asc&limit=50') || [])
       .filter((s) => !isAppReviewShift(s));
@@ -5617,6 +5642,10 @@ export async function runDeparturePlanScan(env) {
           arrive_source: arriveSource,
           arrive_kind: parsed.ok ? parsed.kind : 'none',
           arrive_at: parsed.ok ? parsed.arriveAtUtc : null,
+          // An undecided coordinator time rides along; the alarm below uses
+          // the earlier of the two until the owner decides.
+          alt_arrive_at: altByOrder.has(o.id) ? new Date(altByOrder.get(o.id).proposed_arrive_at).toISOString() : null,
+          alt_intake_id: altByOrder.has(o.id) ? altByOrder.get(o.id).intake_id : null,
           origin_kind: origin.kind, origin_lat: origin.lat, origin_lng: origin.lng, origin_label: origin.label, origin_shift_id: origin.shiftId,
           dest_source: dest.source, dest_address: dest.address,
           buffer_seconds: DEPARTURE_BUFFER_SECONDS, ferry_seconds: FERRY_QUEUE_SECONDS,
@@ -5640,8 +5669,16 @@ export async function runDeparturePlanScan(env) {
         else if (origin.kind === 'none') { row.state = 'no_origin'; }
         else row.state = 'pending';
         if (prev.state === 'closed' || prev.state === 'arrived') row.state = prev.state;
-        const arriveMs = row.arrive_at ? new Date(row.arrive_at).getTime() : null;
-        const arriveChanged = !!prev.arrive_at && !!row.arrive_at && new Date(prev.arrive_at).getTime() !== arriveMs;
+        // The alarm runs on the EARLIER of the time on file and an undecided
+        // coordinator time; the row's arrive_at stays the time on file.
+        const onFileMs = row.arrive_at ? new Date(row.arrive_at).getTime() : null;
+        const altMs = row.alt_arrive_at ? new Date(row.alt_arrive_at).getTime() : null;
+        const arriveMs = finite(onFileMs) && finite(altMs) ? Math.min(onFileMs, altMs) : (finite(onFileMs) ? onFileMs : null);
+        const arriveChanged = !!prev.arrive_at && !!row.arrive_at && new Date(prev.arrive_at).getTime() !== onFileMs;
+        const prevAltMs = prev.alt_arrive_at ? new Date(prev.alt_arrive_at).getTime() : null;
+        const prevOnFileMs = prev.arrive_at ? new Date(prev.arrive_at).getTime() : null;
+        const prevAlarmMs = finite(prevOnFileMs) && finite(prevAltMs) ? Math.min(prevOnFileMs, prevAltMs) : (finite(prevOnFileMs) ? prevOnFileMs : null);
+        const altOnlyChanged = !arriveChanged && finite(prevAlarmMs) && finite(arriveMs) && prevAlarmMs !== arriveMs;
         // The route, when due and when we still have budget.
         if (row.state === 'pending' || (row.state === 'planned')) {
           const inputsChanged = destChanged || prev.window_text !== row.window_text || prev.origin_kind !== row.origin_kind || prev.origin_label !== row.origin_label || prev.market !== market;
@@ -5732,6 +5769,17 @@ export async function runDeparturePlanScan(env) {
           const after = await patchDeparture(env, o.id, null, { alerts: reset, silenced_at: null, silenced_by: null, updated_at: nowIso });
           if (after) { alerts = after.alerts || reset; saved.silenced_at = null; }
           unsilencedByTimeChange = !!reset.unsilenced_note;
+        } else if (altOnlyChanged) {
+          // Only the undecided coordinator time moved (a proposal arrived or
+          // was decided): the ladder restarts at the new time but the nags
+          // already sent stay sent, so Keep after "Late 60" never fires
+          // "Late 10" again. The silence, if any, is kept.
+          const carried = {};
+          for (const key of Object.keys(alerts)) {
+            if (/^late_\d+$/.test(key) || key === 'leave_now' || key === 'heads_up' || key === 'moving_no_pickup') carried[key] = alerts[key];
+          }
+          const after = await patchDeparture(env, o.id, null, { alerts: carried, updated_at: nowIso });
+          if (after) alerts = after.alerts || carried;
         }
         // The crew's tap echo, once per tap.
         if (saved.ack_at && (!alerts.ack || alerts.ack.at !== saved.ack_at)) {
@@ -5884,6 +5932,212 @@ export async function departureCardStatusForMarket(env, market, nowMs) {
     console.error('departureCardStatusForMarket error:', e);
     return null;
   }
+}
+// ── proposals: a time read out of an email about a booked job ────────
+// Jarvis links the email to the order (intake_messages.order_id) and the
+// poller folds any PDF text into raw_text. Here we read a clock time out
+// of that text; when it disagrees with the time on file by more than 15
+// minutes (or nothing parsable is on file) we store a PROPOSAL (042) and
+// tell the owner. Nothing here changes the order: the owner's Accept in
+// the app does that, through 038. Approval-first stays the rule.
+function stripContactShapes(text) {
+  return collapseSpaces(String(text || '')
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[email]')
+    .replace(/\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g, '[phone]'));
+}
+function onFileSourceLabel(dr) {
+  if (!dr) return 'no clock time';
+  return dr.source === 'owner' ? 'you, in the app' : 'customer email';
+}
+// The three proposal banners, byte-exact per the push catalogue. ctx:
+// { day, onFileText, onFileSource, onFileChecked, label, evidence, where,
+//   hoursLeft, leaveBy, originLabel, why }
+export function proposalTexts(kind, order, ctx) {
+  const c = ctx || {};
+  const tag = surname(order && order.client_name);
+  const day = weekdayDayLabel(c.day);
+  const onFile = c.onFileText ? `"${c.onFileText}" (${c.onFileSource}${c.onFileChecked ? ', checked ' + formatDeliveryDay(c.onFileChecked) : ''})` : 'no clock time';
+  const onFileShort = c.onFileText ? c.onFileText : 'no clock time';
+  if (kind === 'time_change') {
+    const evidence = c.evidence ? ` (${c.where && c.where.startsWith('attachment:') ? 'PDF timeline' : 'email'}: "${c.evidence}")` : '';
+    return {
+      title: `Time change? ${tag}, ${day}`,
+      body: `A coordinator email says arrive ${c.label}${evidence}. On file: ${onFile}. Open Needs you to Accept or Keep. Until you decide, the alarm uses ${c.label}.`,
+      managerBody: `A coordinator email says arrive ${c.label}, on file ${onFileShort}. Sidd decides in the app. Until then the alarm uses ${c.label}.`,
+    };
+  }
+  if (kind === 'still_waiting') {
+    const leave = c.leaveBy ? ` If ${c.label}: leave ${c.originLabel || 'the garage'} by about ${c.leaveBy}.` : '';
+    return {
+      title: `Still waiting: ${tag} in ${Math.max(0, Math.round(c.hoursLeft || 0))}h`,
+      body: `Email says ${c.label}, on file ${onFileShort}.${leave} The alarm uses ${c.label} until you decide. Open Needs you to Accept or Keep.`,
+      managerBody: null,
+    };
+  }
+  if (kind === 'linked_no_time') {
+    const venue = venueTag(order && (order.venue || order.delivery_notes));
+    const why = c.why === 'no_text_layer' ? 'PDF attached, NOT readable (no text layer). Open it in Outlook.'
+      : c.why === 'reader_missing' ? 'PDF reader not installed, NOT read. Open it in Outlook.'
+      : c.why === 'pdf_no_time' ? 'PDF read, no arrival time found. Open it in Outlook, then set the time in Calendar if it changed.'
+      : 'No attachment; no clock time in the email. Open it in Outlook.';
+    return { title: `Coordinator email: ${tag}${venue ? ' / ' + venue : ''}, ${day}`, body: why, managerBody: null };
+  }
+  return null;
+}
+// Why a linked email yielded no time, from the attachment markers.
+export function linkedNoTimeReason(rawText) {
+  const t = String(rawText || '');
+  if (t.includes('(no text layer, NOT read)')) return 'no_text_layer';
+  if (t.includes('(PDF reader not installed, NOT read)')) return 'reader_missing';
+  if (/=== ATTACHMENT: .+ \(PDF text, /.test(t)) return 'pdf_no_time';
+  return 'no_attachment';
+}
+const LINKED_NO_TIME_MARK = 'linked_no_time notified ';
+export async function runProposalScan(env) {
+  const counts = { seen: 0, proposed: 0, noTime: 0, agree: 0, skipped: 0, failed: 0 };
+  try {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const since = new Date(Date.UTC(...dayInZone(nowMs, 'ny').split('-').map(Number).map((v, i) => (i === 1 ? v - 1 : v))) - 86400000).toISOString().slice(0, 10);
+    const rows = await fetchSb(env, 'intake_messages?select=id,subject,raw_text,order_id,created_at,error_detail,' +
+      'orders!inner(id,client_name,market,venue,delivery_notes,delivery_at_utc,delivery_request,stage)' +
+      '&status=eq.pending_review&order_id=not.is.null&classified_at=not.is.null' +
+      '&orders.delivery_at_utc=gte.' + since + 'T00:00:00Z&order=created_at.desc&limit=50');
+    if (!rows || !rows.length) return counts;
+    const ids = rows.map((r) => r.id).join(',');
+    const existing = await fetchSb(env, 'order_time_proposals?select=intake_id,status&intake_id=in.(' + ids + ')&limit=100');
+    if (!existing) { console.error('proposal scan: proposals table missing or unreadable (migration 042?), nothing done'); return counts; }
+    const have = new Set(existing.map((p) => Number(p.intake_id)));
+    for (const row of rows) {
+      counts.seen++;
+      try {
+        if (have.has(Number(row.id))) { counts.skipped++; continue; }
+        const o = row.orders;
+        if (!o || o.stage === 'cancelled') { counts.skipped++; continue; }
+        const market = marketKey(o.market);
+        const day = String(o.delivery_at_utc || '').slice(0, 10);
+        const dr = o.delivery_request && typeof o.delivery_request === 'object' ? o.delivery_request : null;
+        const onFileText = dr && dr.status === 'confirmed' ? String(dr.window || '').trim() : '';
+        const onFileParsed = onFileText ? parseArrivalTime(onFileText, day, marketZone(market)) : null;
+        const times = extractArrivalTimes(row.raw_text);
+        if (!times.length) {
+          // Linked but no readable time: tell the owner once, mark the row.
+          if (String(row.error_detail || '').startsWith(LINKED_NO_TIME_MARK)) { counts.skipped++; continue; }
+          const texts = proposalTexts('linked_no_time', o, { day, why: linkedNoTimeReason(row.raw_text) });
+          const id = await derivedQueueId('hc-linked-v1', String(row.id));
+          const sent = await sendPushToMarket(env, market, texts.title, texts.body, { recipients: 'manage', queueId: id, collapseId: 'link-' + row.id, threadId: 'link-' + row.id, kind: 'linked_no_time', orderId: o.id, day, data: { intake_id: row.id } });
+          if (sent.queued) {
+            await webhookFetch(env.SUPABASE_URL + '/rest/v1/intake_messages?id=eq.' + row.id + '&status=eq.pending_review', {
+              method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+              body: JSON.stringify({ error_detail: LINKED_NO_TIME_MARK + nowIso }),
+            }, 15000);
+          }
+          counts.noTime++;
+          continue;
+        }
+        const best = times[0];
+        const conflicts = !onFileParsed || !onFileParsed.ok || windowsConflict({ hh: best.hh, mm: best.mm }, { hh: onFileParsed.hh, mm: onFileParsed.mm });
+        if (!conflicts) { counts.agree++; continue; }
+        const proposedArrive = wallClockToUtc(day, best.hh, best.mm, marketZone(market));
+        if (!proposedArrive) { counts.skipped++; continue; }
+        // A newer email about the same job retires older undecided proposals.
+        await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_time_proposals?order_id=eq.' + encodeURIComponent(o.id) + '&status=eq.pending', {
+          method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ status: 'superseded', decided_via: 'newer_email', decided_at: nowIso, updated_at: nowIso }),
+        }, 15000);
+        const insert = await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_time_proposals', {
+          method: 'POST',
+          headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'resolution=ignore-duplicates,return=minimal' }),
+          body: JSON.stringify({
+            intake_id: row.id, order_id: o.id, proposed_arrive_at: proposedArrive, proposed_label: best.label,
+            evidence_line: stripContactShapes(best.line).slice(0, 200), evidence_where: String(best.where || 'body').slice(0, 120),
+            on_file_window: onFileText || null, on_file_checked_at: dr && dr.checked_at ? String(dr.checked_at) : null,
+            found_at: nowIso, updated_at: nowIso,
+          }),
+        }, 15000);
+        if (!insert.ok) { counts.failed++; console.error('proposal insert failed for intake #' + row.id + ':', insert.status); continue; }
+        const texts = proposalTexts('time_change', o, {
+          day, label: best.label, evidence: stripContactShapes(best.line).slice(0, 120), where: best.where,
+          onFileText, onFileSource: onFileSourceLabel(dr), onFileChecked: dr && dr.checked_at,
+        });
+        const ownerId = await derivedQueueId('hc-proposal-v1\0' + row.id, 'owner');
+        const sent = await sendPushToMarket(env, market, texts.title, texts.body, {
+          recipients: 'manage', managerBody: texts.managerBody, queueId: ownerId, collapseId: 'prop-' + row.id, threadId: 'prop-' + row.id,
+          kind: 'time_change', orderId: o.id, day, data: { intake_id: row.id, proposed_label: best.label },
+        });
+        if (sent.queued) counts.proposed++; else counts.failed++;
+      } catch (e) {
+        counts.failed++;
+        console.error('proposal scan failed on intake #' + (row && row.id) + ':', e);
+      }
+    }
+  } catch (e) {
+    console.error('runProposalScan error:', e);
+  }
+  console.log('proposal scan: ' + JSON.stringify(counts));
+  return counts;
+}
+// Hourly: the undecided proposals, on the owner's phone only. Hourly
+// inside 24 h to the job, every 4 h from 72 h down, never 22:00 to 07:00
+// in the market's own zone. A pending proposal the owner has overtaken by
+// hand (a newer owner time) or whose order is cancelled is retired here.
+export async function runStillWaitingScan(env) {
+  const counts = { seen: 0, nagged: 0, retired: 0, skipped: 0, failed: 0 };
+  try {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const rows = await fetchSb(env, 'order_time_proposals?select=*,orders!inner(id,client_name,market,venue,delivery_notes,delivery_at_utc,delivery_request,stage)&status=eq.pending&order=proposed_arrive_at.asc&limit=100');
+    if (!rows || !rows.length) return counts;
+    for (const p of rows) {
+      counts.seen++;
+      try {
+        const o = p.orders;
+        const market = marketKey(o && o.market);
+        const dr = o && o.delivery_request && typeof o.delivery_request === 'object' ? o.delivery_request : null;
+        const checked = dr && dr.checked_at ? new Date(dr.checked_at).getTime() : NaN;
+        const retire = !o || o.stage === 'cancelled' ? 'cancelled'
+          : (dr && dr.source === 'owner' && finite(checked) && checked > new Date(p.found_at).getTime()) ? 'owner_edit' : null;
+        if (retire) {
+          await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_time_proposals?intake_id=eq.' + p.intake_id + '&status=eq.pending', {
+            method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ status: 'superseded', decided_via: retire, decided_at: nowIso, updated_at: nowIso }),
+          }, 15000);
+          counts.retired++;
+          continue;
+        }
+        const arriveMs = new Date(p.proposed_arrive_at).getTime();
+        const hoursLeft = (arriveMs - nowMs) / 3600000;
+        if (!finite(hoursLeft) || hoursLeft > 72 || hoursLeft < -1) { counts.skipped++; continue; }
+        const hour = marketHour(nowMs, market);
+        if (['22', '23', '00', '01', '02', '03', '04', '05', '06'].includes(hour)) { counts.skipped++; continue; }
+        const gapMin = hoursLeft <= 24 ? 55 : 235;
+        if (p.nagged_at && (nowMs - new Date(p.nagged_at).getTime()) < gapMin * 60000) { counts.skipped++; continue; }
+        const plan = (await fetchSb(env, 'order_departures?select=leave_by_at,origin_label,alt_arrive_at&order_id=eq.' + encodeURIComponent(o.id) + '&limit=1') || [])[0];
+        const leaveBy = plan && plan.leave_by_at && plan.alt_arrive_at ? marketTimeStr(plan.leave_by_at, market) : null;
+        const day = String(o.delivery_at_utc || '').slice(0, 10);
+        const texts = proposalTexts('still_waiting', o, { day, label: p.proposed_label, onFileText: p.on_file_window, hoursLeft, leaveBy, originLabel: plan && plan.origin_label });
+        const bucket = String(Math.floor(nowMs / 3600000));
+        const id = await derivedQueueId('hc-stillwaiting-v1\0' + p.intake_id, bucket);
+        const sent = await sendPushToMarket(env, market, texts.title, texts.body, {
+          recipients: 'manage', ownersOnly: true, queueId: id, collapseId: 'prop-' + p.intake_id, threadId: 'prop-' + p.intake_id,
+          kind: 'time_change', orderId: o.id, day, data: { intake_id: p.intake_id, proposed_label: p.proposed_label },
+        });
+        if (sent.queued) {
+          counts.nagged++;
+          await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_time_proposals?intake_id=eq.' + p.intake_id, {
+            method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ nagged_at: nowIso, updated_at: nowIso }),
+          }, 15000);
+        } else counts.failed++;
+      } catch (e) {
+        counts.failed++;
+        console.error('still waiting scan failed on intake #' + (p && p.intake_id) + ':', e);
+      }
+    }
+  } catch (e) {
+    console.error('runStillWaitingScan error:', e);
+  }
+  return counts;
 }
 // ════════════════════════════════════════════════════════════════════
 // end of the departure plan wiring
