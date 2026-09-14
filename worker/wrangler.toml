@@ -58,3 +58,18 @@ crons = [
 # and the droplet drainer swapped BEFORE this Worker is deployed with the
 # departure scan. Deploy from feature/departure-plan (or its merge), never
 # from main (main has none of the field-ops code).
+# TEAM INVITE (2026-09-14, HC Field build 34): POST /team/invite adds a new
+# hire (a Supabase login plus a field_workers row) and, best effort, invites
+# the email to TestFlight. The four values below are OPTIONAL. Without the
+# first three the route still creates the login and the row and answers
+# testflight 'skipped: no App Store Connect key on the worker'. They come
+# from App Store Connect > Users and Access > Integrations > App Store
+# Connect API (a Team key with the App Manager role). All four were loaded
+# on 2026-09-14 (`wrangler secret list` shows the names); to rotate, paste
+# the new value with `wrangler secret put <NAME>`:
+# ASC_KEY_ID - the 10-character key id shown next to the key
+# ASC_ISSUER_ID - the issuer id (a UUID) shown at the top of that page
+# ASC_PRIVATE_KEY - the whole AuthKey_<key id>.p8 file text (BEGIN/END lines
+#   included). Apple hands it out once; keep the file somewhere safe.
+# ASC_CREW_GROUP_ID - optional; the TestFlight beta group a new hire joins.
+#   Defaults in code to the HC crew group 4976ebfe-29f5-47b9-92e7-a314bbb271a1.

@@ -142,6 +142,12 @@ export default {
       return handleDashboardAiRequest(request, env, handleParseFile);
     }
 
+    // HC Field Team screen (build 34): the owner adds a new hire. The phone's
+    // own Supabase token proves who is asking; the service key does the writes.
+    if (url.pathname === '/team/invite') {
+      return handleTeamInvite(request, env);
+    }
+
     // Inbound webhooks (lead sources, phone events, etc.)
     if (url.pathname === '/webhooks/formspree') return handleFormspreeWebhook(request, env);
     if (url.pathname === '/webhooks/quo') return handleQuoWebhook(request, env);
@@ -647,7 +653,9 @@ async function authenticateDashboardOwner(request, env) {
   }
   const profile = Array.isArray(rows) ? rows[0] : rows;
   const email = String(profile && profile.email || '').trim().toLowerCase();
-  if (!email || profile.role !== 'owner') {
+  // The roster stores roles in lowercase, and migration 043 compares
+  // lower(btrim(role)); match that so a stray capital never locks the owner out.
+  if (!email || String((profile && profile.role) || '').trim().toLowerCase() !== 'owner') {
     throw new DashboardRequestError(403, 'Owner access required');
   }
   return { email };
@@ -5420,15 +5428,22 @@ function b64urlBytes(bytes) {
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 const b64urlText = (text) => b64urlBytes(new TextEncoder().encode(text));
-// A 30-minute ES256 token signed with the Maps key, the same shape the
-// drainer mints for Apple push (pushdrain.py _apns_jwt).
+// Signs {header}.{claims} with a P-256 private key (the .p8 text Apple
+// hands out): the ES256 JWT every Apple server API wants. Maps uses it
+// here, App Store Connect uses it for TestFlight invites (team invite
+// section at the end of this file), and the drainer mints the same shape
+// for push (pushdrain.py _apns_jwt).
+async function es256Jwt(privateKeyPem, header, claims) {
+  const head = b64urlText(JSON.stringify(header));
+  const body = b64urlText(JSON.stringify(claims));
+  const key = await crypto.subtle.importKey('pkcs8', pemToPkcs8(privateKeyPem), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, new TextEncoder().encode(head + '.' + body));
+  return head + '.' + body + '.' + b64urlBytes(new Uint8Array(signature));
+}
+// A 30-minute ES256 token signed with the Maps key.
 export async function appleMapsJwt(env, nowMs) {
   const iat = Math.floor((nowMs || Date.now()) / 1000);
-  const header = b64urlText(JSON.stringify({ alg: 'ES256', kid: env.APPLE_MAPS_KEY_ID, typ: 'JWT' }));
-  const claims = b64urlText(JSON.stringify({ iss: env.APPLE_MAPS_TEAM_ID, iat, exp: iat + 1800 }));
-  const key = await crypto.subtle.importKey('pkcs8', pemToPkcs8(env.APPLE_MAPS_PRIVATE_KEY), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
-  const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, new TextEncoder().encode(header + '.' + claims));
-  return header + '.' + claims + '.' + b64urlBytes(new Uint8Array(signature));
+  return es256Jwt(env.APPLE_MAPS_PRIVATE_KEY, { alg: 'ES256', kid: env.APPLE_MAPS_KEY_ID, typ: 'JWT' }, { iss: env.APPLE_MAPS_TEAM_ID, iat, exp: iat + 1800 });
 }
 async function appleMapsAccessToken(env, nowMs) {
   if (appleMapsTokenCache.token && appleMapsTokenCache.expiresAt > nowMs + 60000) return appleMapsTokenCache.token;
@@ -6816,5 +6831,310 @@ export async function runLiveActivityEndScan(env) {
     }
   } catch (e) {
     console.error('runLiveActivityEndScan error:', e);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// TEAM INVITE: POST /team/invite (HC Field Team screen, build 34)
+// ════════════════════════════════════════════════════════════════════
+// The owner adds a new hire from the phone. Migration 043 lets the phone
+// EDIT roster rows through hc_update_field_worker, but a brand new person
+// needs two things a phone can never do: a Supabase login (the auth admin
+// API, service key only) and a roster insert (field_workers is read-only
+// for phones). So the app posts here. The worker proves the caller is an
+// active owner using the caller's OWN token, then does the writes with the
+// service key and, best effort, invites the email to TestFlight so they
+// can install the app. No reply ever carries a token or a key.
+//
+// Request:  POST /team/invite
+//           Authorization: Bearer <the phone's Supabase access token>
+//           Content-Type: application/json
+//           { email, name, role, market, hourly_rate_cents }
+// Replies:  200 { ok: true, worker: { id, email, name, role, market, active,
+//                 hourly_rate_cents }, testflight: 'invited' |
+//                 'already a tester' | 'skipped: <reason>' }
+//           400 { ok: false, error }  a bad field, in plain English
+//           401 { ok: false, error: 'Authentication required' }
+//           403 { ok: false, error: 'Owner access required' }
+//           409 { ok: false, error: 'already on the roster (switch them on from the Team screen)' }
+//           413 { ok: false, error: 'Request body is too large' }
+//           502 { ok: false, error }  Supabase refused the login or the row
+//           503 { ok: false, error }  Supabase could not be reached
+//           500 { ok: false, error: 'Request failed' }  anything unexpected
+
+const ASC_API = 'https://api.appstoreconnect.apple.com/v1';
+// The TestFlight group every crew phone installs from. ASC_CREW_GROUP_ID
+// overrides it without a deploy.
+const ASC_CREW_GROUP_DEFAULT = '4976ebfe-29f5-47b9-92e7-a314bbb271a1';
+const TEAM_ROLES = new Set(['owner', 'manager', 'team']);
+const TEAM_MARKETS = new Set(['ny', 'vegas', 'miami']);
+// Plain email shape: something@something.tld, no spaces, one @.
+const TEAM_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TEAM_DUPLICATE_MESSAGE = 'already on the roster (switch them on from the Team screen)';
+
+class TeamInviteError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// Checks the five fields and hands back the clean versions, or throws a
+// 400 whose words the Team screen shows as written. Mirrors 043's rules
+// so a row created here can always be edited afterwards.
+export function validateTeamInvite(body) {
+  const email = String(body.email == null ? '' : body.email).trim().toLowerCase();
+  if (!email || email.length > 254 || !TEAM_EMAIL_RE.test(email)) {
+    throw new TeamInviteError(400, 'a valid email address is required');
+  }
+  if (typeof body.name !== 'string') {
+    throw new TeamInviteError(400, 'name must be 1 to 80 plain characters');
+  }
+  // Runs of whitespace (tabs, newlines, double spaces) become one space,
+  // the same way 043 stores a name; what is left may hold no control codes.
+  const name = body.name.replace(/\s+/g, ' ').trim();
+  // eslint-disable-next-line no-control-regex
+  if (name.length < 1 || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) {
+    throw new TeamInviteError(400, 'name must be 1 to 80 plain characters');
+  }
+  const role = String(body.role == null ? '' : body.role).trim().toLowerCase();
+  if (!TEAM_ROLES.has(role)) {
+    throw new TeamInviteError(400, 'role must be owner, manager or team');
+  }
+  const market = String(body.market == null ? '' : body.market).trim().toLowerCase();
+  if (!TEAM_MARKETS.has(market)) {
+    throw new TeamInviteError(400, 'market must be ny, vegas or miami');
+  }
+  let rate = body.hourly_rate_cents;
+  if (rate === undefined || rate === null || rate === '') {
+    rate = null;
+  } else {
+    // A text field on the phone may send "1800"; whole digits only.
+    if (typeof rate === 'string' && /^\d+$/.test(rate.trim())) rate = Number(rate.trim());
+    if (!Number.isInteger(rate) || rate < 0 || rate > 25000) {
+      throw new TeamInviteError(400, 'hourly_rate_cents must be a whole number of cents between 0 and 25000');
+    }
+  }
+  return { email, name, role, market, hourly_rate_cents: rate };
+}
+
+// Reads the whole roster (a handful of rows, nowhere near the 1000 cap) so
+// the duplicate check is case-insensitive however an old row was typed.
+async function teamRosterHasEmail(env, email) {
+  let resp;
+  try {
+    // webhookFetch, not fetchSb: a hung connection ends in a tidy 503 after
+    // 15 seconds instead of waiting until Cloudflare gives up on the request.
+    resp = await webhookFetch(env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/field_workers?select=id,email,active',
+      { headers: sbHeaders(env) }, 15000);
+  } catch (e) {
+    console.error('team invite: roster read failed:', e && e.message);
+    throw new TeamInviteError(503, 'the roster could not be read; try again');
+  }
+  let rows = null;
+  try { rows = resp.ok ? await resp.json() : null; } catch { rows = null; }
+  if (!Array.isArray(rows)) throw new TeamInviteError(503, 'the roster could not be read; try again');
+  return rows.some((r) => String((r && r.email) || '').trim().toLowerCase() === email);
+}
+
+// Creates the Supabase login for the email (confirmed, so the code login
+// works on day one) or finds the one that already exists (a former hire,
+// or a retry after a half-finished invite). Returns the auth user id.
+async function teamAuthUserId(env, email) {
+  const base = env.SUPABASE_URL.replace(/\/+$/, '') + '/auth/v1/admin/users';
+  let created;
+  try {
+    created = await webhookFetch(base, {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ email, email_confirm: true }),
+    });
+  } catch (e) {
+    console.error('team invite: auth admin create failed:', e && e.message);
+    throw new TeamInviteError(503, 'the login service could not be reached; try again');
+  }
+  let payload = null;
+  try { payload = await created.json(); } catch { payload = null; }
+  if (created.ok && payload && payload.id) return String(payload.id);
+  const message = String((payload && (payload.msg || payload.message || payload.error_description || payload.error)) || '');
+  // Only a real "already registered" answer counts. A 422 for any other
+  // reason (GoTrue refusing the address) is a failed create, not a lookup.
+  const exists = Boolean(payload && payload.error_code === 'email_exists') || /already|registered|exists/i.test(message);
+  if (!exists) {
+    console.error('team invite: auth admin create returned', created.status);
+    throw new TeamInviteError(502, 'the login could not be created');
+  }
+  let listed;
+  try {
+    listed = await webhookFetch(base + '?page=1&per_page=1000', { headers: sbHeaders(env) });
+  } catch (e) {
+    console.error('team invite: auth admin list failed:', e && e.message);
+    throw new TeamInviteError(503, 'the login service could not be reached; try again');
+  }
+  let list = null;
+  try { list = listed.ok ? await listed.json() : null; } catch { list = null; }
+  const users = list && Array.isArray(list.users) ? list.users : [];
+  const found = users.find((u) => String((u && u.email) || '').trim().toLowerCase() === email);
+  if (!found || !found.id) {
+    console.error('team invite: a registered login could not be found in the admin list');
+    throw new TeamInviteError(502, 'the login exists but could not be found');
+  }
+  // A login that was started but never verified (someone asked for a code
+  // once and stopped) is confirmed here first, so the roster link keeps the
+  // rule from migration 015: no unconfirmed login behind a roster row.
+  if (!found.email_confirmed_at) {
+    let confirmed;
+    try {
+      confirmed = await webhookFetch(base + '/' + encodeURIComponent(String(found.id)), {
+        method: 'PUT',
+        headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ email_confirm: true }),
+      });
+    } catch (e) {
+      console.error('team invite: auth admin confirm failed:', e && e.message);
+      throw new TeamInviteError(503, 'the login service could not be reached; try again');
+    }
+    if (!confirmed.ok) {
+      console.error('team invite: auth admin confirm returned', confirmed.status);
+      throw new TeamInviteError(502, 'the login exists but is unconfirmed');
+    }
+  }
+  return String(found.id);
+}
+
+// The roster insert, with the row asked back so the app can show it.
+async function teamInsertRosterRow(env, fields, authUserId) {
+  let resp;
+  try {
+    resp = await webhookFetch(env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/field_workers', {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+      body: JSON.stringify({
+        email: fields.email,
+        name: fields.name,
+        role: fields.role,
+        market: fields.market,
+        active: true,
+        hourly_rate_cents: fields.hourly_rate_cents,
+        auth_user_id: authUserId,
+      }),
+    });
+  } catch (e) {
+    console.error('team invite: roster insert failed:', e && e.message);
+    throw new TeamInviteError(503, 'the roster could not be reached; try again');
+  }
+  // Two owners tapping at once: the second insert trips the unique email
+  // (23505). Any other conflict (a foreign key, 23503, if the login vanished
+  // between create and insert) is not a duplicate and is never reported as one.
+  if (resp.status === 409) {
+    let conflict = null;
+    try { conflict = await resp.json(); } catch { conflict = null; }
+    const conflictCode = String((conflict && conflict.code) || '');
+    const conflictText = String((conflict && (conflict.message || conflict.details)) || '');
+    if (conflictCode === '23505' || /email/i.test(conflictText)) throw new TeamInviteError(409, TEAM_DUPLICATE_MESSAGE);
+    console.error('team invite: roster insert conflict', conflictCode || resp.status);
+    throw new TeamInviteError(502, 'the roster row could not be created');
+  }
+  let rows = null;
+  try { rows = resp.ok ? await resp.json() : null; } catch { rows = null; }
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row || !row.id) {
+    console.error('team invite: roster insert returned', resp.status);
+    throw new TeamInviteError(502, 'the roster row could not be created');
+  }
+  return {
+    id: row.id,
+    email: row.email,
+    name: row.name,
+    role: row.role,
+    market: row.market,
+    active: row.active,
+    hourly_rate_cents: row.hourly_rate_cents == null ? null : row.hourly_rate_cents,
+  };
+}
+
+// A 19-minute App Store Connect token in Apple's documented shape: the key
+// id in the header, the issuer id as iss, aud appstoreconnect-v1. Apple
+// refuses a token that lasts more than 20 minutes, so the missing minute
+// is the margin for clock drift between Cloudflare and Apple.
+const ASC_TOKEN_SECONDS = 19 * 60;
+export async function appStoreConnectJwt(env, nowMs) {
+  const iat = Math.floor((nowMs || Date.now()) / 1000);
+  return es256Jwt(env.ASC_PRIVATE_KEY, { alg: 'ES256', kid: env.ASC_KEY_ID, typ: 'JWT' },
+    { iss: env.ASC_ISSUER_ID, iat, exp: iat + ASC_TOKEN_SECONDS, aud: 'appstoreconnect-v1' });
+}
+
+// Best effort TestFlight invite. Never throws and never fails the request:
+// the login and the roster row already exist, and Sidd can add the tester
+// by hand in App Store Connect whenever this leg says skipped.
+export async function inviteToTestFlight(env, email, name, nowMs) {
+  if (!env.ASC_KEY_ID || !env.ASC_ISSUER_ID || !env.ASC_PRIVATE_KEY) {
+    return 'skipped: no App Store Connect key on the worker';
+  }
+  try {
+    const jwt = await appStoreConnectJwt(env, nowMs);
+    // "Jayden Martin" -> firstName Jayden, lastName Martin. A one-word
+    // name sends no lastName at all (Apple takes an absent field).
+    const words = String(name || '').trim().split(/\s+/).filter(Boolean);
+    const attributes = { email, firstName: words[0] || '' };
+    if (words.length > 1) attributes.lastName = words.slice(1).join(' ');
+    const body = {
+      data: {
+        type: 'betaTesters',
+        attributes,
+        relationships: { betaGroups: { data: [{ type: 'betaGroups', id: env.ASC_CREW_GROUP_ID || ASC_CREW_GROUP_DEFAULT }] } },
+      },
+    };
+    const resp = await webhookFetch(ASC_API + '/betaTesters', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + jwt, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 15000);
+    if (resp.status === 201) return 'invited';
+    if (resp.status === 409) return 'already a tester';
+    return 'skipped: ' + resp.status;
+  } catch (e) {
+    console.error('team invite: TestFlight leg failed:', e && e.message);
+    return 'skipped: ' + (e && e.name === 'AbortError' ? 'timeout' : 'network error');
+  }
+}
+
+// Team replies carry a person's email and pay rate, so they never sit in
+// any cache. (jsonResponse adds the dashboard's CORS headers, which a
+// native app does not need.)
+function teamReply(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
+}
+
+async function handleTeamInvite(request, env) {
+  try {
+    // 1. Who is asking? The phone's own token, checked exactly the way the
+    //    dashboard AI routes check theirs: hc_claim_field_worker returns the
+    //    caller's roster row only while that row is active, and the role
+    //    must be owner. No token 401, a non-owner 403.
+    await authenticateDashboardOwner(request, env);
+    // 2. What are they asking for? A bad field is a 400 in plain English.
+    const fields = validateTeamInvite(await readDashboardJson(request));
+    // 3. Nobody gets two roster rows. A former hire is switched back on
+    //    from the Team screen instead (043 keeps their history).
+    if (await teamRosterHasEmail(env, fields.email)) {
+      throw new TeamInviteError(409, TEAM_DUPLICATE_MESSAGE);
+    }
+    // 4. The login, then the roster row. The phone can do neither.
+    const authUserId = await teamAuthUserId(env, fields.email);
+    const worker = await teamInsertRosterRow(env, fields, authUserId);
+    // 5. TestFlight, best effort; the answer rides along in the reply.
+    const testflight = await inviteToTestFlight(env, fields.email, fields.name);
+    console.log('team invite: ' + fields.email + ' added; testflight ' + testflight);
+    return teamReply({ ok: true, worker, testflight });
+  } catch (error) {
+    if (error instanceof TeamInviteError || error instanceof DashboardRequestError) {
+      return teamReply({ ok: false, error: error.message }, error.status);
+    }
+    console.error('team invite failed:', error && error.message);
+    return teamReply({ ok: false, error: 'Request failed' }, 500);
   }
 }
