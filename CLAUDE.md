@@ -330,7 +330,14 @@ this feature; every message is an HC Field banner.
   secrets exist the scan reports "routing unavailable" and sends nothing but
   the once-a-day cannot-plan banner.
 
-## Team roster edits from the phone (migration 043, written 2026-09-14)
+## Team roster edits from the phone (migration 043, LIVE 2026-09-14)
+
+APPLIED 2026-09-14 05:56 UTC via the SQL editor paste recipe (18,337 bytes,
+sha1 a01a5d6b). Droplet probe: field_worker_edits answers 200 [] with the
+service key and 401 without a bearer; hc_update_field_worker answers 401
+without a bearer and 403/42501 for service_role (only a signed-in owner phone
+may call it). Rollback: `043_team_roster_edit_rollback.sql` (roster rows are
+not restored by it).
 
 `migrations/043_team_roster_edit.sql` adds `hc_update_field_worker(worker,
 patch)` (owner only; name, role owner|manager|team, market ny|vegas|miami,
@@ -387,6 +394,21 @@ Probed from the droplet with the app's exact parameter names.
   head 79ad7ba (`npx --yes wrangler@latest deploy`, wrangler 4.131.1,
   252.93 KiB). Previous live version 3a9ae8e1 (2026-09-10) is the rollback
   target. Deploy only from feature/departure-plan until it is merged.
+- WORKER DEPLOYED AGAIN 2026-09-14 14:01 UTC (Sidd's "yes do it all"): live
+  version 0ed08287-0cdb-452a-851e-5ed5680050a4 from feature/departure-plan
+  head ca106bb (wrangler 4.131.2, 267.14 KiB). Adds POST /team/invite (the
+  Team screen's "Add someone": owner-only, creates the Supabase login and
+  the field_workers row, best-effort TestFlight invite with a 19-minute App
+  Store Connect token; contract in worker/test-team-invite.mjs) and the
+  structured lock-screen card fields (stage, headline, jobTag, leaveByISO,
+  etaISO, lateMinutes; build 33 phones ignore them). Probed live: no token
+  and a garbage token both answer 401 {"ok":false,"error":"Authentication
+  required"} with Cache-Control no-store; GET still falls through to the
+  "bot is running" text. Rollback target: acb7b4de.
+- ASC SECRETS SET 2026-09-14 ~05:50 UTC: ASC_KEY_ID, ASC_ISSUER_ID,
+  ASC_PRIVATE_KEY (hc-field-app/credentials/AuthKey_MJTT8WC4HJ.p8, the same
+  key finish_testflight.py uses) and ASC_CREW_GROUP_ID (the external crew
+  group). Names only; `wrangler secret list` shows them.
 - APPLE MAPS SECRETS SET 2026-09-14 ~02:55 UTC (Sidd's "keep going"): key
   "HC Maps Server" LWC6536DM2 on Maps ID maps.com.hamptonscoconuts.field,
   APPLE_MAPS_KEY_ID / APPLE_MAPS_TEAM_ID / APPLE_MAPS_PRIVATE_KEY loaded with
