@@ -330,6 +330,21 @@ this feature; every message is an HC Field banner.
   secrets exist the scan reports "routing unavailable" and sends nothing but
   the once-a-day cannot-plan banner.
 
+## Team roster edits from the phone (migration 043, written 2026-09-14)
+
+`migrations/043_team_roster_edit.sql` adds `hc_update_field_worker(worker,
+patch)` (owner only; name, role owner|manager|team, market ny|vegas|miami,
+active, hourly_rate_cents 0..25000) and the audit table `field_worker_edits`.
+Guards: never your own role or access, never the last active owner, never
+the App Review login's role/market/access, never someone still clocked in.
+Switching off deletes push_tokens + live_activity_tokens for that email;
+demotion to team deletes the card tokens. Email never changes (a new email
+is a new row + auth user). Rehearse:
+`node rehearsal/run-043-team-roster-edit-pglite.mjs <pglite dir>` (44
+scenarios). Apply after 041 (any time). The HC Field Team screen (build 34)
+is the caller. Offboarding by hand until then: scratchpad offboard scripts
+(roster flag + tokens on the droplet, TestFlight tester on the laptop).
+
 ## Departure plan, stage 0 truth checks (recorded 2026-09-13, read-only)
 
 Plan: `../DEPARTURE-PLAN-2026-09-12.md` (original + the app-only revision).
