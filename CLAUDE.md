@@ -405,6 +405,17 @@ Probed from the droplet with the app's exact parameter names.
   and a garbage token both answer 401 {"ok":false,"error":"Authentication
   required"} with Cache-Control no-store; GET still falls through to the
   "bot is running" text. Rollback target: acb7b4de.
+- WORKER DEPLOYED 2026-09-14 16:45 UTC (Sidd's "yes do it"): live version
+  1dcf73f0-5e52-4053-a714-6abbfdefa065 from feature/departure-plan head
+  42086c9. THE FIRST REAL FALSE ALARM of the proposal scan: a customer's
+  reply quoted "On Mon, Sep 14, 2026 at 1:24 AM Sidd Saxena
+  <sidd@hamptonscoconuts.com> wrote:", "hamptons" inside the address counted
+  as the brand keyword, and the app asked Sidd about "1:24 AM".
+  extractArrivalTimes now skips reply attribution and Sent/Date/Received/
+  Submitted lines outright and reads keywords with addresses and phones
+  blanked out (test-departure-plan.mjs 12b pins the exact shape). The one
+  false row (intake 63184) was retired by hand: status superseded,
+  decided_via cancelled. Rollback target: 0ed08287.
 - ASC SECRETS SET 2026-09-14 ~05:50 UTC: ASC_KEY_ID, ASC_ISSUER_ID,
   ASC_PRIVATE_KEY (hc-field-app/credentials/AuthKey_MJTT8WC4HJ.p8, the same
   key finish_testflight.py uses) and ASC_CREW_GROUP_ID (the external crew
