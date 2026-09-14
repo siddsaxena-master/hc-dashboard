@@ -351,12 +351,19 @@ Probed from the droplet with the app's exact parameter names.
 - push_queue columns: id, kind, outbox_type, payload, attempts, claimed_at,
   created_at, next_attempt_at, done_at, last_error, dead_lettered_at,
   dead_letter_reason. There is NO delivered_at; done_at is the success stamp.
-- Deployed droplet drainer: /opt/jarvis-invoice-bot/pushdrain.py = 26,084 bytes,
-  sha1 cb11c963b3226d032cd16ee6e990dbc519081787 (the 2026-08-04 original). It
-  imports cryptography, has no la_update handling, forwards neither
-  apns-collapse-id nor apns-expiration, and cannot carry content.data. The repo
-  copy is 67,068 bytes, sha1 563c1acabdb2aee522c09350b56ef980b8c0ceae. Swap it
-  before the departure worker deploy (stage 1), Sidd watching.
+- Deployed droplet drainer, SWAPPED 2026-09-14 02:01:43 UTC (Sidd's "yes do
+  it"): /opt/jarvis-invoice-bot/pushdrain.py is now the repo copy, 75,355
+  bytes, sha1 b3f81475be424bd00fdf848108e50e213d069b1f (commit c0958c8 on
+  feature/departure-plan; custom "body" key, collapse/expiration headers,
+  413 handling, la_update). Rollback copy kept beside it:
+  pushdrain.py.bak-aug4-cb11c963 (26,084 bytes, sha1 cb11c963..., the
+  2026-08-04 original). Startup log: "pushdrain starting: interval=20s
+  apns=on", heartbeats depth=0, plus one expected ERROR line "webhook
+  Telegram outbox configuration problem: the current webhook outbox
+  encryption key is missing" (WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT is not in
+  the droplet .env; no webhook_telegram rows exist; one Telegram health notice
+  to the owner per 6 h). Queue at swap time: 0 pending, last 7 days all
+  'push' rows (la_update + alert), all delivered.
 - No ghost 'Canelle' inquiry rows; only the real order 567ba3a6.
 - Worker branch fix/worker-intake-and-vegas tip db94db4; the departure work
   continues on feature/departure-plan cut from it. main has no field-ops code.
