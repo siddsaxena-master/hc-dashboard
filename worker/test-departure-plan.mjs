@@ -328,6 +328,21 @@ assert.deepEqual(extractArrivalTimes('Coconut delivery 2').map((t) => t.hh), [])
 times = extractArrivalTimes('3:00 PM vendor arrival\n2:00 PM Hamptons Coconuts\n1:00 PM delivery of chairs\n1:00 PM coconut water');
 assert.deepEqual(times.map((t) => t.hh), [13, 14, 15]);
 pass('extractArrivalTimes: coordinator body yields nothing, attachment lines yield the coconut time, tables paired, ceremony lines excluded, phones ignored');
+// 12b. Mail plumbing never proposes a time (the 2026-09-14 "1:24 AM" false
+// alarm: a customer's reply quoted Sidd's 1:24 AM email, and his address
+// carries the word "hamptons").
+const replyHeader = 'Thanks Sidd, that works for us.\n\nOn Mon, Sep 14, 2026 at 1:24 AM Sidd Saxena <sidd@hamptonscoconuts.com<mailto:sidd@hamptonscoconuts.com>> wrote:\n> Hi Nadege, following up on the quote.';
+assert.deepEqual(extractArrivalTimes(replyHeader), []);
+assert.deepEqual(extractArrivalTimes('From: Hamptons Coconuts <sidd@hamptonscoconuts.com>\nSent: Monday, September 14, 2026 1:24 AM\nTo: Charles'), []);
+assert.deepEqual(extractArrivalTimes('Submitted 04:56 PM - 11 May 2026\nName: Charles'), []);
+assert.deepEqual(extractArrivalTimes('On Mon, Sep 14, 2026 at 1:24 AM Hamptons Coconuts <sidd@hamptonscoconuts.com>\nwrote:'), []);
+assert.deepEqual(extractArrivalTimes('> On 9/14/2026 at 1:24 AM, Hamptons Coconuts wrote:'), []);
+assert.deepEqual(extractArrivalTimes('Meeting at 9:00 AM with sidd@hamptonscoconuts.com'), []);
+// The real thing right after a reply header still reads, and a line that
+// merely starts with "on" is not a header.
+assert.deepEqual(extractArrivalTimes('On Mon, Sep 14, 2026 at 1:24 AM Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n> Coconuts should arrive by 2:00 PM please').map((t) => t.hh), [14]);
+assert.deepEqual(extractArrivalTimes('On site vendor arrival at 2:00 PM').map((t) => t.hh), [14]);
+pass('extractArrivalTimes: reply attribution, Sent/Date/Submitted headers and addresses never yield a time; the coconut line after a header still does');
 assert.equal(windowsConflict({ hh: 14, mm: 0 }, { hh: 15, mm: 30 }), true);
 assert.equal(windowsConflict({ hh: 15, mm: 30 }, { hh: 15, mm: 40 }), false);
 assert.equal(windowsConflict(null, { hh: 15, mm: 30 }), false);

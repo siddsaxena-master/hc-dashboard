@@ -5110,6 +5110,15 @@ function rankOf(line) {
   if (l.includes('vendor')) return 1;
   return 2;
 }
+// Email plumbing that carries a clock but never a delivery time: the
+// quoted-reply attribution ("On Mon, Sep 14, 2026 at 1:24 AM Sidd Saxena
+// <...> wrote:"), Outlook's "Sent:" and "Date:" headers, a form's
+// "Submitted 04:56 PM". On 2026-09-14 a reply header proposed "1:24 AM" for
+// a real job because the operator's own address contains "hamptons".
+const MAIL_HEADER_RE = /^(?:>\s*)*(?:on\s+(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+)?(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}|\d{1,2}[\/.-]\d{1,2})|(?:sent|date|received|submitted)\b\s*[:\-]?\s)/i;
+function isMailHeaderLine(line) {
+  return MAIL_HEADER_RE.test(String(line || '').trim());
+}
 export function extractArrivalTimes(rawText) {
   const lines = String(rawText || '').slice(0, 100000).split(/\r?\n/);
   const entries = [];
@@ -5146,8 +5155,14 @@ export function extractArrivalTimes(rawText) {
   for (const entry of merged) {
     const line = collapseSpaces(entry.text);
     if (!line) continue;
+    // A reply header or a Sent/Date line is skipped whole, and it never
+    // lends its words to the line after it.
+    if (isMailHeaderLine(line)) { previous = ''; continue; }
     const tokens = explicitClockTokens(line);
-    const lower = line.toLowerCase();
+    // Keywords are read with addresses and phone numbers blanked out, so
+    // "hamptons" inside an email address is never a sign of our delivery.
+    const safe = stripContactShapes(line);
+    const lower = safe.toLowerCase();
     if (tokens.length) {
       const context = lower + ' ' + previous.toLowerCase();
       const keyword = TIME_KEYWORDS.some((k) => context.includes(k));
@@ -5155,10 +5170,10 @@ export function extractArrivalTimes(rawText) {
       const excluded = !own && TIME_EXCLUDES.some((k) => lower.includes(k));
       if (keyword && !excluded) {
         const earliest = tokens.reduce((best, t) => (t.hh * 60 + t.mm < best.hh * 60 + best.mm ? t : best));
-        found.push({ hh: earliest.hh, mm: earliest.mm, label: clockLabel(earliest.hh, earliest.mm), line: line.slice(0, 90), where: entry.where, rank: rankOf(line) });
+        found.push({ hh: earliest.hh, mm: earliest.mm, label: clockLabel(earliest.hh, earliest.mm), line: line.slice(0, 90), where: entry.where, rank: rankOf(safe) });
       }
     }
-    previous = line;
+    previous = safe;
   }
   found.sort((a, b) => a.rank - b.rank || (a.hh * 60 + a.mm) - (b.hh * 60 + b.mm));
   const seen = new Set();
