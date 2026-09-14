@@ -1,5 +1,6 @@
 [
   { "input": "As close to 3:30/4 PM as possible", "day": "2026-09-12", "tz": "America/New_York", "expect": { "ok": true, "kind": "range", "hh": 15, "mm": 30, "arriveAtUtc": "2026-09-12T19:30:00.000Z", "label": "3:30 PM" } },
+  { "input": "not after 2:00 PM", "day": "2026-09-12", "tz": "America/New_York", "expect": { "ok": true, "kind": "deadline", "hh": 14, "mm": 0, "arriveAtUtc": "2026-09-12T18:00:00.000Z", "label": "2:00 PM" } },
   { "input": "2pm", "day": "2026-09-12", "tz": "America/New_York", "expect": { "ok": true, "kind": "exact", "hh": 14, "mm": 0, "arriveAtUtc": "2026-09-12T18:00:00.000Z", "label": "2:00 PM" } },
   { "input": "2:00 PM", "day": "2026-09-12", "tz": "America/New_York", "expect": { "ok": true, "kind": "exact", "hh": 14, "mm": 0, "arriveAtUtc": "2026-09-12T18:00:00.000Z", "label": "2:00 PM" } },
   { "input": "14:00", "day": "2026-09-12", "tz": "America/New_York", "expect": { "ok": true, "kind": "exact", "hh": 14, "mm": 0, "arriveAtUtc": "2026-09-12T18:00:00.000Z", "label": "2:00 PM" } },

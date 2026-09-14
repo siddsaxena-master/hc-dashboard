@@ -17,7 +17,8 @@ import { fileURLToPath } from 'node:url';
 import {
   parseArrivalTime, wallClockToUtc, etHour, marketHour, marketTimeStr, weekdayDayLabel, dayBefore, hmsLabel,
   departureDestination, originFor, leaveByMs, refreshDue, movementState, pickupSeenByGps, alertStage,
-  departureQueueId, cardStatus, routeSanity, extractArrivalTimes, windowsConflict, pushBodyByteCap,
+  departureQueueId, cardStatus, departureCard, cardJobTag, buildLiveActivityContentState,
+  routeSanity, extractArrivalTimes, windowsConflict, pushBodyByteCap,
   departureAlertTexts, onShiftLine, dayBeforeLines, stripDateShapes,
   DEPARTURE_BUFFER_SECONDS, FERRY_QUEUE_SECONDS, ROUTE_CALLS_PER_TICK_MAX,
 } from './worker.js';
@@ -221,6 +222,87 @@ assert.equal(cs({ movement: 'moving_no_pickup' }), 'No pickup · Pridwin');
 assert.equal(cardStatus({ plan: { ...PLAN, venue: "Gurney's Montauk Resort" }, nowMs: T('2026-09-12T15:00:00Z'), movement: 'nobody', market: 'ny' }), "LEAVE NOW · Gurney's");
 for (const text of [cs(), cs({ nowMs: T('2026-09-12T17:42:00Z') }), cs({ movement: 'arrived' })]) assert.ok(text.length <= 20, text);
 pass('cardStatus: every lock-screen status fits 20 characters and reads as the catalogue says');
+
+// ── 10b. departureCard: the structured card build 34 renders ────────
+const dc = (extra) => departureCard({ plan: PLAN, nowMs: T('2026-09-12T13:00:00Z'), movement: 'nobody', etaMs: null, market: 'ny', order: ORDER, ...extra });
+assert.deepEqual(dc(), {
+  status: 'Leave by 10:55a', stage: 'garage', headline: 'Leave by 10:55 AM', jobTag: 'Canelle / Pridwin',
+  leaveByISO: '2026-09-12T14:55:00.000Z', etaISO: null, lateMinutes: null,
+});
+// The first ten minutes past leave-by are LEAVE NOW, not a late count.
+assert.deepEqual(dc({ nowMs: T('2026-09-12T15:00:00Z') }), { ...dc(), status: 'LEAVE NOW · Pridwin', headline: 'LEAVE NOW' });
+assert.deepEqual(dc({ nowMs: T('2026-09-12T15:25:00Z') }), { ...dc(), status: 'Late 30m · Pridwin', headline: 'Late 30m', lateMinutes: 30 });
+assert.deepEqual(dc({ nowMs: T('2026-09-12T17:42:00Z') }), { ...dc(), status: 'Late 2h47m · Pridwin', headline: 'Late 2h47m', lateMinutes: 167 });
+// En route: the ETA clock is on the headline whenever it is known; the
+// 20-character words only say ETA when it is later than the arrival time.
+assert.deepEqual(dc({ movement: 'departed', etaMs: T('2026-09-12T20:45:00Z') }), { ...dc(), status: 'ETA 4:45p · Pridwin', stage: 'enroute', headline: 'ETA 4:45 PM', etaISO: '2026-09-12T20:45:00.000Z' });
+assert.deepEqual(dc({ movement: 'departed', etaMs: T('2026-09-12T19:00:00Z') }), { ...dc(), status: 'Enroute', stage: 'enroute', headline: 'ETA 3:00 PM', etaISO: '2026-09-12T19:00:00.000Z' });
+assert.deepEqual(dc({ movement: 'departed' }), { ...dc(), status: 'Enroute', stage: 'enroute', headline: 'En route' });
+assert.deepEqual(dc({ movement: 'arrived', nowMs: T('2026-09-12T21:00:00Z') }), { ...dc(), status: 'On site · Pridwin', stage: 'arrived', headline: 'On site' });
+// Moving without a pickup keeps its warning words even when late.
+assert.deepEqual(dc({ movement: 'moving_no_pickup', nowMs: T('2026-09-12T15:25:00Z') }), { ...dc(), status: 'No pickup · Pridwin', stage: 'enroute', headline: 'No pickup' });
+// No leave-by yet: nothing to say, and nothing to count down to.
+assert.deepEqual(dc({ plan: { ...PLAN, leave_by_at: null } }), { ...dc(), status: '', headline: '', leaveByISO: null });
+// Vegas reads its own clock and never gets a " PT" suffix on the card.
+assert.equal(dc({ plan: { ...PLAN, market: 'vegas' }, market: 'vegas' }).headline, 'Leave by 7:55 AM');
+assert.equal(dc({ plan: { ...PLAN, market: 'vegas' }, market: 'vegas' }).status, 'Leave by 7:55a');
+// The words never drift from cardStatus: same tree, same text.
+for (const extra of [{}, { nowMs: T('2026-09-12T15:00:00Z') }, { nowMs: T('2026-09-12T17:42:00Z') }, { movement: 'departed', etaMs: T('2026-09-12T20:45:00Z') }, { movement: 'arrived' }, { movement: 'moving_no_pickup' }]) {
+  assert.equal(dc(extra).status, cs(extra));
+}
+pass('departureCard: stage, headline, leaveByISO, etaISO and lateMinutes for every movement, words identical to cardStatus');
+
+// ── 10c. cardJobTag never carries an email, a phone or a dollar ─────
+assert.equal(cardJobTag(ORDER, PLAN.dest_address), 'Canelle / Pridwin');
+assert.equal(cardJobTag({ client_name: 'Abigail Canelle', delivery_notes: 'Pridwin Hotel, Shelter Island, NY' }, null), 'Canelle / Pridwin');
+assert.equal(cardJobTag(null, 'Pridwin Hotel, Shelter Island, NY'), 'Pridwin');
+assert.equal(cardJobTag({ client_name: 'abigail@example.invalid', venue: 'Pridwin Hotel' }, null), 'Pridwin');
+assert.equal(cardJobTag({ client_name: '862-899-1468', venue: 'Pridwin Hotel' }, null), 'Pridwin');
+assert.equal(cardJobTag({ client_name: '$500 Deposit', venue: 'Pridwin Hotel' }, null), 'Deposit / Pridwin');
+assert.equal(cardJobTag({ client_name: 'Marcus Lee', venue: '74 Wythe Ave, Brooklyn' }, null), 'Lee / Wythe');
+// A venue with no safe word falls through to the delivery notes, then the plan's destination.
+assert.equal(cardJobTag({ client_name: 'Marcus Lee', venue: '74', delivery_notes: 'Wythe Hotel, Brooklyn' }, null), 'Lee / Wythe');
+assert.equal(cardJobTag({ client_name: 'Marcus Lee', venue: '74', delivery_notes: '(917) 555-0100' }, 'Pridwin Hotel'), 'Lee / Pridwin');
+assert.equal(cardJobTag({ client_name: 'Tom Baker', venue: "Gurney's Montauk Resort" }, null), "Baker / Gurney's");
+assert.equal(cardJobTag({ client_name: 'Dana Ruiz', venue: 'Southampton, NY' }, null), 'Ruiz / Southamp');
+assert.equal(cardJobTag({ client_name: 'Anna Wolfeschlegelsteinhausen', venue: '' }, ''), 'Wolfeschlege');
+assert.equal(cardJobTag({ client_name: 'sales@example.invalid', venue: '$$$' }, '917-555-0100'), null);
+for (const o of [ORDER, { client_name: 'a@b.c', venue: '$9 (555) 123-4567' }, { client_name: 'Jo (917) 555-0100', venue: 'Pier 17' }]) {
+  const tag = cardJobTag(o, 'Pridwin Hotel') || '';
+  assert.ok(!/[@$\d]/.test(tag), tag);
+}
+pass('cardJobTag: surname / venue word, emails, phones, street numbers and dollars dropped, null when nothing safe is left');
+
+// ── 10d. the content state carries the card's keys only when present ─
+const REPORT = '2026-09-12T12:58:00.000Z';
+const OLD_SHAPE = { status: 'At NJ Garage', statusMinutes: 0, lastReportISO: REPORT, marketLabel: 'NJ' };
+assert.deepEqual(buildLiveActivityContentState('At NJ Garage', 0, REPORT, 'ny'), OLD_SHAPE);
+assert.deepEqual(buildLiveActivityContentState('At NJ Garage', 0, REPORT, 'ny', null), OLD_SHAPE);
+const garageCard = dc();
+assert.deepEqual(buildLiveActivityContentState(garageCard.status, 0, REPORT, 'ny', garageCard), {
+  status: 'Leave by 10:55a', statusMinutes: 0, lastReportISO: REPORT, marketLabel: 'NJ',
+  stage: 'garage', headline: 'Leave by 10:55 AM', jobTag: 'Canelle / Pridwin', leaveByISO: '2026-09-12T14:55:00.000Z',
+});
+const lateCard = dc({ nowMs: T('2026-09-12T15:25:00Z') });
+assert.deepEqual(buildLiveActivityContentState(lateCard.status, 0, REPORT, 'ny', lateCard), {
+  status: 'Late 30m · Pridwin', statusMinutes: 0, lastReportISO: REPORT, marketLabel: 'NJ',
+  stage: 'garage', headline: 'Late 30m', jobTag: 'Canelle / Pridwin', leaveByISO: '2026-09-12T14:55:00.000Z', lateMinutes: 30,
+});
+const etaCard = dc({ movement: 'departed', etaMs: T('2026-09-12T20:45:00Z') });
+assert.deepEqual(buildLiveActivityContentState(etaCard.status, 0, REPORT, 'ny', etaCard), {
+  status: 'ETA 4:45p · Pridwin', statusMinutes: 0, lastReportISO: REPORT, marketLabel: 'NJ',
+  stage: 'enroute', headline: 'ETA 4:45 PM', jobTag: 'Canelle / Pridwin', leaveByISO: '2026-09-12T14:55:00.000Z', etaISO: '2026-09-12T20:45:00.000Z',
+});
+// The key order is fixed: the update path fingerprints the JSON text.
+assert.deepEqual(Object.keys(buildLiveActivityContentState(etaCard.status, 0, REPORT, 'ny', etaCard)),
+  ['status', 'statusMinutes', 'lastReportISO', 'marketLabel', 'stage', 'headline', 'jobTag', 'leaveByISO', 'etaISO']);
+// Stopped wins: a stale GPS never gets a countdown or a late count painted over it.
+assert.deepEqual(buildLiveActivityContentState('Stopped', 30, REPORT, 'ny', lateCard), { status: 'Stopped', statusMinutes: 30, lastReportISO: REPORT, marketLabel: 'NJ' });
+// Garbage in the card adds nothing: unknown stage, bad dates, a zero or negative late count.
+assert.deepEqual(buildLiveActivityContentState('Enroute', 0, REPORT, 'ny', { stage: 'flying', headline: '  ', jobTag: null, leaveByISO: 'nope', etaISO: '', lateMinutes: -3 }),
+  { status: 'Enroute', statusMinutes: 0, lastReportISO: REPORT, marketLabel: 'NJ' });
+assert.deepEqual(buildLiveActivityContentState('Enroute', 0, REPORT, 'ny', { stage: 'Enroute', lateMinutes: 0 }), { status: 'Enroute', statusMinutes: 0, lastReportISO: REPORT, marketLabel: 'NJ', stage: 'enroute' });
+pass('buildLiveActivityContentState: old shape without a card, six optional keys with one, Stopped drops them, garbage adds nothing');
 
 // ── 11. routeSanity ─────────────────────────────────────────────────
 assert.deepEqual(routeSanity({ meters: 186700, driveSeconds: 11100, endLat: PRIDWIN.lat, endLng: PRIDWIN.lng, originLat: GARAGE.lat, originLng: GARAGE.lng, marketCenter: GARAGE }), { ok: true, reason: null });

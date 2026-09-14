@@ -3840,7 +3840,7 @@ function distMeters(lat1, lng1, lat2, lng2) {
 // a stop alerts once at ~15 and once at ~45 with nothing stored, and a
 // long-stale shift discovered after a deploy (age already 90+) never
 // storms. NEVER throws (own try/catch top to bottom).
-async function runShiftStatusScan(env) {
+export async function runShiftStatusScan(env) {
   try {
     const since = new Date(Date.now() - 24 * 3600000).toISOString();
     const shifts = await fetchSb(env, 'shifts?select=id,worker_name,worker_email,market,clock_in_at,clock_in_lat,clock_in_lng' +
@@ -3885,12 +3885,16 @@ async function runShiftStatusScan(env) {
           // When a departure plan exists for this market today, the card
           // says "Leave by 10:55a", "LEAVE NOW · Pridwin", "Late 30m · ..."
           // or "ETA 4:45p · ..." instead. "Stopped" always wins: a stale
-          // GPS is a safety signal.
+          // GPS is a safety signal, so the plan is not even consulted.
+          // The whole card rides in laStatus: its .status is the 20-char
+          // line every build renders, the rest (stage, headline, jobTag,
+          // leaveByISO, etaISO, lateMinutes) feeds build 34's countdown,
+          // ETA clock and journey bar.
           if (laStatus !== 'Stopped') {
             const mk = marketKey(row.market);
             if (!cardByMarket.has(mk)) cardByMarket.set(mk, await departureCardStatusForMarket(env, mk, Date.now()));
-            const planWords = cardByMarket.get(mk);
-            if (planWords) laStatus = planWords;
+            const card = cardByMarket.get(mk);
+            if (card) laStatus = card;
           }
           await updateShiftLiveActivity(
             env, row.id, laStatus, laMins, p.at, row.market,
@@ -4753,7 +4757,7 @@ export function parseArrivalTime(windowText, day, tz) {
   let kind = 'exact';
   if (converted.some((t) => t.assumed)) kind = 'assumed';
   else if (converted.length >= 2) kind = 'range';
-  else if (/(?:\bby|\bbefore|\bno later than|\buntil)\s*$/.test(stripped.text.slice(Math.max(0, chosen.start - 14), chosen.start))) kind = 'deadline';
+  else if (/(?:\bby|\bbefore|\bno later than|\bnot after|\buntil)\s*$/.test(stripped.text.slice(Math.max(0, chosen.start - 14), chosen.start))) kind = 'deadline';
   const arriveAtUtc = wallClockToUtc(day, chosen.hh, chosen.mm, tz || ET_ZONE);
   return { ok: true, kind, hh: chosen.hh, mm: chosen.mm, arriveAtUtc, label: clockLabel(chosen.hh, chosen.mm) };
 }
@@ -4967,25 +4971,119 @@ function venueTag(venue) {
   const word = collapseSpaces(venue).split(' ')[0] || '';
   return word.slice(0, 8);
 }
-export function cardStatus({ plan, nowMs, movement, etaMs, market }) {
+// One word that is safe on a lock screen: it has letters and is never an
+// email (@), money ($), or a phone or street number (any digit). Leading
+// and trailing punctuation is dropped so "Southampton," reads as a word.
+function safeTagWord(word, max) {
+  const w = String(word || '').replace(/^[("']+/, '').replace(/[.,;:!?)"']+$/, '');
+  if (!w || /[@$\d]/.test(w) || !/[a-z]/i.test(w)) return '';
+  return w.slice(0, max);
+}
+// "Canelle / Pridwin": the customer's surname (last safe word of the
+// name) and the venue's first safe word, taken from the first source
+// that has one: the order's venue, then its delivery notes, then the
+// plan's destination. Either half is dropped when it is unknown or
+// unsafe; null when neither survives. The widget prints this under the
+// journey bar, so it never carries an email, phone or dollar.
+// Name suffixes that make a poor lock-screen tag ("Jr", "LLC"): skipped so the
+// last REAL word of the name is the tag.
+const TAG_NAME_SUFFIX = /^(jr|sr|ii|iii|iv|llc|inc|ltd|co|corp)\.?$/i;
+export function cardJobTag(order, destAddress) {
+  const firstSafe = (text, max) => collapseSpaces(text).split(' ').map((w) => safeTagWord(w, max)).find(Boolean) || '';
+  const name = collapseSpaces(order && order.client_name).split(' ').reverse()
+    .filter((w) => !TAG_NAME_SUFFIX.test(w))
+    .map((w) => safeTagWord(w, 12)).find(Boolean) || '';
+  const venue = [order && order.venue, order && order.delivery_notes, destAddress]
+    .map((source) => firstSafe(source, 8)).find(Boolean) || '';
+  return [name, venue].filter(Boolean).join(' / ') || null;
+}
+// 'h:mm AM' in the market's zone with no suffix, for the card headline.
+// Whitespace is normalized because some ICU builds put a narrow space
+// before AM/PM and the phone should always get a plain one.
+function cardClockStr(ms, market) {
+  return new Date(ms).toLocaleTimeString('en-US', { timeZone: marketZone(market), hour: 'numeric', minute: '2-digit' }).replace(/\s+/g, ' ');
+}
+// The lock-screen card for one plan: the 20-character words every build
+// renders (status) plus the structured fields build 34 renders itself.
+//   stage        garage | enroute | arrived (stopped and ended are set by
+//                the shift scan and the END path, never by a plan)
+//   headline     the big line: "Leave by 10:55 AM", "LEAVE NOW", "Late 30m",
+//                "ETA 4:45 PM", "On site", "No pickup", "En route"
+//   jobTag       "Canelle / Pridwin", see cardJobTag
+//   leaveByISO   the planned leave-by instant; the phone counts down to it
+//   etaISO       the live ETA while en route, shown as a clock time
+//   lateMinutes  whole minutes past leave-by, only once the words say
+//                "Late" (the first ten minutes are "LEAVE NOW" on purpose)
+// status and headline come from ONE decision tree so they can never
+// disagree. Unknown fields are null and buildLiveActivityContentState
+// leaves them out of the push.
+export function departureCard({ plan, nowMs, movement, etaMs, market, order }) {
   const p = plan || {};
   const tag = venueTag(p.venue || p.dest_address);
   const withTag = (text) => (tag ? `${text} · ${tag}` : text).slice(0, 20);
   const leaveMs = p.leave_by_at ? new Date(p.leave_by_at).getTime() : null;
   const arriveMs = p.arrive_at ? new Date(p.arrive_at).getTime() : null;
-  if (movement === 'arrived') return withTag('On site');
-  if (movement === 'moving_no_pickup') return withTag('No pickup');
-  if (movement === 'departed') {
-    if (finite(etaMs) && finite(arriveMs) && etaMs > arriveMs) return withTag(`ETA ${cardTimeStr(etaMs, market)}`);
-    return 'Enroute';
+  const card = {
+    status: '',
+    stage: 'garage',
+    headline: '',
+    jobTag: cardJobTag(order, p.venue || p.dest_address),
+    leaveByISO: finite(leaveMs) ? new Date(leaveMs).toISOString() : null,
+    etaISO: null,
+    lateMinutes: null,
+  };
+  if (movement === 'arrived') {
+    card.stage = 'arrived';
+    card.headline = 'On site';
+    card.status = withTag('On site');
+    return card;
   }
-  if (!finite(leaveMs)) return '';
+  if (movement === 'moving_no_pickup') {
+    // The phone is moving but the boxes never left the garage: the words
+    // carry the warning, so no late count competes with them.
+    card.stage = 'enroute';
+    card.headline = 'No pickup';
+    card.status = withTag('No pickup');
+    return card;
+  }
+  if (movement === 'departed') {
+    card.stage = 'enroute';
+    if (finite(etaMs)) {
+      // Floored to the minute like leaveByISO, so a second-level jitter in
+      // eta_at cannot change the content-state fingerprint (no extra pushes).
+      card.etaISO = new Date(Math.floor(etaMs / 60000) * 60000).toISOString();
+      card.headline = `ETA ${cardClockStr(etaMs, market)}`;
+    } else {
+      card.headline = 'En route';
+    }
+    // The words only say ETA when it is later than the arrival time
+    // (that is the old builds' running-late signal); the headline
+    // always shows a known ETA because the new card has room for it.
+    card.status = finite(etaMs) && finite(arriveMs) && etaMs > arriveMs ? withTag(`ETA ${cardTimeStr(etaMs, market)}`) : 'Enroute';
+    return card;
+  }
+  if (!finite(leaveMs)) return card;
   const lateMin = (nowMs - leaveMs) / 60000;
-  if (lateMin < 0) return `Leave by ${cardTimeStr(leaveMs, market)}`.slice(0, 20);
-  if (lateMin < 10) return withTag('LEAVE NOW');
+  if (lateMin < 0) {
+    card.headline = `Leave by ${cardClockStr(leaveMs, market)}`;
+    card.status = `Leave by ${cardTimeStr(leaveMs, market)}`.slice(0, 20);
+    return card;
+  }
+  if (lateMin < 10) {
+    card.headline = 'LEAVE NOW';
+    card.status = withTag('LEAVE NOW');
+    return card;
+  }
   const mins = Math.floor(lateMin);
   const late = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, '0')}m`;
-  return withTag(`Late ${late}`);
+  card.lateMinutes = mins;
+  card.headline = `Late ${late}`;
+  card.status = withTag(`Late ${late}`);
+  return card;
+}
+// The words alone, for callers that only render the 20-character line.
+export function cardStatus(args) {
+  return departureCard(args).status;
 }
 
 // ── reading arrival times out of a coordinator's email or PDF ────────
@@ -5918,20 +6016,39 @@ export async function runDayBeforeDepartureScan(env) {
   }
   return counts;
 }
-// The lock-screen card words for a market today: the soonest planned
-// job's status, or null when there is no plan. Read once per tick by the
-// shift status scan.
+// The lock-screen card for a market today: the soonest planned job's
+// departureCard (status words plus stage, headline, jobTag, leaveByISO,
+// etaISO, lateMinutes), or null when there is no plan or the plan has
+// nothing to say yet. Read once per tick by the shift status scan. The
+// order is read only for the job tag: when that read fails the card
+// still goes out with the venue word alone.
 export async function departureCardStatusForMarket(env, market, nowMs) {
   try {
     const today = dayInZone(nowMs, market);
     const rows = await fetchSb(env, 'order_departures?select=order_id,leave_by_at,arrive_at,dest_address,movement,eta_at,state&plan_date=eq.' + today + '&market=eq.' + encodeURIComponent(marketKey(market)) + '&state=in.(planned,arrived)&order=leave_by_at.asc.nullslast&limit=5');
     const plan = (rows || []).find((r) => r.leave_by_at) || (rows || [])[0];
     if (!plan) return null;
-    return cardStatus({ plan: { ...plan, venue: plan.dest_address }, nowMs, movement: plan.movement, etaMs: plan.eta_at ? new Date(plan.eta_at).getTime() : null, market });
+    const args = { plan: { ...plan, venue: plan.dest_address }, nowMs, movement: plan.movement, etaMs: plan.eta_at ? new Date(plan.eta_at).getTime() : null, market };
+    // Words first, with no order read: a plan with nothing to say yet costs
+    // no second round trip. The order row (for the job tag) is read only
+    // when the card has words.
+    if (!departureCard({ ...args, order: null }).status) return null;
+    let order = null;
+    if (plan.order_id) {
+      const orders = await fetchSb(env, 'orders?select=id,client_name,venue,delivery_notes&id=eq.' + encodeURIComponent(plan.order_id) + '&limit=1');
+      order = (orders || []).find((o) => o.id === plan.order_id) || null;
+    }
+    const card = departureCard({ ...args, order });
+    return card.status ? card : null;
   } catch (e) {
     console.error('departureCardStatusForMarket error:', e);
     return null;
   }
+}
+// The same card's words alone (the string every build renders), or null.
+export async function departureCardWordsForMarket(env, market, nowMs) {
+  const card = await departureCardStatusForMarket(env, market, nowMs);
+  return card ? card.status : null;
 }
 // ── proposals: a time read out of an email about a booked job ────────
 // Jarvis links the email to the order (intake_messages.order_id) and the
@@ -6259,16 +6376,25 @@ export async function runDeliveryConfirmationScan(env) {
 // tells the operator once over Telegram, and alert pushes (separate
 // topic string, same key) keep working untouched.
 const LA_TOPIC = 'com.hamptonscoconuts.field.push-type.liveactivity';
-let laLastSent = new Map();   // shiftId -> last pushed "status:minutes" (isolate memory; a recycle just re-sends one priority-5 update)
+let laLastSent = new Map();   // shiftId -> JSON of the last pushed content state (isolate memory; a recycle just re-sends one priority-5 update)
 
 // ContentState gained lastReportISO as an optional field. Old app builds ignore
 // the unknown JSON key, while the next widget can render the latest GPS report
 // time as a native relative label without one push per displayed minute.
+//
+// Build 34 adds six more optional keys from the departure card (see
+// departureCard): stage, headline, jobTag, leaveByISO, etaISO, lateMinutes.
+// Each is written only when the card has it, so a call without a card
+// produces exactly the old shape and Swift's optionals stay nil. A
+// "Stopped" status never carries them: a stale GPS is a safety signal and
+// the phone must not paint a countdown or a late count over it.
+const LA_STAGES = ['garage', 'enroute', 'arrived', 'stopped', 'ended'];
 export function buildLiveActivityContentState(
   status,
   statusMinutes,
   lastReportISO = null,
   market = null,
+  departure = null,
 ) {
   const state = {
     status: status,
@@ -6282,6 +6408,21 @@ export function buildLiveActivityContentState(
   if (marketWord === 'ny') state.marketLabel = 'NJ';
   else if (marketWord === 'miami') state.marketLabel = 'Miami';
   else if (marketWord === 'vegas') state.marketLabel = 'Vegas'; // parity with App.js
+  const stopped = /^Stopped/.test(String(status || ''));
+  if (departure && typeof departure === 'object' && !stopped) {
+    const stage = String(departure.stage || '').trim().toLowerCase();
+    if (LA_STAGES.includes(stage)) state.stage = stage;
+    for (const key of ['headline', 'jobTag']) {
+      const text = String(departure[key] || '').trim();
+      if (text) state[key] = text;
+    }
+    for (const key of ['leaveByISO', 'etaISO']) {
+      const ms = new Date(departure[key] || '').getTime();
+      if (Number.isFinite(ms)) state[key] = new Date(ms).toISOString();
+    }
+    const late = Number(departure.lateMinutes);
+    if (Number.isFinite(late) && late > 0) state.lateMinutes = Math.floor(late);
+  }
   return state;
 }
 
@@ -6556,8 +6697,13 @@ export async function runLiveActivityStartScan(env) {
   return queuedCount;
 }
 
-// event:update only when rendered status, its 5-minute stopped bucket, or the
-// latest GPS report timestamp changed. No tokens means retry on the next tick.
+// event:update only when something the phone would see changed: the rendered
+// status, its 5-minute stopped bucket, the latest GPS report timestamp, or
+// any departure field (a moved leave-by, a fresh ETA, one more late minute).
+// No tokens means retry on the next tick.
+// `status` is the 20-character words, or the structured departure card from
+// departureCardStatusForMarket whose .status holds the same words (the shift
+// scan passes the whole card so one call carries both).
 async function updateShiftLiveActivity(
   env,
   shiftId,
@@ -6568,11 +6714,14 @@ async function updateShiftLiveActivity(
 ) {
   try {
     if (laLastSent.size > 200) laLastSent.clear(); // bound isolate memory
+    const card = status && typeof status === 'object' ? status : null;
+    const words = card ? String(card.status || '') : status;
     const contentState = buildLiveActivityContentState(
-      status, minutes, lastReportISO, market,
+      words, minutes, lastReportISO, market, card,
     );
-    const key = status + ':' + minutes + ':' + (contentState.lastReportISO || '') +
-      ':' + (contentState.marketLabel || '');
+    // Keys are written in a fixed order, so the JSON text is a stable
+    // fingerprint of the whole content state.
+    const key = JSON.stringify(contentState);
     if (laLastSent.get(shiftId) === key) return;
     const tokens = await laTokensForShift(env, shiftId, market);
     if (!tokens || !tokens.length) return; // null (read failed) or none: do not mark sent, retry next tick

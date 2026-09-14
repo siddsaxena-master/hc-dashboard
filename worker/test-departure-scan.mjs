@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import {
   runDeparturePlanScan, sendPushToMarket, resolveMarketRecipients, routeProvider, appleMapsJwt,
   appleDirectionsHasFerry, computeRoute, enqueuePush, runDayBeforeDepartureScan, departureCardStatusForMarket,
+  departureCardWordsForMarket, runShiftStatusScan,
 } from './worker.js';
 
 let passed = 0;
@@ -106,7 +107,11 @@ function harness(opts = {}) {
     const path = url.slice((SB + '/rest/v1/').length);
     if (method === 'GET' && path.startsWith('orders?')) {
       const m = /market=eq\.([a-z]+)/.exec(path);
-      return reply(200, (opts.orders || []).filter((o) => !m || String(o.market || 'ny') === m[1]));
+      // Honour an id filter too, so the worker's by-id read is really proved.
+      const idm = /id=eq\.([^&]+)/.exec(path);
+      return reply(200, (opts.orders || [])
+        .filter((o) => !m || String(o.market || 'ny') === m[1])
+        .filter((o) => !idm || String(o.id) === decodeURIComponent(idm[1])));
     }
     if (method === 'GET' && path.startsWith('order_departures?')) {
       const rows = [...plans.values()];
@@ -122,6 +127,11 @@ function harness(opts = {}) {
       return reply(200, points[id] || []);
     }
     if (method === 'GET' && path.startsWith('field_workers?')) return reply(200, ROSTER);
+    // Live Activity update tokens: `laTokens` rows are { shift_id, email, token }.
+    if (method === 'GET' && path.startsWith('live_activity_tokens?')) {
+      const id = decodeURIComponent(/shift_id=eq\.([^&]+)/.exec(path)[1]);
+      return reply(200, (opts.laTokens || []).filter((r) => r.shift_id === id).map((r) => ({ email: r.email, token: r.token })));
+    }
     if (method === 'GET' && path.startsWith('push_tokens?')) {
       const list = decodeURIComponent(path.split('email=in.(')[1].split(')')[0]);
       const wanted = list.split(',').map((s) => s.replace(/"/g, '').trim().toLowerCase());
@@ -358,15 +368,75 @@ const crewShift = { id: 's-crew', worker_name: 'Hashim Nadir', worker_email: 'cr
   } finally { quiet.restore(); }
   pass('day-before: at 6 PM Eastern one manage body and one crew body; at 4 PM nothing');
 }
-// ── 13. The lock-screen card words come from the plan ───────────────
+// ── 13. The lock-screen card comes from the plan ────────────────────
 {
-  const h = harness({ plans: [plannedRow()] });
+  const h = harness({ plans: [plannedRow()], orders: [pridwinOrder()] });
   try {
-    assert.equal(await at('2026-09-12T13:00:00Z', () => departureCardStatusForMarket(APPLE_ENV, 'ny', T('2026-09-12T13:00:00Z'))), 'Leave by 10:55a');
-    assert.equal(await at('2026-09-12T15:25:00Z', () => departureCardStatusForMarket(APPLE_ENV, 'ny', T('2026-09-12T15:25:00Z'))), 'Late 30m · Pridwin');
+    assert.deepEqual(await at('2026-09-12T13:00:00Z', () => departureCardStatusForMarket(APPLE_ENV, 'ny', T('2026-09-12T13:00:00Z'))), {
+      status: 'Leave by 10:55a', stage: 'garage', headline: 'Leave by 10:55 AM', jobTag: 'Canelle / Pridwin',
+      leaveByISO: '2026-09-12T14:55:00.000Z', etaISO: null, lateMinutes: null,
+    });
+    assert.deepEqual(await at('2026-09-12T15:25:00Z', () => departureCardStatusForMarket(APPLE_ENV, 'ny', T('2026-09-12T15:25:00Z'))), {
+      status: 'Late 30m · Pridwin', stage: 'garage', headline: 'Late 30m', jobTag: 'Canelle / Pridwin',
+      leaveByISO: '2026-09-12T14:55:00.000Z', etaISO: null, lateMinutes: 30,
+    });
     assert.equal(await departureCardStatusForMarket(APPLE_ENV, 'vegas', T('2026-09-12T13:00:00Z')), null);
+    // The string path for callers that only want the words.
+    assert.equal(await at('2026-09-12T13:00:00Z', () => departureCardWordsForMarket(APPLE_ENV, 'ny', T('2026-09-12T13:00:00Z'))), 'Leave by 10:55a');
+    assert.equal(await at('2026-09-12T15:25:00Z', () => departureCardWordsForMarket(APPLE_ENV, 'ny', T('2026-09-12T15:25:00Z'))), 'Late 30m · Pridwin');
+    assert.equal(await departureCardWordsForMarket(APPLE_ENV, 'vegas', T('2026-09-12T13:00:00Z')), null);
   } finally { h.restore(); }
-  pass('card words: "Leave by 10:55a" before, "Late 30m · Pridwin" after, null with no plan');
+  // No order row (read failed or gone): the card still goes out with the venue word alone.
+  const bare = harness({ plans: [plannedRow()] });
+  try {
+    const card = await at('2026-09-12T13:00:00Z', () => departureCardStatusForMarket(APPLE_ENV, 'ny', T('2026-09-12T13:00:00Z')));
+    assert.equal(card.status, 'Leave by 10:55a'); assert.equal(card.jobTag, 'Pridwin');
+  } finally { bare.restore(); }
+  // A plan with no leave-by and nobody moving has nothing to say yet.
+  const quiet = harness({ plans: [plannedRow({ leave_by_at: null })], orders: [pridwinOrder()] });
+  try {
+    assert.equal(await at('2026-09-12T13:00:00Z', () => departureCardStatusForMarket(APPLE_ENV, 'ny', T('2026-09-12T13:00:00Z'))), null);
+  } finally { quiet.restore(); }
+  pass('card: the structured card before and after leave-by, the words path, venue-only tag without the order, null with no plan or no leave-by');
+}
+// ── 13b. The shift scan sends the card in content-state; Stopped wins ─
+{
+  const laShift = (id) => ({ id, worker_name: 'Hashim Nadir', worker_email: 'crew@example.invalid', market: 'ny', clock_in_at: '2026-09-12T12:30:00Z', clock_in_lat: GARAGE.lat + 0.0009, clock_in_lng: GARAGE.lng });
+  const laTokens = (id) => [{ shift_id: id, email: 'owner@example.invalid', token: 'la-owner-' + id }];
+  const contentStates = (h) => h.queuePosts().filter((p) => p.kind === 'la_update').map((p) => ({ tokens: p.payload.tokens, state: p.payload.aps['content-state'], event: p.payload.aps.event }));
+  // At the garage at 9:00 AM with a plan: the words every build renders plus the six new keys.
+  const atGarage = harness({ plans: [plannedRow()], orders: [pridwinOrder()], shifts: [laShift('la-1')], points: { 'la-1': [fresh(GARAGE, '2026-09-12T13:00:00Z', 2)] }, laTokens: laTokens('la-1') });
+  try {
+    await at('2026-09-12T13:00:00Z', () => runShiftStatusScan(APPLE_ENV));
+    const sent = contentStates(atGarage);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].event, 'update');
+    assert.deepEqual(sent[0].tokens, ['la-owner-la-1']);
+    assert.deepEqual(sent[0].state, {
+      status: 'Leave by 10:55a', statusMinutes: 0, lastReportISO: '2026-09-12T12:58:00.000Z', marketLabel: 'NJ',
+      stage: 'garage', headline: 'Leave by 10:55 AM', jobTag: 'Canelle / Pridwin', leaveByISO: '2026-09-12T14:55:00.000Z',
+    });
+    // The same tick again changes nothing the phone would see: no second update.
+    await at('2026-09-12T13:00:00Z', () => runShiftStatusScan(APPLE_ENV));
+    assert.equal(contentStates(atGarage).length, 1);
+    // One more late minute is something the phone would see: it goes out.
+    atGarage.plans.get(ORDER_ID).leave_by_at = '2026-09-12T12:30:00+00:00';
+    await at('2026-09-12T13:00:00Z', () => runShiftStatusScan(APPLE_ENV));
+    const late = contentStates(atGarage);
+    assert.equal(late.length, 2);
+    assert.equal(late[1].state.status, 'Late 30m · Pridwin'); assert.equal(late[1].state.headline, 'Late 30m'); assert.equal(late[1].state.lateMinutes, 30);
+  } finally { atGarage.restore(); }
+  // A GPS stamp 30 minutes old away from the garage: "Stopped 30m" and none of the plan's keys.
+  const stopped = harness({ plans: [plannedRow()], orders: [pridwinOrder()], shifts: [laShift('la-2')], points: { 'la-2': [fresh({ lat: 40.7555, lng: -74.1059 }, '2026-09-12T13:00:00Z', 30)] }, laTokens: laTokens('la-2') });
+  try {
+    await at('2026-09-12T13:00:00Z', () => runShiftStatusScan(APPLE_ENV));
+    const sent = contentStates(stopped);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].state, { status: 'Stopped', statusMinutes: 30, lastReportISO: '2026-09-12T12:30:00.000Z', marketLabel: 'NJ' });
+    // The plan was never even read for a stopped shift.
+    assert.ok(!stopped.calls.some((c) => c.url.includes('order_departures?')));
+  } finally { stopped.restore(); }
+  pass('shift scan: content-state carries the card (stage, headline, jobTag, leaveByISO), dedupes on it, resends on a new late count; Stopped keeps precedence and skips the plan');
 }
 // ── 14. The router facade and the Apple token ───────────────────────
 {
