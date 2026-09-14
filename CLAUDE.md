@@ -371,10 +371,15 @@ Probed from the droplet with the app's exact parameter names.
   version acb7b4de-7e54-4bc6-a73b-1e8236c82bea from feature/departure-plan
   head 79ad7ba (`npx --yes wrangler@latest deploy`, wrangler 4.131.1,
   252.93 KiB). Previous live version 3a9ae8e1 (2026-09-10) is the rollback
-  target. Deploy only from feature/departure-plan until it is merged. The
-  Apple Maps secrets were still absent at deploy time, so every order that
-  enters the two-day window gets one "Cannot plan departure" banner a day
-  (owner + manager) until step 6 lands.
+  target. Deploy only from feature/departure-plan until it is merged.
+- APPLE MAPS SECRETS SET 2026-09-14 ~02:55 UTC (Sidd's "keep going"): key
+  "HC Maps Server" LWC6536DM2 on Maps ID maps.com.hamptonscoconuts.field,
+  APPLE_MAPS_KEY_ID / APPLE_MAPS_TEAM_ID / APPLE_MAPS_PRIVATE_KEY loaded with
+  `wrangler secret put` (the .p8 stays in Sidd's ~/Downloads; Apple never
+  re-issues it). Verified with one real call through the worker's own
+  appleMapsJwt: garage -> Pridwin 10,686 s with traffic / 9,851 s static,
+  213.7 km, ferry detected ("Take the North Haven - Shelter Island Ferry").
+  routeProvider(env) now returns 'apple_maps'.
 - Postgres 17.6. Cloudflare plan tier and Google Cloud billing: not checked
   (Sidd's accounts).
 - 2026-09-13 evening: MIGRATION 040 IS LIVE (Sidd's "yes do it, run 040").
