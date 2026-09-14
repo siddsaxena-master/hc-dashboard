@@ -367,6 +367,14 @@ Probed from the droplet with the app's exact parameter names.
 - No ghost 'Canelle' inquiry rows; only the real order 567ba3a6.
 - Worker branch fix/worker-intake-and-vegas tip db94db4; the departure work
   continues on feature/departure-plan cut from it. main has no field-ops code.
+- WORKER DEPLOYED 2026-09-14 02:06 UTC (Sidd's "yes do it"): Cloudflare
+  version acb7b4de-7e54-4bc6-a73b-1e8236c82bea from feature/departure-plan
+  head 79ad7ba (`npx --yes wrangler@latest deploy`, wrangler 4.131.1,
+  252.93 KiB). Previous live version 3a9ae8e1 (2026-09-10) is the rollback
+  target. Deploy only from feature/departure-plan until it is merged. The
+  Apple Maps secrets were still absent at deploy time, so every order that
+  enters the two-day window gets one "Cannot plan departure" banner a day
+  (owner + manager) until step 6 lands.
 - Postgres 17.6. Cloudflare plan tier and Google Cloud billing: not checked
   (Sidd's accounts).
 - 2026-09-13 evening: MIGRATION 040 IS LIVE (Sidd's "yes do it, run 040").
