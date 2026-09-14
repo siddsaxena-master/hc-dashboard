@@ -73,3 +73,39 @@ crons = [
 #   included). Apple hands it out once; keep the file somewhere safe.
 # ASC_CREW_GROUP_ID - optional; the TestFlight beta group a new hire joins.
 #   Defaults in code to the HC crew group 4976ebfe-29f5-47b9-92e7-a314bbb271a1.
+# RECONFIRMATION EMAILS (2026-09-14, RECONFIRMATION-CONTRACT-2026-09-14.md
+# section 2). The hourly runReconfirmationScan drafts the customer's "quick
+# reconfirm" email into order_reconfirmations (migration 044 must be live
+# first); the droplet sends released rows from sidd@hamptonscoconuts.com and
+# the HC Field app (build 35) carries Send now / Hold / Skip. Four settings,
+# all read from env; set the switches with `wrangler secret put` too so
+# they never sit in this file:
+# RECONFIRM_MODE - 'off' (the default when unset: the scan returns at once
+#   and drafts nothing), 'preview' (drafts, previews on the owner's phone,
+#   sends only on a Send now tap), or 'auto' (untouched drafts are released
+#   at their send_after time, 10:00 market time four days before delivery).
+#   Flipping to 'auto' is its own "yes do it" (plan section 9, Phase C).
+# RECONFIRM_DAILY_CAP - integer, default 8: automatic releases per market per
+#   day, counted by the moment each row was released (the release stamps
+#   send_after with that instant). The owner's own Send now taps are never
+#   capped; a row the owner held and released by hand still counts. Nothing
+#   is released outside 08:00 to 21:00 market time. A bad data backfill can
+#   therefore never fan out more than this many emails a day.
+# RECONFIRM_TEST_TO - Phase A only: Sidd's own test address. When set, the
+#   worker stamps it into every row's test_to (on insert and on every
+#   rewrite; cleared again on the next rewrite once the setting is gone) so
+#   the app shows "Test mode" and the droplet sends only to that address
+#   with the "[TEST for ...]" subject tag. A test copy never marks the row
+#   sent (the droplet puts it back to ready with no send_after), so the
+#   real email can still go out later. Remove it before Phase B.
+# OWNER_CELL - Sidd's cell number as printed in the email ("Your contact on
+#   our side: Sidd, <cell>, sidd@hamptonscoconuts.com" and the sign-off). A
+#   secret: never in code, never in this file. When unset the contact line
+#   omits the number and the sign-off ends at "Hamptons Coconuts".
+# Eligibility needs MONEY RECORDED (deposit_cents plus balance_cents above
+# zero) with a stage of invoiced, deposit_paid or paid_full: a hand-set paid
+# stage with nothing recorded is never drafted, and the 8am digest names it
+# under "Stage says paid but nothing recorded, check QuickBooks".
+# Push bodies from this scan never carry an email, phone or dollar; the
+# email body never carries an amount, a crew name, the garage, or internal
+# notes. Deploy from feature/departure-plan, never from main.

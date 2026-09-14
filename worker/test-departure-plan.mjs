@@ -338,11 +338,32 @@ assert.deepEqual(extractArrivalTimes('Submitted 04:56 PM - 11 May 2026\nName: Ch
 assert.deepEqual(extractArrivalTimes('On Mon, Sep 14, 2026 at 1:24 AM Hamptons Coconuts <sidd@hamptonscoconuts.com>\nwrote:'), []);
 assert.deepEqual(extractArrivalTimes('> On 9/14/2026 at 1:24 AM, Hamptons Coconuts wrote:'), []);
 assert.deepEqual(extractArrivalTimes('Meeting at 9:00 AM with sidd@hamptonscoconuts.com'), []);
-// The real thing right after a reply header still reads, and a line that
-// merely starts with "on" is not a header.
-assert.deepEqual(extractArrivalTimes('On Mon, Sep 14, 2026 at 1:24 AM Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n> Coconuts should arrive by 2:00 PM please').map((t) => t.hh), [14]);
+// The real thing ABOVE a reply header still reads, and a line that merely
+// starts with "on" is not a header. What sits under the header is quoted
+// text (2026-09-14, reconfirmation plan section 5): the customer's own
+// words come first, our email comes after, so a quoted line is never read
+// as the answer, even when it names coconuts and a time.
+assert.deepEqual(extractArrivalTimes('Coconuts should arrive by 2:00 PM please\n\nOn Mon, Sep 14, 2026 at 1:24 AM Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n> Hi Nadege, following up on the quote.').map((t) => t.hh), [14]);
+assert.deepEqual(extractArrivalTimes('On Mon, Sep 14, 2026 at 1:24 AM Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n> Coconuts should arrive by 2:00 PM please').map((t) => t.hh), []);
 assert.deepEqual(extractArrivalTimes('On site vendor arrival at 2:00 PM').map((t) => t.hh), [14]);
-pass('extractArrivalTimes: reply attribution, Sent/Date/Submitted headers and addresses never yield a time; the coconut line after a header still does');
+pass('extractArrivalTimes: reply attribution, Sent/Date/Submitted headers and addresses never yield a time; the coconut line above a header still does, a quoted one never');
+// 12c. Our own reconfirmation template quoted back is never the answer
+// (Gmail "wrote:" quoting, Apple Mail ">" quoting, and Outlook's own
+// From/Sent block), while a coordinator PDF pasted BELOW the quote is
+// still read, because attachment sections are never stripped.
+const ourTemplateLine = 'Delivery: Saturday, September 19, arriving 3:30 PM';
+const gmailQuote = 'Can we do 4:00 PM for the coconut delivery instead?\n\nOn Tue, Sep 15, 2026 at 10:00 AM Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n> Hi Jamie,\n>\n> ' + ourTemplateLine + '\n> Drop off: The Maidstone, 207 Main St, East Hampton, NY 11937';
+assert.deepEqual(extractArrivalTimes(gmailQuote).map((t) => [t.hh, t.mm]), [[16, 0]]);
+const appleQuote = 'Confirmed, thanks!\n\n> On Sep 15, 2026, at 10:00 AM, Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n>\n> ' + ourTemplateLine;
+assert.deepEqual(extractArrivalTimes(appleQuote), []);
+const outlookQuote = 'Looks good.\n\n________________________________\nFrom: Sidd Saxena <sidd@hamptonscoconuts.com>\nSent: Tuesday, September 15, 2026 10:00 AM\nTo: Jamie <jamie@example.invalid>\nSubject: Your coconuts for Saturday, September 19: quick reconfirm\n\nHi Jamie,\n\n' + ourTemplateLine;
+assert.deepEqual(extractArrivalTimes(outlookQuote), []);
+// A forwarded coordinator email keeps its header block (their From line is not ours).
+assert.deepEqual(extractArrivalTimes('FYI\n\n---------- Forwarded message ---------\nFrom: Planner <planner@example.invalid>\nDate: Thu, Sep 10, 2026 at 12:12 PM\nSubject: Timeline\n\nHamptons Coconuts arrival 2:00 PM').map((t) => t.hh), [14]);
+const pdfBelowQuote = 'See attached.\n\nOn Tue, Sep 15, 2026 at 10:00 AM Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n> ' + ourTemplateLine + '\n\n=== ATTACHMENT: Run of Show.pdf (PDF text, 3 pages) ===\n5:00 PM Ceremony\n2:00 PM Hamptons Coconuts arrival + setup\n';
+const pdfTimes = extractArrivalTimes(pdfBelowQuote);
+assert.deepEqual(pdfTimes.map((t) => [t.hh, t.where]), [[14, 'attachment:Run of Show.pdf']]);
+pass('extractArrivalTimes: our template line quoted back (Gmail, Apple Mail, Outlook) is ignored; a forward and a PDF section below a quote are still read');
 assert.equal(windowsConflict({ hh: 14, mm: 0 }, { hh: 15, mm: 30 }), true);
 assert.equal(windowsConflict({ hh: 15, mm: 30 }, { hh: 15, mm: 40 }), false);
 assert.equal(windowsConflict(null, { hh: 15, mm: 30 }), false);

@@ -1049,6 +1049,14 @@ async function runDailyDigest(env) {
     intakeLines.forEach(l => lines.push(l));
   }
 
+  // Reconfirmation emails (2026-09-14): one line, names only. Empty when
+  // the mode is off or the table is not there yet.
+  const reconfirmLines = await buildReconfirmationDigestLines(env);
+  if (reconfirmLines.length) {
+    lines.push('');
+    reconfirmLines.forEach(l => lines.push(l));
+  }
+
   // Sunday payroll section (weekday checked in EASTERN time inside the
   // helper; returns [] on any other day or on any read failure).
   const payrollLines = await buildPayrollDigestLines(env);
@@ -1063,47 +1071,1343 @@ async function runDailyDigest(env) {
   }
 }
 
-// Hourly — find events ~1 week out and draft a reconfirmation
-async function runReconfirmationScan(env) {
-  // Intake nags ride the same hourly cron; run them first so the early
-  // returns below (no reconfirmations due) cannot skip them.
-  await runIntakeNagScan(env);
+// ════════════════════════════════════════════════════════════════════
+// RECONFIRMATION EMAILS (2026-09-14). Spec: RECONFIRMATION-CONTRACT-
+// 2026-09-14.md sections 2 and 4; the words: RECONFIRMATION-EMAIL-PLAN-
+// 2026-09-14.md sections 2 and 5. About four days before a paid delivery
+// the customer gets one short email from Sidd's own mailbox asking them
+// to check the count, time, address, cracking and site contact. Claudia
+// (this worker) decides which orders qualify, writes the exact text from
+// stored facts (no AI writes a word), and keeps one row per order per
+// delivery day in order_reconfirmations (migration 044). The droplet
+// sends released rows; the HC Field app shows Send now, Hold and Skip.
+// Every pure helper below is exported for worker/test-reconfirmation.mjs.
+// ════════════════════════════════════════════════════════════════════
 
-  const target = new Date(Date.now() + 7 * 86400000);
-  const dayStr = target.toISOString().slice(0, 10);
+// ── the three settings (documented in wrangler.toml) ────────────────
+// RECONFIRM_MODE: 'off' (default) drafts nothing; 'preview' drafts and
+// waits for the owner's Send now; 'auto' also releases untouched drafts
+// at their send_after time.
+export function reconfirmMode(env) {
+  const mode = String((env && env.RECONFIRM_MODE) || '').trim().toLowerCase();
+  return mode === 'preview' || mode === 'auto' ? mode : 'off';
+}
+// RECONFIRM_DAILY_CAP: automatic releases per market per day; default 8.
+export function reconfirmDailyCap(env) {
+  const n = parseInt(String((env && env.RECONFIRM_DAILY_CAP) || ''), 10);
+  return Number.isInteger(n) && n >= 0 ? n : 8;
+}
 
-  const resp = await fetch(
-    env.SUPABASE_URL +
-      '/rest/v1/orders?select=id,client_name,client_email,event_start_at,venue,coconuts_qty,total_cents,stage' +
-      '&event_start_at=gte.' + dayStr + 'T00:00:00Z' +
-      '&event_start_at=lt.' + dayStr + 'T23:59:59Z' +
-      '&stage=in.(deposit_paid,invoiced,paid_full)',
-    { headers: sbHeaders(env) }
-  );
-  if (!resp.ok) return;
-  const rows = await resp.json();
-  if (!rows.length) return;
+// ── calendar arithmetic on 'YYYY-MM-DD' strings (never hours) ───────
+function reconfirmDayMs(day) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(day || ''));
+  return m ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : NaN;
+}
+// Whole days from one date string to another; null when either is not a date.
+export function daysBetween(fromDay, toDay) {
+  const a = reconfirmDayMs(fromDay), b = reconfirmDayMs(toDay);
+  return Number.isFinite(a) && Number.isFinite(b) ? Math.round((b - a) / 86400000) : null;
+}
+export function addDays(day, n) {
+  const ms = reconfirmDayMs(day);
+  return Number.isFinite(ms) ? new Date(ms + n * 86400000).toISOString().slice(0, 10) : '';
+}
+// 'Saturday, September 19' from a date string. The weekday comes from the
+// string itself, so no zone can shift it.
+export function longDayWords(day) {
+  const ms = reconfirmDayMs(day);
+  if (!Number.isFinite(ms)) return '';
+  return new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'long', month: 'long', day: 'numeric' }).format(new Date(ms));
+}
+// The delivery day is the date text of delivery_at_utc, taken as written
+// (Jarvis stores midnight UTC; converting to Pacific would show the day
+// before).
+export function reconfirmDeliveryDay(order) {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String((order && order.delivery_at_utc) || '').trim());
+  return m ? m[1] : '';
+}
 
-  const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-  for (const r of rows) {
-    const lines = [
-      '📩 *Reconfirmation Draft* (event in 7 days)',
-      '',
-      '*' + (r.client_name || 'Unnamed') + '*',
-      '_' + (r.event_start_at || '').slice(0, 10) + '_',
-      r.venue ? '📍 ' + r.venue : '',
-      r.coconuts_qty ? '🥥 ' + r.coconuts_qty + ' coconuts' : '',
-      '',
-      'Draft email:',
-      '> Hi ' + (r.client_name || '').split(' ')[0] + ', wanted to confirm everything for next week\'s event. Final headcount, delivery window, and stamp design all locked in?',
-      '',
-      'Reply *send* in Telegram to send (manual for now).',
-    ].filter(Boolean);
-    for (const cid of chatIds) {
-      await sendTelegram(env.TG_BOT_TOKEN, cid, lines.join('\n'));
+// ── eligibility (contract section 2, exact) ─────────────────────────
+const RECONFIRM_PAID_STAGES = ['deposit_paid', 'paid_full'];
+const RECONFIRM_MONEY_STAGES = ['invoiced', 'deposit_paid', 'paid_full'];
+const RECONFIRM_CLOSED_STAGES = ['cancelled', 'fulfilled', 'complete'];
+// Money RECORDED on the order: a deposit or a balance the payment poller
+// wrote (deposit_cents plus balance_cents above zero). Null and blank
+// count as zero here.
+export function reconfirmMoneyRecorded(order) {
+  const o = order || {};
+  return (Number(o.deposit_cents) || 0) + (Number(o.balance_cents) || 0) > 0;
+}
+// Money received per QuickBooks: money recorded AND a stage of invoiced,
+// deposit_paid or paid_full. A stage alone never qualifies: on 2026-09-14
+// an unpaid December order carried a hand-set deposit_paid stage from
+// June with nothing recorded, and QuickBooks showed nothing paid. The
+// digest names such orders under "stage says paid but nothing recorded".
+export function reconfirmMoneyReceived(order) {
+  const o = order || {};
+  const stage = String(o.stage || '');
+  return RECONFIRM_MONEY_STAGES.includes(stage) && reconfirmMoneyRecorded(o);
+}
+// Everything but the "no active row" rule, which needs the table. Returns
+// the market, today in that market, the delivery day and the day count so
+// the caller never recomputes them.
+export function reconfirmEligibility(order, nowMs) {
+  const o = order || {};
+  const market = marketKey(o.market);
+  const today = dayInZone(nowMs, market);
+  const deliveryDay = reconfirmDeliveryDay(o);
+  const daysOut = deliveryDay ? daysBetween(today, deliveryDay) : null;
+  const out = (eligible, reason) => ({ eligible, reason, market, today, deliveryDay, daysOut });
+  const stage = String(o.stage || '');
+  if (RECONFIRM_CLOSED_STAGES.includes(stage)) return out(false, 'stage ' + stage);
+  // A paid stage with nothing recorded is its own reason (the digest tells
+  // the owner to check QuickBooks); anything else without money is simply
+  // not paid yet.
+  if (!reconfirmMoneyReceived(o)) return out(false, RECONFIRM_PAID_STAGES.includes(stage) && !reconfirmMoneyRecorded(o) ? 'stage says paid but nothing recorded' : 'no payment yet');
+  if (!String(o.external_invoice_id || '').trim()) return out(false, 'no invoice');
+  if (!deliveryDay) return out(false, 'no delivery date');
+  if (o.is_recurring === true) return out(false, 'recurring account');
+  // 0 to 5 calendar days out. Minus 1 and the day itself still get a row
+  // (a deposit or a Resend can land that late) but reconfirmSendAfter gives
+  // them no send_after: Send now only, never automatic.
+  if (daysOut < 0) return out(false, 'delivery day passed');
+  if (daysOut > 5) return out(false, 'too far');
+  return out(true, null);
+}
+
+// ── the clock ───────────────────────────────────────────────────────
+// Drafting (and every automatic release) happens on an hourly tick from
+// 08:00 up to but not including 21:00 in the market's own zone.
+export function reconfirmInDraftHours(nowMs, market) {
+  const h = Number(marketHour(nowMs, market));
+  return h >= 8 && h < 21;
+}
+// When auto mode may release a draft. Minus 5 (or earlier): 10:00 market
+// time on minus 4. Drafted late (minus 4, 3 or 2): three hours from now,
+// never after 17:00 on minus 2 (past that it is Send now only). One rule
+// beyond the contract, so a payment landing at 21:30 does not send an
+// email at half past midnight: a late send_after outside 08:00 to 21:00
+// rolls to 10:00 the next morning (still three hours later, still before
+// the minus 2 cap).
+export function reconfirmSendAfter({ deliveryDay, daysOut, nowMs, market }) {
+  const zone = marketZone(market);
+  if (!Number.isInteger(daysOut) || daysOut <= 1) return null;
+  if (daysOut >= 5) return wallClockToUtc(addDays(deliveryDay, -4), 10, 0, zone);
+  const today = dayInZone(nowMs, market);
+  let sendMs = nowMs + 3 * 3600000;
+  const sendDay = dayInZone(sendMs, market);
+  const morning = Date.parse(wallClockToUtc(sendDay, 8, 0, zone));
+  const evening = Date.parse(wallClockToUtc(sendDay, 21, 0, zone));
+  if (sendMs < morning) sendMs = Date.parse(wallClockToUtc(sendDay, 10, 0, zone));
+  else if (sendMs > evening) sendMs = Date.parse(wallClockToUtc(addDays(sendDay, 1), 10, 0, zone));
+  if (daysOut === 2) {
+    const cap = Date.parse(wallClockToUtc(today, 17, 0, zone));
+    if (nowMs >= cap) return null;
+    if (sendMs > cap) sendMs = cap;
+  }
+  return new Date(sendMs).toISOString();
+}
+
+// ── recipients ──────────────────────────────────────────────────────
+const RECONFIRM_BILLING_LOCAL_PARTS = new Set(['ar', 'accounting', 'accounts', 'billing', 'invoices', 'payables', 'ap']);
+// Every address on the invoice, split on commas or semicolons (QuickBooks
+// accepts both in BillEmail), trimmed, lowercased, de-duplicated. A
+// "Name <a@b.com>" part yields the address inside it.
+export function reconfirmRecipients(clientEmail) {
+  const out = [];
+  const seen = new Set();
+  for (const part of String(clientEmail || '').split(/[,;]/)) {
+    const m = /[^\s<>,;"']+@[^\s<>,;"']+\.[^\s<>,;"']+/.exec(part);
+    if (!m) continue;
+    const addr = m[0].trim().toLowerCase().replace(/[.)]+$/, '');
+    if (!seen.has(addr)) { seen.add(addr); out.push(addr); }
+  }
+  return out;
+}
+function reconfirmOwnDomains() {
+  return OWN_COLD_EMAIL_DOMAINS.concat(['@hamptonscoconuts.com']);
+}
+// Recipient holds. An address on one of our own domains is not a customer
+// address, so it is reported as no_email (the contract's hold list has no
+// own-domain value).
+export function reconfirmRecipientHolds(recipients) {
+  const list = Array.isArray(recipients) ? recipients : [];
+  if (!list.length) return ['no_email'];
+  if (list.length > 4) return ['too_many_emails'];
+  const own = reconfirmOwnDomains();
+  if (list.some((a) => own.some((d) => a.endsWith(d)))) return ['no_email'];
+  if (list.every((a) => RECONFIRM_BILLING_LOCAL_PARTS.has(a.split('@')[0]))) return ['billing_email_only'];
+  return [];
+}
+
+// ── the facts object (contract section 4) ───────────────────────────
+// Strings trimmed; blank and null are the same thing (null).
+function factText(value) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  return s || null;
+}
+// A number column as a number; null and blank stay null (never 0).
+function factNumber(value) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+// Cracking words for the email. The dashboard box (crack_type) is used
+// when ticked, else the invoice reading; 'review' and anything unknown
+// means nobody may guess. When the box and the invoice reading both exist
+// and disagree (box 'straw' against invoice 'cocktail' or 'mixed', box
+// 'circle' against 'straw_hole' or 'mixed', box 'whole' against any
+// cracking) the answer is UNKNOWN, a hard hold: never the box alone, a
+// wrong cracking line must not reach the customer. Mixed counts come from
+// the invoice note Jarvis writes: "Cocktail cut on 60 of 100 coconuts;
+// straw hole on the other 40."
+const CRACKING_STRAW_WORDS = 'straw hole pre-cracked, ready for straws';
+const CRACKING_COCKTAIL_WORDS = 'cocktail cut';
+// Which invoice reading each box agrees with. The invoice reader never
+// says 'whole' (it says 'review'), so a 'whole' box agrees with nothing.
+const CRACKING_BOX_FAMILY = { straw: 'straw_hole', circle: 'cocktail', whole: null };
+export function reconfirmCrackingWords(source) {
+  const s = source || {};
+  const inv = s.invoice_fulfillment || {};
+  const ct = factText(s.crack_type);
+  const c = factText(inv.cracking);
+  if (ct && ct in CRACKING_BOX_FAMILY && c && c !== 'review' && c !== CRACKING_BOX_FAMILY[ct]) return null;
+  if (ct === 'straw') return CRACKING_STRAW_WORDS;
+  if (ct === 'circle') return CRACKING_COCKTAIL_WORDS;
+  // The plan's variant lines carry their trailing period ("whole,
+  // unopened." and "60 cocktail cut, 40 straw hole pre-cracked."), the
+  // same way the Branding line does; the default straw and cocktail
+  // words are printed as the main template shows them, without one.
+  if (ct === 'whole') return 'whole, unopened.';
+  if (c === 'straw_hole') return CRACKING_STRAW_WORDS;
+  if (c === 'cocktail') return CRACKING_COCKTAIL_WORDS;
+  if (c === 'mixed') {
+    const note = String(inv.cracking_note || '');
+    const cocktail = /cocktail cut on (\d+) of (\d+)/i.exec(note);
+    const straw = /straw hole on the other (\d+)/i.exec(note);
+    if (cocktail && straw) return `${Number(cocktail[1])} cocktail cut, ${Number(straw[1])} straw hole pre-cracked.`;
+  }
+  return null;
+}
+// Which picture the droplet embeds: the approved logo preview from the
+// private order-logos bucket, else the legacy logo file when it is a PNG
+// or JPEG (a forwarded .ai or .pdf would not display). Never a URL that
+// could be printed in the email.
+export function reconfirmPicture(order) {
+  const o = order || {};
+  const asset = o.logo_asset && typeof o.logo_asset === 'object' ? o.logo_asset : null;
+  if (asset && asset.status === 'approved' && Array.isArray(asset.files)) {
+    const files = asset.files.filter((f) => f && typeof f === 'object' && factText(f.preview_path));
+    const front = files.find((f) => /coconut front/i.test(String(f.usage || ''))) || files[0];
+    if (front) return { source: 'logo_asset', bucket: 'order-logos', path: String(front.preview_path).trim(), content_type: 'image/png' };
+  }
+  const url = factText(o.logo_url);
+  if (url && /^https?:\/\//i.test(url)) {
+    const path = url.split(/[?#]/)[0].toLowerCase();
+    if (path.endsWith('.png')) return { source: 'logo_url', bucket: null, path: url, content_type: 'image/png' };
+    if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return { source: 'logo_url', bucket: null, path: url, content_type: 'image/jpeg' };
+  }
+  return null;
+}
+export function reconfirmFacts(order, ctx = {}) {
+  const o = order || {};
+  const inv = o.invoice_fulfillment && typeof o.invoice_fulfillment === 'object' ? o.invoice_fulfillment : {};
+  const dr = o.delivery_request && typeof o.delivery_request === 'object' ? o.delivery_request : {};
+  const asset = o.logo_asset && typeof o.logo_asset === 'object' ? o.logo_asset : null;
+  const market = marketKey(o.market);
+  const zone = marketZone(market);
+  const deliveryDay = ctx.deliveryDay || reconfirmDeliveryDay(o);
+  // Numbers stay numbers and null stays null (contract section 4): the
+  // droplet reads a null column as None, so Number(null) = 0 here would
+  // read as a change at send time and bounce the row for ever.
+  const qty = factNumber(o.coconuts_qty);
+  const source = {
+    stage: factText(o.stage),
+    coconuts_qty: qty,
+    delivery_at_utc: factText(o.delivery_at_utc),
+    delivery_notes: factText(o.delivery_notes),
+    venue: factText(o.venue),
+    client_name: factText(o.client_name),
+    client_email: factText(o.client_email),
+    client_phone: factText(o.client_phone),
+    crack_type: factText(o.crack_type),
+    invoice_fulfillment: {
+      address: factText(inv.address), cracking: factText(inv.cracking), cracking_note: factText(inv.cracking_note),
+      delivery_window: factText(inv.delivery_window), read_status: factText(inv.read_status),
+    },
+    // 'location' (the gate note, 038) rides along beyond the contract's key
+    // list; the droplet compares only the listed keys, so it is harmless there.
+    delivery_request: {
+      status: factText(dr.status), window: factText(dr.window), contact_name: factText(dr.contact_name),
+      contact_phone: factText(dr.contact_phone), location: factText(dr.location),
+    },
+    logo_url: factText(o.logo_url),
+    logo_asset_status: asset ? factText(asset.status) : null,
+    // orders.logo_received is a boolean column: it stays true or false here
+    // (never the text 'true'), because the droplet reads the live column as
+    // a boolean and compares it to this value at send time. A text value
+    // (an older row) is kept as trimmed text. The template never reads it:
+    // the picture alone decides the Count line.
+    logo_received: typeof o.logo_received === 'boolean' ? o.logo_received : factText(o.logo_received),
+    balance_cents: factNumber(o.balance_cents),
+    external_invoice_url: factText(o.external_invoice_url),
+  };
+  // The departure plan's own address precedence: the invoice ship address
+  // when read completely, else the delivery notes, else the venue. Never
+  // a billing address (the invoice reader drops it before it gets here).
+  const dest = departureDestination(o);
+  // Window: the owner-confirmed request wins; else a parseable invoice
+  // window. A time with no AM/PM is a guess, so it is asked for instead.
+  let windowText = '';
+  if (source.delivery_request.status === 'confirmed' && source.delivery_request.window) windowText = source.delivery_request.window;
+  else if (source.invoice_fulfillment.delivery_window) windowText = source.invoice_fulfillment.delivery_window;
+  const parsed = windowText ? parseArrivalTime(windowText, deliveryDay, zone) : null;
+  const windowWords = parsed && parsed.ok && parsed.kind !== 'assumed' ? parsed.label : null;
+  const contactWords = [source.delivery_request.contact_name, source.delivery_request.contact_phone].filter(Boolean).join(', ') || null;
+  // First name: the first word of the customer name that is not an
+  // article or a title, punctuation stripped, so 'The Maidstone' greets
+  // Maidstone and QuickBooks' 'Rivera, Jamie' greets Rivera (no stray
+  // comma), else 'there'.
+  const nameWords = collapseSpaces(source.client_name || '').split(' ').map((w) => w.replace(/[^A-Za-z'\-]/g, '')).filter(Boolean);
+  const derived = {
+    first_name: nameWords.find((w) => !/^(the|a|an|mr|mrs|ms|dr)$/i.test(w)) || 'there',
+    day_words: longDayWords(deliveryDay),
+    prep_day_words: longDayWords(addDays(deliveryDay, -1)),
+    reply_by_words: longDayWords(addDays(deliveryDay, -3)),
+    count: Number.isInteger(source.coconuts_qty) && source.coconuts_qty > 0 ? source.coconuts_qty : null,
+    address: dest.address || null,
+    cracking_words: reconfirmCrackingWords(source),
+    window_words: windowWords,
+    contact_words: contactWords,
+    // deposit_cents and balance_cents are RECEIVED installments (the
+    // payment poller writes them), never the amount owed. Money is still
+    // open until QuickBooks moves the stage to paid_full.
+    balance_open: source.stage !== 'paid_full' && !!source.external_invoice_url,
+    market, zone,
+  };
+  return { source, derived };
+}
+// Hard holds. Soft gaps (window, site contact, logo) never appear here:
+// the email sends and asks.
+export function reconfirmHolds(facts, ctx = {}) {
+  const f = facts || { source: {}, derived: {} };
+  const reasons = [];
+  if (!f.derived.count) reasons.push('count_missing');
+  if (!f.derived.address) reasons.push('address_missing');
+  if (!f.derived.cracking_words) reasons.push('cracking_unknown');
+  if (ctx.pendingProposal) reasons.push('pending_time_proposal');
+  reasons.push(...reconfirmRecipientHolds(ctx.recipients));
+  if (!f.source.delivery_at_utc) reasons.push('date_unverified');
+  return reasons;
+}
+
+// ── change detection (the worker's side of contract section 4) ──────
+// Flat list of the compared keys, nested ones dotted.
+const RECONFIRM_SOURCE_KEYS = [
+  'stage', 'coconuts_qty', 'delivery_at_utc', 'delivery_notes', 'venue', 'client_name', 'client_email', 'client_phone', 'crack_type',
+  'invoice_fulfillment.address', 'invoice_fulfillment.cracking', 'invoice_fulfillment.cracking_note', 'invoice_fulfillment.delivery_window', 'invoice_fulfillment.read_status',
+  'delivery_request.status', 'delivery_request.window', 'delivery_request.contact_name', 'delivery_request.contact_phone', 'delivery_request.location',
+  'logo_url', 'logo_asset_status', 'logo_received', 'balance_cents', 'external_invoice_url',
+];
+function reconfirmSourceValue(source, key) {
+  let v = source || {};
+  for (const part of key.split('.')) v = v && typeof v === 'object' ? v[part] : undefined;
+  if (v == null) return null;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'boolean') return v;
+  const s = String(v).trim();
+  if (s === '') return null;
+  return /^-?\d+(\.\d+)?$/.test(s) && (key === 'coconuts_qty' || key === 'balance_cents') ? Number(s) : s;
+}
+// The keys whose normalised values differ, as [{ key, from, to }].
+export function reconfirmSourceDiff(before, after) {
+  const diff = [];
+  for (const key of RECONFIRM_SOURCE_KEYS) {
+    const from = reconfirmSourceValue(before, key), to = reconfirmSourceValue(after, key);
+    if (from !== to) diff.push({ key, from, to });
+  }
+  return diff;
+}
+// Plain words for the owner's push and the app row. Never an email, a
+// phone, an address or a dollar: those fields are named, not quoted.
+export function reconfirmChangeNote(diff) {
+  const keys = new Set((diff || []).map((d) => d.key));
+  const get = (k) => (diff || []).find((d) => d.key === k) || {};
+  const notes = [];
+  if (keys.has('coconuts_qty')) notes.push(`count ${get('coconuts_qty').from ?? 'unknown'} to ${get('coconuts_qty').to ?? 'unknown'}`);
+  if (keys.has('delivery_at_utc')) {
+    const day = (v) => String(v || '').slice(0, 10) || 'none';
+    notes.push(`date ${day(get('delivery_at_utc').from)} to ${day(get('delivery_at_utc').to)}`);
+  }
+  if (['invoice_fulfillment.address', 'invoice_fulfillment.read_status', 'delivery_notes', 'venue'].some((k) => keys.has(k))) notes.push('address changed');
+  if (['crack_type', 'invoice_fulfillment.cracking', 'invoice_fulfillment.cracking_note'].some((k) => keys.has(k))) notes.push('cracking changed');
+  if (['delivery_request.status', 'delivery_request.window', 'invoice_fulfillment.delivery_window'].some((k) => keys.has(k))) notes.push('delivery time changed');
+  if (['delivery_request.contact_name', 'delivery_request.contact_phone'].some((k) => keys.has(k))) notes.push('site contact changed');
+  if (keys.has('delivery_request.location')) notes.push('gate note changed');
+  if (keys.has('client_email')) notes.push('customer email changed');
+  if (keys.has('client_phone')) notes.push('customer phone changed');
+  if (keys.has('client_name')) notes.push('customer name changed');
+  if (keys.has('stage')) notes.push(`stage ${get('stage').from || 'none'} to ${get('stage').to || 'none'}`);
+  if (['logo_url', 'logo_asset_status', 'logo_received'].some((k) => keys.has(k))) notes.push('logo changed');
+  if (['balance_cents', 'external_invoice_url'].some((k) => keys.has(k))) notes.push('balance changed');
+  return notes.length ? notes.slice(0, 3).join(', ') : null;
+}
+
+// ── the template (plan section 2, byte for byte) ────────────────────
+// opts: ownerCell (the OWNER_CELL secret, may be blank), venueWord (same
+// customer, two orders on one day), updated (a resend after a change),
+// picture (null or the picture object; the droplet embeds it above the
+// Delivery line, the text never mentions it). The picture also decides
+// the Count line (decided 2026-09-14): a logo file on file (an approved
+// preview or a png/jpeg logo) means "custom branded coconuts"; without
+// one the line says plain "coconuts", the email carries no picture and
+// no logo sentence, and the OWNER sees "no image" on the row in the app
+// instead. logo_received is a boolean column and no value says "plain
+// coconuts", so the email never asks the customer for a logo and never
+// claims plain coconuts.
+export function reconfirmTemplate(facts, opts = {}) {
+  const f = facts || { source: {}, derived: {} };
+  const d = f.derived, s = f.source;
+  const day = d.day_words;
+  const venueWord = factText(opts.venueWord);
+  const subject = opts.updated
+    ? `Updated details for ${day}`
+    : `Your coconuts for ${day}${venueWord ? ' at ' + venueWord : ''}: quick reconfirm`;
+  const cell = factText(opts.ownerCell);
+  const askTime = !d.window_words;
+  const askContact = !d.contact_words;
+  // Branded means a picture goes with the email; nothing else counts.
+  const branded = !!(opts.picture && typeof opts.picture === 'object');
+  const gate = s.delivery_request && s.delivery_request.location ? s.delivery_request.location : null;
+  const lines = [];
+  lines.push(`Hi ${d.first_name},`);
+  lines.push('');
+  lines.push(`Your coconuts for ${day} are locked in. One quick read through before we brand them.`);
+  lines.push('');
+  if (askTime && askContact) {
+    lines.push(`Delivery: ${day}. What exact time should our driver arrive, and who should they call on arrival? A time, a name and a cell is perfect.`);
+  } else if (askTime) {
+    lines.push(`Delivery: ${day}. What exact time should our driver arrive? One line like 'please arrive at ...' with the time is perfect.`);
+  } else {
+    lines.push(`Delivery: ${day}, arriving ${d.window_words}`);
+  }
+  lines.push(`Drop off: ${d.address || ''}${gate ? ', ' + gate : ''}`);
+  // "custom branded" only when the picture goes with the email; without a
+  // logo file the line is plain and no logo sentence follows (the owner
+  // gets the missing-logo alarm on the row, the customer is never asked).
+  lines.push(`Count: ${d.count || ''} ${branded ? 'custom branded coconuts' : 'coconuts'}`);
+  lines.push(`Cracking: ${d.cracking_words || ''}`);
+  if (!askContact) lines.push(`On site contact: ${d.contact_words}`);
+  else if (!askTime) lines.push('On site contact: who should our driver call when we arrive? A name and cell is perfect.');
+  lines.push(`Your contact on our side: Sidd, ${cell ? cell + ', ' : ''}sidd@hamptonscoconuts.com`);
+  lines.push('');
+  // Reply-by is delivery day minus 3. When a late draft has already passed
+  // that day, "reply today" replaces a date in the past.
+  const replyByDay = addDays(opts.deliveryDay || '', -3);
+  const replyByGap = opts.today && replyByDay ? daysBetween(opts.today, replyByDay) : null;
+  const replyBy = replyByGap != null && replyByGap <= 0 ? 'today' : `by ${d.reply_by_words}`;
+  lines.push(`We brand and box everything on ${d.prep_day_words}, the day before. If anything above needs to change (count, time, address, or who meets us), reply ${replyBy} and I will update it.`);
+  lines.push('');
+  lines.push(askTime && askContact
+    ? 'If everything else looks right, reply with that and we are set.'
+    : 'If it all looks right, just reply "confirmed" and we are set.');
+  lines.push('');
+  lines.push('If there is a run of show or vendor timeline for the day, send it over and I will make sure our arrival matches it.');
+  lines.push('');
+  if (d.balance_open && s.external_invoice_url) {
+    // Never an amount. The invoice number is not stored on the order as a
+    // column (external_invoice_id is QuickBooks' internal id), so the line
+    // names no number.
+    lines.push(`Your invoice is here if you need it: ${s.external_invoice_url}`);
+    lines.push('');
+  }
+  lines.push('Thanks so much,');
+  lines.push('Sidd');
+  lines.push('Hamptons Coconuts');
+  if (cell) lines.push(cell);
+  return { subject: subject.slice(0, 200), body: lines.join('\n').slice(0, 6000) };
+}
+
+// ── push words (owner only; never an email, phone or dollar) ────────
+const RECONFIRM_REASON_WORDS = {
+  count_missing: 'coconut count missing',
+  address_missing: 'drop off address missing',
+  cracking_unknown: 'cracking unknown',
+  pending_time_proposal: 'a Time change? proposal is waiting',
+  no_email: 'no usable customer email',
+  billing_email_only: 'only an accounting email on file',
+  too_many_emails: 'more than 4 email addresses',
+  date_unverified: 'delivery date unverified',
+  owner_hold: 'held by you',
+};
+export function reconfirmReasonWords(reasons) {
+  return (reasons || []).map((r) => RECONFIRM_REASON_WORDS[r] || String(r).replace(/_/g, ' ')).join(', ');
+}
+// "<Last name> / <venue word>" through the lock-screen tag rules (no
+// digits, no @, no $), falling back to the surname when it passes the
+// same rules, else 'Unnamed'. A push body never carries an email.
+export function reconfirmTag(order, address) {
+  return cardJobTag(order, address) || safeTagWord(surname(order && order.client_name), 12) || 'Unnamed';
+}
+// kind: previewed | reminded | held | changed | confirmed | bounced.
+// ctx: tag, day, market, sendAfter, sendsItself, reasons, note.
+export function reconfirmPushTexts(kind, ctx) {
+  const c = ctx || {};
+  const title = `Reconfirmation: ${c.tag}, ${weekdayDayLabel(c.day)}`;
+  if (kind === 'previewed') {
+    const body = c.sendsItself && c.sendAfter
+      ? `Reconfirmation ready: ${c.tag}, sends ${weekdayOf(dayInZone(Date.parse(c.sendAfter), c.market))} ${cardTimeStr(Date.parse(c.sendAfter), c.market)} unless you hold it.`
+      : `Reconfirmation ready: ${c.tag}, needs your Send now.`;
+    return { title, body };
+  }
+  if (kind === 'reminded') return { title, body: `Sends at ${cardTimeStr(Date.parse(c.sendAfter), c.market)} unless you hold it.` };
+  if (kind === 'held') return { title, body: `Reconfirmation needs details: ${c.tag}, ${reconfirmReasonWords(c.reasons)}.` };
+  if (kind === 'changed') return { title, body: `Details changed after the reconfirmation went out: ${c.note}.` };
+  if (kind === 'confirmed') return { title, body: `${c.tag} confirmed for ${weekdayDayLabel(c.day)}.` };
+  if (kind === 'bounced') return { title, body: `Reconfirmation email bounced: ${c.tag}. Check the customer email on the invoice.` };
+  return null;
+}
+// Stable queue ids: a repeated tick is a no-op. One id per row and kind,
+// plus a suffix for the things that may legitimately repeat (a new hold
+// reason set, a new change note).
+export async function reconfirmQueueId(kind, rowId, extra) {
+  return derivedQueueId('hc-reconfirm-v1', String(kind) + '\0' + String(rowId) + (extra != null ? '\0' + String(extra) : ''));
+}
+
+// ── quoted text ─────────────────────────────────────────────────────
+// Drops what a reply quotes back: lines starting with '>' and everything
+// from a recognised quote header down. Recognised headers: Gmail and Apple
+// Mail's "On <date> ... wrote:" (the "wrote:" may sit on the next line,
+// Outlook wraps it), and Outlook's own header block ("From: <one of our
+// addresses>" followed within three lines by "Sent:" or "Date:"), which is
+// our own email coming back. A forwarded coordinator email keeps its
+// header block (their From line is not ours), so a timeline pasted under
+// it is still read. Attachment sections are never stripped: a PDF is
+// never quoted text.
+function reconfirmIsQuoteHeader(lines, i) {
+  const line = String(lines[i] || '').trim();
+  const lower = line.toLowerCase();
+  const onLine = /^on\s+(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+)?(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}|\d{1,2}[\/.-]\d{1,2})/i.test(line);
+  if (onLine) {
+    if (/\bwrote:\s*$/i.test(line)) return true;
+    const next = [lines[i + 1], lines[i + 2]].map((l) => String(l || '').trim());
+    if (next.some((l) => /^wrote:\s*$/i.test(l) || /\bwrote:\s*$/i.test(l))) return true;
+    return false;
+  }
+  if (lower.startsWith('from:')) {
+    const own = reconfirmOwnDomains();
+    const addr = (/[^\s<>,;"']+@[^\s<>,;"']+/.exec(lower) || [''])[0];
+    if (!addr || !own.some((d) => addr.endsWith(d))) return false;
+    for (let j = 1; j <= 3; j++) {
+      if (/^(sent|date):/i.test(String(lines[i + j] || '').trim())) return true;
     }
   }
+  return false;
 }
+export function stripQuotedText(rawText) {
+  const lines = String(rawText || '').split(/\r?\n/);
+  const out = [];
+  let inAttachment = false;
+  let quoting = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^=== ATTACHMENT: .+? \(/.test(line)) { inAttachment = true; quoting = false; out.push(line); continue; }
+    if (inAttachment) { out.push(line); continue; }
+    if (quoting) continue;
+    if (/^\s*>/.test(line)) continue;
+    if (reconfirmIsQuoteHeader(lines, i)) { quoting = true; continue; }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+// ── the reply classifier (plan section 5, contract section 2) ───────
+const RECONFIRM_CONFIRM_PHRASES = ['confirmed', 'confirm', 'looks good', 'all good', 'all set', 'sounds good', 'perfect', 'yes', 'correct', 'great', 'thanks', 'thank you', 'we are set', 'good to go'];
+const RECONFIRM_GREETING_RE = /^(hi|hello|hey|dear|good morning|good afternoon|good evening)( [a-z']+)?$/;
+const RECONFIRM_SIGN_OFF_RE = /^(thanks|thank you|thx|ty|best|cheers|regards|kind regards|best regards|warm regards|warmest regards|sincerely|talk soon|see you (then|there|soon))$/;
+// Words that mean the customer is changing something. A trailing segment
+// carrying one of these is never treated as a signature line.
+const RECONFIRM_CHANGE_WORDS = /\b(please|change|changed|changes|but|instead|actually|however|not|no|can|could|would|should|update|updated|different|new|address|time|count|cancel|cancelled|except|also|question|need|needs|add|remove|more|less|fewer|extra|another|move|moved|reschedule|later|earlier|deliver|delivery|arrive|arrival|coconuts|coconut|logo|invoice|pay|paid|payment|refund|wrong|unfortunately|sorry|if|only|unless)\b/;
+// The words a signature may carry: the customer's own name words (from
+// client_name) and ours ('Sidd'). Any other word at the end of a reply is
+// content ('Yes. Noon', 'Perfect. Gate B'), never a signature.
+function reconfirmKnownNames(clientName) {
+  return new Set(collapseSpaces(clientName || '').toLowerCase().replace(/[^a-z' ]+/g, ' ').split(' ').filter(Boolean).concat(['sidd']));
+}
+// A signature line: one to four words, letters only, none of the change
+// words, and EVERY word a known name (the customer's own name words or
+// Sidd). Nothing else may sit in a signature, not even under the name
+// line: a title or company line ('Events Director', 'The Pridwin') is
+// content, and so is an answer written there ('Noon', 'Gate B'), because
+// 'Yes.\n\nJamie Rivera\nNoon' answers the email's time question and must
+// reach the owner. A corporate signature therefore costs one extra
+// change card; a buried answer would cost a wrong delivery.
+function reconfirmNameLike(original, lower, names) {
+  const words = original.split(' ').filter(Boolean);
+  if (!words.length || words.length > 4) return false;
+  if (RECONFIRM_CHANGE_WORDS.test(lower) || !/^[A-Za-z' ]+$/.test(original)) return false;
+  return words.every((w) => names.has(w.toLowerCase()));
+}
+// A segment made only of list phrases, longest phrase first. `original`
+// (the same words with their casing) lets a trailing name inside the
+// segment ("thanks Sidd", "Confirmed Jamie") count as a signature: one
+// or two known-name words after the phrases, nothing else.
+function reconfirmPhraseRun(segment, original, names) {
+  let rest = segment;
+  let consumed = 0;
+  while (rest) {
+    const hit = RECONFIRM_CONFIRM_PHRASES
+      .filter((p) => rest === p || rest.startsWith(p + ' '))
+      .sort((a, b) => b.length - a.length)[0];
+    if (!hit) break;
+    consumed += hit.split(' ').length;
+    rest = rest.slice(hit.length).trim();
+  }
+  if (!rest) return consumed > 0;
+  if (!consumed || !original) return false;
+  const tail = original.split(' ').filter(Boolean).slice(consumed).join(' ');
+  return tail.split(' ').length <= 2 && reconfirmNameLike(tail, rest, names) && tail === tail.replace(/[^A-Za-z' ]/g, '');
+}
+// A plain confirmation: at most 12 words, no digits, no question, and
+// after a greeting and a clean signature block are set aside every
+// remaining segment is made of phrases from the fixed list. The signature
+// block starts at the first sign-off or known-name line after the first
+// segment (a list phrase is content, the scan keeps going), runs to the
+// end, is at most four segments, and may hold ONLY sign-offs and
+// known-name lines (the customer's own name words and Sidd). Any other
+// word, even under the name line, keeps the block as content and fails
+// the list: one extra card beats a buried change, so 'Yes. Noon',
+// 'Perfect. Gate B' and 'Yes / Jamie Rivera / Noon' are never
+// confirmations.
+//
+// A line the phone appends on its own ('Sent from my iPhone', 'Get
+// Outlook for iOS', 'Sent from my T-Mobile 5G Device'), never the
+// customer's words: it is dropped before anything else is read, so a
+// plain 'Confirmed' from a phone still counts. A fixed pattern, anchored
+// to the whole line, never free text: 'Sent from my iPhone. Please arrive
+// at noon' does not match and stays content. After the device name the
+// footer may carry only the fixed vocabulary below ('Galaxy S24 Ultra',
+// 'T-Mobile 5G Device'), so a customer who types on the footer line
+// itself without punctuation ('Sent from my iPhone noon', 'Sent from my
+// iPhone please arrive at noon') never matches and stays content. The
+// change-word check on the drop line stays as a belt on top of that.
+// The words a footer may carry after the device name: a token with a
+// digit ('5G', 'S24'), or a device, carrier or typo-excuse word; never
+// free text, so 'Sent from my iPhone noon' stays content.
+const RECONFIRM_DEVICE_TAIL = String.raw`(?:[a-z0-9-]*\d[a-z0-9-]*|iphone|ipad|galaxy|android|samsung|pixel|mobile|phone|smartphone|device|wireless|lte|ultra|pro|max|plus|mini|note|fold|flip|edge|se|xr|xs|for|ios|windows|mail|outlook|gmail|yahoo|verizon|t-mobile|at&t|sprint|boost|metro|cricket|so|excuse|pardon|forgive|typos|errors|brevity|mistakes|any|the|my)`;
+const RECONFIRM_DEVICE_SIG_RE = new RegExp(String.raw`^(sent from (my |the )?(iphone|ipad|ipod|galaxy|android|samsung|pixel|mobile|phone|smartphone|t-mobile|verizon|at&t|blackberry|outlook|gmail|yahoo|mail for windows|windows mail)(\s` + RECONFIRM_DEVICE_TAIL + String.raw`){0,6}|get outlook for (ios|android)|sent via (my |the )?` + RECONFIRM_DEVICE_TAIL + String.raw`(\s` + RECONFIRM_DEVICE_TAIL + String.raw`){0,5})[.!]?$`, 'i');
+export function isPlainConfirmation(text, clientName) {
+  // The device footer goes first: its digits ('5G') must never refuse the list.
+  const raw = String(text || '').replace(/[‘’“”]/g, "'").split(/\r?\n/).filter((l) => !(RECONFIRM_DEVICE_SIG_RE.test(l.trim()) && !RECONFIRM_CHANGE_WORDS.test(l.trim().toLowerCase()))).join('\n');
+  if (/\d/.test(raw) || raw.includes('?')) return false;
+  const words = raw.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 12) return false;
+  const names = reconfirmKnownNames(clientName);
+  // Segments keep their original casing (the signature rule reads it) next
+  // to a lower-case copy for the phrase list.
+  const segs = raw.split(/[\n.,!;:()\-]+/)
+    .map((s) => s.replace(/[^A-Za-z' ]+/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .map((s) => ({ original: s, lower: s.toLowerCase() }));
+  if (segs.length && RECONFIRM_GREETING_RE.test(segs[0].lower)) segs.shift();
+  let start = -1;
+  for (let i = 1; i < segs.length; i++) {
+    const s = segs[i];
+    if (reconfirmPhraseRun(s.lower, s.original, names)) continue;
+    if (RECONFIRM_SIGN_OFF_RE.test(s.lower) || reconfirmNameLike(s.original, s.lower, names)) { start = i; break; }
+  }
+  if (start > 0 && segs.length - start <= 4) {
+    let clean = true;
+    for (const s of segs.slice(start)) {
+      if (RECONFIRM_SIGN_OFF_RE.test(s.lower)) continue;
+      if (reconfirmNameLike(s.original, s.lower, names)) continue;
+      clean = false;
+      break;
+    }
+    if (clean) segs.splice(start);
+  }
+  if (!segs.length) return false;
+  return segs.every((s) => reconfirmPhraseRun(s.lower, s.original, names));
+}
+// An auto reply announces itself on the OPENING line ("I am out of the
+// office until Monday", "Thank you for your email. I am currently out of
+// the office"). A mention deeper in a human reply ("Hi Sidd, I will be out
+// of the office that day, please call Maria") is content and goes to the
+// owner, and so is a human opening that goes on with the job (below).
+const RECONFIRM_AUTO_OPENING_RE = /^(thank you for (your|the) (e-?mail|message|note)[.!]?\s*)?(i am|i'm|i will be|i'll be|we are|we're)\s+(currently\s+|now\s+)?(out of (the )?office|away from (the|my) (office|desk))/i;
+// What an auto reply says AFTER the announcement: when the sender is back
+// ('until Monday', 'returning Friday', 'through September 21') or how
+// little access they have ('with limited access', 'will respond when I
+// return'), or nothing at all ('I am out of the office.'). A human line
+// that goes on with the job instead ('I will be out of the office that
+// day, please call Maria at the gate') is content and goes to the owner.
+const RECONFIRM_AUTO_TAIL_RE = /^\s*[.!,;]?\s*$|\b(until|till|thru|through|returning|return|back|access|respond|response|reply|replies|absence|limited|urgent)\b/i;
+function reconfirmOpeningIsAutoReply(opening) {
+  if (/^automatic reply/i.test(opening)) return true;
+  const m = RECONFIRM_AUTO_OPENING_RE.exec(opening);
+  return !!m && RECONFIRM_AUTO_TAIL_RE.test(opening.slice(m[0].length));
+}
+// kind: auto_reply | bounced | confirmed | time | changed. Nothing here
+// changes an order; a time goes to the proposal scan (Accept/Keep in the
+// app) and anything else goes to the owner as a card. client_name is the
+// order's customer name: the only words a signature may carry.
+export function classifyReconfirmationReply({ subject, from_addr, raw_text, client_name } = {}) {
+  const subj = String(subject || '').trim();
+  const from = String(from_addr || '').trim().toLowerCase();
+  const stripped = stripQuotedText(raw_text);
+  const bodyOnly = stripped.split(/^=== ATTACHMENT: /m)[0];
+  const opening = bodyOnly.split('\n').map((l) => l.trim()).find(Boolean) || '';
+  if (/out of (the )?office|automatic reply|auto-?reply|autoreply/i.test(subj) || reconfirmOpeningIsAutoReply(opening)) {
+    return { kind: 'auto_reply', stripped };
+  }
+  const local = (/([^<\s@]+)@/.exec(from) || [])[1] || '';
+  if (/^(postmaster|mailer-daemon)$/.test(local) || /^undeliverable/i.test(subj)) return { kind: 'bounced', stripped };
+  // An attachment (a logo, a run of show) is content: never a plain confirmation.
+  if (!stripped.includes('=== ATTACHMENT: ') && isPlainConfirmation(bodyOnly, client_name)) return { kind: 'confirmed', stripped };
+  const times = extractArrivalTimes(stripped);
+  if (times.length) return { kind: 'time', stripped, times };
+  return { kind: 'changed', stripped };
+}
+// A short, safe excerpt of the customer's words for change_note (the app
+// row prints it): addresses, phones and amounts blanked, 120 characters.
+function reconfirmReplyExcerpt(text) {
+  const safe = stripContactShapes(String(text || '').split(/^=== ATTACHMENT: /m)[0])
+    .replace(/\$\s?\d[\d,.]*/g, '[amount]');
+  return safe ? 'reply: ' + safe.slice(0, 120) : 'reply';
+}
+
+// ── database plumbing ───────────────────────────────────────────────
+// Paged read (PostgREST caps one response at 1000 rows). The query must
+// carry a deterministic order; any failed page returns null.
+async function fetchSbAll(env, pathQuery) {
+  const all = [];
+  for (let from = 0; ; from += 1000) {
+    const page = await fetchSb(env, pathQuery + '&offset=' + from + '&limit=1000');
+    if (!page) return null;
+    all.push(...page);
+    if (page.length < 1000) break;
+  }
+  return all;
+}
+const RECONFIRM_ORDER_COLUMNS = 'id,client_name,client_email,client_phone,venue,delivery_notes,delivery_at_utc,stage,market,coconuts_qty,crack_type,invoice_fulfillment,delivery_request,logo_url,logo_asset,logo_received,balance_cents,deposit_cents,external_invoice_id,external_invoice_url,is_recurring';
+const RECONFIRM_LIVE_STATUSES = ['ready', 'held', 'released', 'claimed', 'sent', 'confirmed', 'changed'];
+const RECONFIRM_TABLE = 'order_reconfirmations';
+// Guarded PATCH: the filter names the status the row must still have, so
+// an owner tap or the droplet's claim in the meantime always wins.
+async function patchReconfirmation(env, id, guard, body) {
+  const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + RECONFIRM_TABLE + '?id=eq.' + encodeURIComponent(id) + (guard ? '&' + guard : ''), {
+    method: 'PATCH',
+    headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+    body: JSON.stringify({ ...body, updated_at: new Date(Date.now()).toISOString() }),
+  }, 15000);
+  if (!resp.ok) { console.error('reconfirmation patch failed:', id, resp.status); return null; }
+  const rows = await resp.json();
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+async function insertReconfirmation(env, row) {
+  const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + RECONFIRM_TABLE, {
+    method: 'POST',
+    headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
+    body: JSON.stringify(row),
+  }, 15000);
+  // 409 = a row for this order and day already exists (two ticks raced);
+  // the next tick sees it and moves on.
+  if (resp.status === 409) return { duplicate: true, row: null };
+  if (!resp.ok) { console.error('reconfirmation insert failed:', row.order_id, resp.status, (await resp.text()).slice(0, 200)); return { duplicate: false, row: null }; }
+  const rows = await resp.json();
+  return { duplicate: false, row: Array.isArray(rows) && rows[0] ? rows[0] : null };
+}
+async function sendReconfirmPush(env, market, kind, ctx, queueId, order, day, extraData) {
+  const texts = reconfirmPushTexts(kind, ctx);
+  if (!texts) return { queued: false };
+  return sendPushToMarket(env, market, texts.title, texts.body, {
+    recipients: 'owner', ownersOnly: true, queueId, collapseId: 'reconfirm-' + ctx.rowId, threadId: 'reconfirm-' + ctx.rowId,
+    kind: 'reconfirm_' + kind, orderId: order.id, day, data: { reconfirmation_id: ctx.rowId, ...(extraData || {}) },
+  });
+}
+// Everything one row holds that is computed from the order.
+function reconfirmDraft(order, ctx) {
+  const facts = reconfirmFacts(order, { deliveryDay: ctx.deliveryDay });
+  const recipients = reconfirmRecipients(order.client_email);
+  const picture = reconfirmPicture(order);
+  const holds = reconfirmHolds(facts, { pendingProposal: ctx.pendingProposal, recipients });
+  const text = reconfirmTemplate(facts, { ownerCell: ctx.ownerCell, venueWord: ctx.venueWord, updated: ctx.updated, picture, today: ctx.today, deliveryDay: ctx.deliveryDay });
+  return { facts, recipients, picture, holds, subject: text.subject, body: text.body };
+}
+// Same customer, two orders on one delivery day: each subject carries its
+// venue word so the two emails read apart.
+function reconfirmVenueWords(orders) {
+  const groups = new Map();
+  for (const o of orders) {
+    const day = reconfirmDeliveryDay(o);
+    const who = collapseSpaces(String(o.client_name || '')).toLowerCase();
+    if (!day || !who) continue;
+    const key = day + '|' + who;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(o);
+  }
+  const words = new Map();
+  for (const list of groups.values()) {
+    if (list.length < 2) continue;
+    for (const o of list) {
+      const w = [o.venue, o.delivery_notes].map((t) => collapseSpaces(t).split(' ').map((x) => safeTagWord(x, 20)).find(Boolean) || '').find(Boolean);
+      if (w) words.set(o.id, w);
+    }
+  }
+  return words;
+}
+
+// ── the hourly scan ─────────────────────────────────────────────────
+// Exported for worker/test-reconfirmation.mjs. Returns its counts.
+export async function runReconfirmationScan(env) {
+  // Intake nags ride the same hourly cron; run them first so the early
+  // returns below (mode off, nothing due) cannot skip them.
+  await runIntakeNagScan(env);
+  const counts = { mode: reconfirmMode(env), seen: 0, drafted: 0, held: 0, rewritten: 0, released: 0, capped: 0, reminded: 0, changed: 0, expired: 0, skipped: 0, failed: 0 };
+  if (counts.mode === 'off') return counts;
+  try {
+    const nowMs = Date.now();
+    const cap = reconfirmDailyCap(env);
+    const ownerCell = factText(env.OWNER_CELL);
+    // Phase A: RECONFIRM_TEST_TO is stamped into every row's test_to (on
+    // insert and on every rewrite, null once the setting is gone) so the
+    // app can show "Test mode" and the droplet sends only to that address.
+    const testTo = factText(env.RECONFIRM_TEST_TO);
+    const todayEt = dayInZone(nowMs, 'ny');
+    // One day back and a week ahead in Eastern time bounds the orders read;
+    // each order and row is then judged in its own market's zone. The
+    // reconfirmation rows are read from a WEEK back: a row that went out
+    // for a day that has passed must stay in view, so the owner's Done on
+    // a moved date keeps holding (emailedOrders below) until the old day
+    // is a week gone. The loop leaves sent and confirmed rows for a past
+    // day alone and expires a stale ready or held one, so the wider read
+    // changes nothing else.
+    const lo = addDays(todayEt, -1), hi = addDays(todayEt, 7);
+    const rowsLo = addDays(todayEt, -7);
+    const rows = await fetchSb(env, RECONFIRM_TABLE + '?select=*&delivery_day=gte.' + rowsLo + '&order=id.asc&limit=1000');
+    if (!rows) { console.error('reconfirmation scan: table missing or unreadable (migration 044?), nothing done'); return counts; }
+    const orders = await fetchSbAll(env, 'orders?select=' + RECONFIRM_ORDER_COLUMNS +
+      '&stage=in.(invoiced,deposit_paid,paid_full)&external_invoice_id=not.is.null&is_recurring=not.is.true' +
+      '&delivery_at_utc=gte.' + lo + 'T00:00:00Z&delivery_at_utc=lt.' + hi + 'T00:00:00Z&order=delivery_at_utc.asc,id.asc');
+    if (!orders) return counts;
+    const byId = new Map(orders.map((o) => [o.id, o]));
+    // Rows whose order fell out of the window (cancelled, moved) are read by id.
+    const missing = [...new Set(rows.map((r) => r.order_id).filter((id) => id && !byId.has(id)))];
+    if (missing.length) {
+      const extra = await fetchSb(env, 'orders?select=' + RECONFIRM_ORDER_COLUMNS + '&id=in.(' + missing.map((id) => encodeURIComponent('"' + id + '"')).join(',') + ')&limit=' + missing.length);
+      for (const o of extra || []) byId.set(o.id, o);
+    }
+    // Undecided Time change? proposals hold a draft until the owner decides.
+    const candidateIds = [...byId.keys()];
+    const pending = candidateIds.length
+      ? (await fetchSb(env, 'order_time_proposals?select=order_id&status=eq.pending&order_id=in.(' + candidateIds.map((id) => encodeURIComponent('"' + id + '"')).join(',') + ')&limit=500') || [])
+      : [];
+    const pendingSet = new Set(pending.map((p) => p.order_id));
+    const venueWords = reconfirmVenueWords(orders);
+    const activeByKey = new Map();
+    // Orders with a superseded row (the owner tapped Resend): the next
+    // draft is an "Updated details" email, whichever day it is for, so a
+    // moved date still reads as an update to the customer. A superseded
+    // row that had bounced does not count: the customer never got that
+    // one, so the fresh draft keeps the first subject.
+    const supersededOrders = new Set();
+    // Orders with a row that went out or is going out (any day in the
+    // week-back read): a moved date makes that row 'changed' below, and
+    // the owner decides Resend (a fresh draft next hour) or Done (no
+    // second email). Until then no fresh draft is made for the new day,
+    // and after Done none is made while the old row is still read (a
+    // week past its old day), so Done holds across the move.
+    const emailedOrders = new Set();
+    for (const r of rows) {
+      const key = r.order_id + '|' + r.delivery_day;
+      if (r.status === 'superseded') { if (r.reply_kind !== 'bounced') supersededOrders.add(r.order_id); continue; }
+      activeByKey.set(key, r);
+      if (!['released', 'claimed', 'sent', 'confirmed', 'changed'].includes(r.status)) continue;
+      // A sent or confirmed row for a day already gone holds only when the
+      // owner's Done put it there (the date moved before the day and the
+      // owner chose no second email). A job whose date moved only AFTER
+      // its old day passed (a rain date) was never flipped to changed, so
+      // it must not block the fresh draft for the new day; that draft
+      // reads as an update, since the customer had the first email.
+      const ro = byId.get(r.order_id);
+      const rPast = daysBetween(dayInZone(nowMs, marketKey(ro && ro.market)), r.delivery_day) < 0;
+      if (rPast && (r.status === 'sent' || r.status === 'confirmed') && r.decision !== 'done') { supersededOrders.add(r.order_id); continue; }
+      emailedOrders.add(r.order_id);
+    }
+    // The daily cap counts rows released TODAY in the market's zone by the
+    // moment they were released: the release PATCH below stamps send_after
+    // with that instant (the RPC's Send now does the same). Only the
+    // owner's Send now taps are exempt; a row the owner held and released
+    // by hand still goes out by the worker and counts.
+    const releasedToday = new Map();
+    for (const r of rows) {
+      if (!['released', 'claimed', 'sent', 'confirmed', 'changed', 'bounced'].includes(r.status) || r.decision === 'send_now' || !r.send_after) continue;
+      const o = byId.get(r.order_id);
+      const market = marketKey(o && o.market);
+      if (dayInZone(Date.parse(r.send_after), market) !== dayInZone(nowMs, market)) continue;
+      releasedToday.set(market, (releasedToday.get(market) || 0) + 1);
+    }
+
+    // 1) Existing rows: change detection, holds, reminders, releases, expiry.
+    for (const row of rows) {
+      // A bounced row (the email never reached the customer) is retired
+      // when its order moved to another day or left the game, so the
+      // owner's list never shows a stale "email bounced" next to the
+      // fresh draft for the new day, or a Resend for a cancelled job.
+      if (row.status === 'bounced') {
+        try {
+          const bo = byId.get(row.order_id) || {};
+          const boDay = reconfirmDeliveryDay(bo);
+          if (RECONFIRM_CLOSED_STAGES.includes(String(bo.stage || '')) || (boDay && boDay !== row.delivery_day)) {
+            await patchReconfirmation(env, row.id, 'status=eq.bounced', { status: 'expired', error_detail: 'bounced row retired: order moved or closed' });
+            counts.expired++;
+          }
+        } catch (e) {
+          counts.failed++;
+          console.error('reconfirmation scan failed on bounced row #' + (row && row.id) + ':', e);
+        }
+        continue;
+      }
+      if (!RECONFIRM_LIVE_STATUSES.includes(row.status)) continue;
+      counts.seen++;
+      try {
+        const o = byId.get(row.order_id);
+        if (!o) { counts.skipped++; continue; }
+        const market = marketKey(o.market);
+        const today = dayInZone(nowMs, market);
+        const daysOut = daysBetween(today, row.delivery_day);
+        const orderDay = reconfirmDeliveryDay(o);
+        const tag = reconfirmTag(o, null);
+        const ctxBase = { rowId: row.id, tag, day: row.delivery_day, market };
+        if (row.status === 'ready' || row.status === 'held') {
+          // The order left the game or its date moved: this row is over.
+          if (RECONFIRM_CLOSED_STAGES.includes(String(o.stage || '')) || (orderDay && orderDay !== row.delivery_day)) {
+            await patchReconfirmation(env, row.id, 'status=in.(ready,held)', { status: 'expired', error_detail: orderDay && orderDay !== row.delivery_day ? 'date moved to ' + orderDay : 'order stage ' + o.stage });
+            counts.expired++;
+            continue;
+          }
+          // A ready (or still held) row nobody sent by the delivery day is
+          // over: a Send now after the day would email the customer about
+          // a past job, and a hold lifting after the day must not revive it.
+          if (daysOut < 0) {
+            await patchReconfirmation(env, row.id, 'status=in.(ready,held)', { status: 'expired', error_detail: 'delivery day passed unsent' });
+            counts.expired++;
+            continue;
+          }
+          const ownerHeld = row.status === 'held' && (row.hold_reasons || []).includes('owner_hold');
+          // The facts are recomputed BEFORE anything else happens to the
+          // row: a hold that was fixed lifts, a stale body (the droplet's
+          // 'facts changed at send time' requeue included) is rewritten,
+          // and only then does the release step below look at it.
+          const draft = reconfirmDraft(o, { deliveryDay: row.delivery_day, pendingProposal: pendingSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(row.order_id), today });
+          const diff = reconfirmSourceDiff(row.facts && row.facts.source, draft.facts.source);
+          const wantHeld = draft.holds.length > 0;
+          const wasHeld = row.status === 'held';
+          const reasonsNow = ownerHeld ? ['owner_hold', ...draft.holds] : draft.holds;
+          const reasonsChanged = JSON.stringify(reasonsNow) !== JSON.stringify(row.hold_reasons || []);
+          const testToChanged = factText(row.test_to) !== testTo;
+          // A row STILL held on delivery day minus 1 (or the day) expires;
+          // the digest names it. A hold that was fixed in time lifts below.
+          if (wasHeld && (wantHeld || ownerHeld) && daysOut <= 1) {
+            await patchReconfirmation(env, row.id, 'status=eq.held', { status: 'expired', error_detail: 'still held on delivery day minus ' + daysOut });
+            counts.expired++;
+            continue;
+          }
+          // Whether a ready row was rewritten in place this tick (the owner
+          // then gets a fresh preview unless the row goes out right away).
+          let freshPreview = false;
+          let current = row;
+          if (diff.length || reasonsChanged || testToChanged || (wantHeld !== wasHeld && !ownerHeld)) {
+            const becomesReady = !wantHeld && !ownerHeld;
+            const body = {
+              subject: draft.subject, body: draft.body, facts: draft.facts, recipients: draft.recipients, picture: draft.picture,
+              hold_reasons: reasonsNow, status: becomesReady ? 'ready' : 'held', test_to: testTo,
+            };
+            // Whether what the OWNER sees (subject, body, recipients,
+            // picture) moved, judged before the PATCH replaces it.
+            const ownerSeesChange = draft.subject !== row.subject || draft.body !== row.body
+              || JSON.stringify(draft.recipients) !== JSON.stringify(row.recipients || [])
+              || JSON.stringify(draft.picture || null) !== JSON.stringify(row.picture || null);
+            // A row that just became ready is scheduled as if drafted now.
+            if (becomesReady && wasHeld) body.send_after = reconfirmSendAfter({ deliveryDay: row.delivery_day, daysOut, nowMs, market });
+            const updated = await patchReconfirmation(env, row.id, 'status=in.(ready,held)', body);
+            if (!updated) { counts.failed++; continue; }
+            counts.rewritten++;
+            if (!becomesReady) {
+              counts.held++;
+              // The owner's own hold is not a missing detail: no push for it.
+              if (reasonsNow.some((r) => r !== 'owner_hold')) {
+                const id = await reconfirmQueueId('held', row.id, reasonsNow.join(','));
+                await sendReconfirmPush(env, market, 'held', { ...ctxBase, reasons: reasonsNow }, id, o, row.delivery_day);
+              }
+              continue;
+            }
+            if (wasHeld) {
+              const id = await reconfirmQueueId('previewed', row.id, body.send_after || 'none');
+              const sent = await sendReconfirmPush(env, market, 'previewed', { ...ctxBase, sendAfter: body.send_after, sendsItself: counts.mode === 'auto' }, id, o, row.delivery_day);
+              if (sent.queued) await patchReconfirmation(env, row.id, 'status=eq.ready', { previewed_at: new Date(nowMs).toISOString() });
+              continue;
+            }
+            // A ready row rewritten in place: when the draft the owner saw
+            // is gone (the subject, body, recipients or picture moved), a
+            // fresh preview follows (a new id per rewrite). A fact that
+            // changes nothing the owner sees (a payment landing moves
+            // balance_cents alone) still rewrites the facts so the
+            // droplet's compare stays in step, but pushes nothing: the
+            // preview would repeat word for word.
+            freshPreview = ownerSeesChange;
+            current = { ...row, ...updated };
+          }
+          if (current.status !== 'ready') continue;
+          const sendMs = current.send_after ? Date.parse(current.send_after) : NaN;
+          if (current.send_after) {
+            // One reminder, an hour before the automatic send.
+            if (counts.mode === 'auto' && !current.reminded_at && sendMs > nowMs && sendMs - nowMs <= 75 * 60000) {
+              const id = await reconfirmQueueId('reminded', row.id);
+              const sent = await sendReconfirmPush(env, market, 'reminded', { ...ctxBase, sendAfter: current.send_after }, id, o, row.delivery_day);
+              if (sent.queued) { counts.reminded++; await patchReconfirmation(env, row.id, 'status=eq.ready', { reminded_at: new Date(nowMs).toISOString() }); }
+            }
+            // Auto release: under the cap, inside 08:00 to 21:00 market time
+            // (a missed planned time never sends at midnight), never on
+            // minus 1 or the day, and never for an order that left the game
+            // (cancelled, fulfilled, complete) or lost its payment. The
+            // release instant is stamped into send_after so the cap counts
+            // it today.
+            const stageNow = String(o.stage || '');
+            const stillPaid = !RECONFIRM_CLOSED_STAGES.includes(stageNow) && reconfirmMoneyReceived(o);
+            if (counts.mode === 'auto' && sendMs <= nowMs && daysOut >= 2 && reconfirmInDraftHours(nowMs, market) && stillPaid) {
+              const used = releasedToday.get(market) || 0;
+              if (used >= cap) counts.capped++;
+              else {
+                const released = await patchReconfirmation(env, row.id, 'status=eq.ready', { status: 'released', send_after: new Date(nowMs).toISOString() });
+                if (released) { counts.released++; releasedToday.set(market, used + 1); continue; }
+              }
+            }
+          }
+          if (freshPreview) {
+            const id = await reconfirmQueueId('previewed', row.id, current.updated_at || new Date(nowMs).toISOString());
+            const sent = await sendReconfirmPush(env, market, 'previewed', { ...ctxBase, sendAfter: current.send_after, sendsItself: counts.mode === 'auto' && sendMs > nowMs }, id, o, row.delivery_day);
+            if (sent.queued) await patchReconfirmation(env, row.id, 'status=eq.ready', { previewed_at: new Date(nowMs).toISOString() });
+          }
+          continue;
+        }
+        if (row.status === 'sent' || row.status === 'confirmed') {
+          if (daysOut < 0) continue;
+          const facts = reconfirmFacts(o, { deliveryDay: row.delivery_day });
+          const diff = reconfirmSourceDiff(row.facts && row.facts.source, facts.source);
+          if (!diff.length) continue;
+          // A payment landing is not a detail change: the balance moving,
+          // the invoice link, or the stage moving between invoiced,
+          // deposit_paid and paid_full refresh the facts quietly (so the
+          // droplet's compare and the next diff start from the current
+          // money) and never flip the row to changed. A move to cancelled
+          // still raises the change.
+          const paidStages = ['invoiced', 'deposit_paid', 'paid_full'];
+          const moneyOnly = diff.every((d) => d.key === 'balance_cents' || d.key === 'external_invoice_url'
+            || (d.key === 'stage' && paidStages.includes(String(d.from)) && paidStages.includes(String(d.to))));
+          if (moneyOnly) {
+            await patchReconfirmation(env, row.id, 'status=eq.' + row.status, { facts });
+            continue;
+          }
+          const note = reconfirmChangeNote(diff) || 'details changed';
+          // The new facts are stored with the note, so Done (back to sent)
+          // does not raise the same change again next hour.
+          const updated = await patchReconfirmation(env, row.id, 'status=in.(sent,confirmed)', { status: 'changed', change_note: note.slice(0, 200), facts });
+          if (!updated) { counts.failed++; continue; }
+          counts.changed++;
+          const id = await reconfirmQueueId('changed', row.id, note);
+          await sendReconfirmPush(env, market, 'changed', { ...ctxBase, note }, id, o, row.delivery_day);
+        }
+      } catch (e) {
+        counts.failed++;
+        console.error('reconfirmation scan failed on row #' + (row && row.id) + ':', e);
+      }
+    }
+
+    // 2) New drafts.
+    for (const o of orders) {
+      try {
+        const e = reconfirmEligibility(o, nowMs);
+        if (!e.eligible) continue;
+        if (activeByKey.has(o.id + '|' + e.deliveryDay)) continue;
+        // An email already went out (or is going out) for this order on
+        // another day: the date moved, and the owner's Resend or Done on
+        // that 'changed' row decides whether a second email is drafted.
+        if (emailedOrders.has(o.id)) { counts.skipped++; continue; }
+        if (!reconfirmInDraftHours(nowMs, e.market)) continue;
+        counts.seen++;
+        const draft = reconfirmDraft(o, { deliveryDay: e.deliveryDay, pendingProposal: pendingSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(o.id), today: e.today });
+        const held = draft.holds.length > 0;
+        const sendAfter = held ? null : reconfirmSendAfter({ deliveryDay: e.deliveryDay, daysOut: e.daysOut, nowMs, market: e.market });
+        const inserted = await insertReconfirmation(env, {
+          order_id: o.id, delivery_day: e.deliveryDay, status: held ? 'held' : 'ready', hold_reasons: draft.holds,
+          facts: draft.facts, subject: draft.subject, body: draft.body, recipients: draft.recipients, picture: draft.picture,
+          mode: counts.mode, send_after: sendAfter, test_to: testTo,
+        });
+        if (inserted.duplicate) { counts.skipped++; continue; }
+        if (!inserted.row) { counts.failed++; continue; }
+        const row = inserted.row;
+        activeByKey.set(o.id + '|' + e.deliveryDay, row);
+        counts.drafted++;
+        const tag = reconfirmTag(o, null);
+        const ctxBase = { rowId: row.id, tag, day: e.deliveryDay, market: e.market };
+        if (held) {
+          counts.held++;
+          const id = await reconfirmQueueId('held', row.id, draft.holds.join(','));
+          await sendReconfirmPush(env, e.market, 'held', { ...ctxBase, reasons: draft.holds }, id, o, e.deliveryDay);
+        } else {
+          const id = await reconfirmQueueId('previewed', row.id, sendAfter || 'none');
+          const sent = await sendReconfirmPush(env, e.market, 'previewed', { ...ctxBase, sendAfter, sendsItself: counts.mode === 'auto' }, id, o, e.deliveryDay);
+          if (sent.queued) await patchReconfirmation(env, row.id, 'status=eq.ready', { previewed_at: new Date(nowMs).toISOString() });
+        }
+      } catch (e) {
+        counts.failed++;
+        console.error('reconfirmation draft failed for order ' + (o && o.id) + ':', e);
+      }
+    }
+  } catch (e) {
+    counts.failed++;
+    console.error('runReconfirmationScan error:', e);
+  }
+  console.log('reconfirmation scan: ' + JSON.stringify(counts));
+  return counts;
+}
+
+// ── the reply step (runs first in the 5-minute intake pass) ─────────
+// Sorts a customer's reply to the reconfirmation email before any
+// Telegram card can go out. Returns the intake ids whose reply is a
+// change, so the card scan can add its one extra line. Never throws.
+export async function runReconfirmationReplyScan(env) {
+  const counts = { seen: 0, confirmed: 0, time: 0, changed: 0, bounced: 0, autoReply: 0, skipped: 0, failed: 0 };
+  const changedIntakeIds = new Set();
+  try {
+    if (reconfirmMode(env) === 'off') return { counts, changedIntakeIds };
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const lo = addDays(dayInZone(nowMs, 'ny'), -1);
+    const sentRows = await fetchSb(env, RECONFIRM_TABLE + '?select=id,order_id,delivery_day,status,recipients,sent_conversation_id,sent_at,reply_kind,reply_intake_id' +
+      '&status=in.(sent,confirmed,changed)&delivery_day=gte.' + lo + '&order=id.asc&limit=500');
+    if (!sentRows || !sentRows.length) return { counts, changedIntakeIds };
+    // Rows Jarvis already filed as 'ignored' are read too: a bounce
+    // (postmaster is on no invoice) and an auto reply land there within
+    // two minutes and would otherwise never be seen. Ignored rows stay
+    // in this filter for good, and the poller stamps a conversation id on
+    // every insert, so bulk ignored mail (vendor PDFs kept by the artwork
+    // rule) could fill the page: pending rows are read for the last week
+    // (a reply lands at most four days after the send), ignored rows only
+    // for the last two days (a bounce or an auto reply lands within
+    // minutes of the send). Newest first, so the customer replies that
+    // matter are never the ones that fall off the 200-row end; the page
+    // is then walked oldest first (below), because the local sentRows
+    // are not refreshed between intakes and the walk order decides which
+    // reply ends up on the row.
+    const since = new Date(nowMs - 7 * 86400000).toISOString();
+    const ignoredSince = new Date(nowMs - 2 * 86400000).toISOString();
+    const intakes = await fetchIntake(env,
+      'select=id,from_addr,subject,raw_text,order_id,conversation_id,created_at,status' +
+      '&or=(status.eq.pending_review,and(status.eq.ignored,created_at.gte.' + encodeURIComponent(ignoredSince) + '))' +
+      '&telegram_message_id=is.null&or=(order_id.not.is.null,conversation_id.not.is.null)' +
+      '&created_at=gte.' + encodeURIComponent(since) + '&order=created_at.desc,id.desc&limit=200');
+    if (!intakes || !intakes.length) return { counts, changedIntakeIds };
+    // The page is read newest first so the 200-row bound keeps the newest
+    // mail, but it is walked oldest first so a customer's LAST word is the
+    // one that lands on the row.
+    intakes.reverse();
+    // Already sorted on an earlier tick (the card did not go out yet).
+    for (const r of sentRows) {
+      if (r.reply_intake_id != null && r.reply_kind === 'changed') changedIntakeIds.add(Number(r.reply_intake_id));
+    }
+    const orderCache = new Map();
+    for (const intake of intakes) {
+      try {
+        if (sentRows.some((r) => r.reply_intake_id != null && Number(r.reply_intake_id) === Number(intake.id))) { counts.skipped++; continue; }
+        const from = (/[^\s<>,;"']+@[^\s<>,;"']+/.exec(String(intake.from_addr || '').toLowerCase()) || [''])[0];
+        const conv = factText(intake.conversation_id);
+        const matches = sentRows.filter((r) => {
+          if (conv && r.sent_conversation_id && r.sent_conversation_id === conv) return true;
+          if (!intake.order_id || r.order_id !== intake.order_id) return false;
+          if (!from || !(r.recipients || []).map((a) => String(a).toLowerCase()).includes(from)) return false;
+          // The sender rule needs the mail to have arrived AFTER the send:
+          // an email that landed minutes before it (still waiting on its
+          // card) is about something else, never the reply.
+          const sentMs = Date.parse(r.sent_at || ''), arrivedMs = Date.parse(intake.created_at || '');
+          if (!Number.isFinite(sentMs) || !Number.isFinite(arrivedMs) || arrivedMs < sentMs) return false;
+          return true;
+        });
+        if (!matches.length) continue;
+        const row = matches.sort((a, b) => Number(b.id) - Number(a.id))[0];
+        // A reply older than the one already on the row never replaces it:
+        // an ignored auto reply (never dismissed, read for two days) or an
+        // older change whose card is still waiting would otherwise be
+        // stamped again after the customer's later word, and a later
+        // "Confirmed" would then read as worker-flagged and lose its push.
+        if (row.reply_intake_id != null && Number(intake.id) < Number(row.reply_intake_id)) { counts.skipped++; continue; }
+        // Matched on the thread itself (the conversation id Microsoft gave
+        // our sent email), not on the sender address.
+        const byConversation = !!(conv && row.sent_conversation_id === conv);
+        // An ignored row matched by the SENDER is only ever a bounce or an
+        // auto reply here; any other ignored mail was Jarvis's call and
+        // stays as it is. A reply on our own thread is different: Jarvis
+        // could only link it by a name or address the order carries, so a
+        // coordinator replying all can be filed 'ignored' by the model's
+        // verdict alone (a 'Confirmed' counts as not_order there). The
+        // thread match is the belt: such a row is read in full, and a
+        // time or a change re-opens it below so it still gets its card.
+        if (intake.status === 'ignored' && !byConversation) {
+          const pre = classifyReconfirmationReply(intake);
+          if (pre.kind !== 'bounced' && pre.kind !== 'auto_reply') { counts.skipped++; continue; }
+        }
+        counts.seen++;
+        let order = orderCache.get(row.order_id);
+        if (!order) {
+          order = ((await fetchSb(env, 'orders?select=id,client_name,venue,delivery_notes,market,delivery_at_utc&id=eq.' + encodeURIComponent(row.order_id) + '&limit=1')) || [])[0] || null;
+          orderCache.set(row.order_id, order);
+        }
+        const market = marketKey(order && order.market);
+        // The sender rule needs a delivery day today or later in the market.
+        if (!byConversation && daysBetween(dayInZone(nowMs, market), row.delivery_day) < 0) continue;
+        const verdict = classifyReconfirmationReply({ ...intake, client_name: order && order.client_name });
+        const stamp = { reply_kind: verdict.kind, replied_at: nowIso, reply_intake_id: intake.id };
+        // A plain confirmation closes the intake row from pending_review,
+        // and from 'ignored' too when the thread match re-read it (the
+        // belt above); a bounce or an auto reply on an ignored row is left
+        // as Jarvis filed it, as before.
+        const dismissIntake = async (fromIgnoredToo = false) => {
+          const guard = fromIgnoredToo ? 'status=in.(pending_review,ignored)' : 'status=eq.pending_review';
+          await webhookFetch(env.SUPABASE_URL + '/rest/v1/intake_messages?id=eq.' + intake.id + '&' + guard, {
+            method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ status: 'dismissed', reviewed_at: nowIso, error_detail: 'reconfirmation reply: ' + verdict.kind }),
+          }, 15000);
+        };
+        // The belt for a time or a change on our own thread that Jarvis
+        // filed 'ignored': the row goes back to pending_review as
+        // maybe_order (classified_at stays, so Jarvis never re-judges it
+        // and the card scan cards it next tick, with the "Reply to the
+        // reconfirmation email" line). The order id from the matched
+        // reconfirmation is stamped when the row has none, the way Jarvis
+        // links, so the card says "Linked to a booked job" and the
+        // proposal scan can make the Time change? row. Guarded on
+        // 'ignored': a row the owner already acted on is left alone.
+        const reopenIgnoredIntake = async () => {
+          if (intake.status !== 'ignored' || !byConversation) return;
+          const body = { status: 'pending_review', classification: 'maybe_order', reviewed_at: null };
+          if (!intake.order_id) body.order_id = row.order_id;
+          await webhookFetch(env.SUPABASE_URL + '/rest/v1/intake_messages?id=eq.' + intake.id + '&status=eq.ignored', {
+            method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify(body),
+          }, 15000);
+        };
+        const tag = reconfirmTag(order || {}, null);
+        const ctx = { rowId: row.id, tag, day: row.delivery_day, market };
+        if (verdict.kind === 'auto_reply') {
+          await patchReconfirmation(env, row.id, null, stamp);
+          await dismissIntake();
+          counts.autoReply++;
+        } else if (verdict.kind === 'bounced') {
+          await patchReconfirmation(env, row.id, 'status=in.(sent,confirmed,changed)', { ...stamp, status: 'bounced', error_detail: ('bounced: ' + String(intake.subject || '')).slice(0, 200) });
+          await dismissIntake();
+          const id = await reconfirmQueueId('bounced', row.id);
+          await sendReconfirmPush(env, market, 'bounced', ctx, id, order || { id: row.order_id }, row.delivery_day, { intake_id: intake.id });
+          counts.bounced++;
+        } else if (verdict.kind === 'confirmed') {
+          // The WORKER flipped this row to changed (the details moved after
+          // the send, so the customer confirmed an email that no longer
+          // matches the order): the reply is only stamped on the row, the
+          // status stays changed and no push goes out, so the owner still
+          // decides Resend or Done in the app. A row the customer's own
+          // reply made changed (reply_kind 'changed') is a different case
+          // and a later "confirmed" closes it as before.
+          const workerFlagged = row.status === 'changed' && row.reply_kind !== 'changed';
+          if (workerFlagged) {
+            await patchReconfirmation(env, row.id, 'status=eq.changed', stamp);
+            await dismissIntake(true);
+            counts.confirmed++;
+            continue;
+          }
+          const already = row.status === 'confirmed';
+          await patchReconfirmation(env, row.id, 'status=in.(sent,confirmed,changed)', { ...stamp, status: 'confirmed' });
+          await dismissIntake(true);
+          if (!already) {
+            const id = await reconfirmQueueId('confirmed', row.id);
+            await sendReconfirmPush(env, market, 'confirmed', ctx, id, order || { id: row.order_id }, row.delivery_day, { intake_id: intake.id });
+          }
+          counts.confirmed++;
+        } else if (verdict.kind === 'time') {
+          // The proposal scan makes the Time change? row from this intake.
+          await patchReconfirmation(env, row.id, null, stamp);
+          await reopenIgnoredIntake();
+          counts.time++;
+        } else {
+          const body = { ...stamp, change_note: reconfirmReplyExcerpt(verdict.stripped).slice(0, 200) };
+          const flipped = row.status === 'changed' ? null : await patchReconfirmation(env, row.id, 'status=in.(sent,confirmed)', { ...body, status: 'changed' });
+          if (!flipped) await patchReconfirmation(env, row.id, null, body);
+          await reopenIgnoredIntake();
+          changedIntakeIds.add(Number(intake.id));
+          counts.changed++;
+        }
+      } catch (e) {
+        counts.failed++;
+        console.error('reconfirmation reply scan failed on intake #' + (intake && intake.id) + ':', e);
+      }
+    }
+  } catch (e) {
+    counts.failed++;
+    console.error('runReconfirmationReplyScan error:', e);
+  }
+  return { counts, changedIntakeIds };
+}
+
+// ── the 8am digest lines ────────────────────────────────────────────
+// "Reconfirmations: N send today, N held (<reasons>), N confirmed, N not
+// sent, no payment yet (<names>)", and when any order inside the window
+// carries a paid stage with nothing recorded, a second line "Stage says
+// paid but nothing recorded, check QuickBooks: <names>". Names only.
+// Nothing when the mode is off or the table is unreadable.
+export async function buildReconfirmationDigestLines(env) {
+  try {
+    if (reconfirmMode(env) === 'off') return [];
+    const nowMs = Date.now();
+    const todayEt = dayInZone(nowMs, 'ny');
+    const lo = addDays(todayEt, -1), hi = addDays(todayEt, 7);
+    const rows = await fetchSb(env, RECONFIRM_TABLE + '?select=id,order_id,delivery_day,status,hold_reasons,send_after,error_detail,facts&delivery_day=gte.' + lo + '&order=id.asc&limit=1000');
+    if (!rows) return [];
+    const orders = await fetchSbAll(env, 'orders?select=' + RECONFIRM_ORDER_COLUMNS +
+      '&stage=in.(invoiced,deposit_paid,paid_full)&external_invoice_id=not.is.null&is_recurring=not.is.true' +
+      '&delivery_at_utc=gte.' + lo + 'T00:00:00Z&delivery_at_utc=lt.' + hi + 'T00:00:00Z&order=delivery_at_utc.asc,id.asc') || [];
+    const byId = new Map(orders.map((o) => [o.id, o]));
+    const marketOf = (r) => marketKey((byId.get(r.order_id) || {}).market);
+    const nameOf = (r) => collapseSpaces((byId.get(r.order_id) || {}).client_name || (r.facts && r.facts.source && r.facts.source.client_name) || 'Unnamed');
+    const sendToday = rows.filter((r) => ['ready', 'released', 'claimed'].includes(r.status) && r.send_after && dayInZone(Date.parse(r.send_after), marketOf(r)) <= dayInZone(nowMs, marketOf(r)));
+    const held = rows.filter((r) => r.status === 'held' && daysBetween(dayInZone(nowMs, marketOf(r)), r.delivery_day) >= 0);
+    const confirmed = rows.filter((r) => r.status === 'confirmed' && daysBetween(dayInZone(nowMs, marketOf(r)), r.delivery_day) >= 0);
+    const expired = rows.filter((r) => r.status === 'expired' && String(r.error_detail || '').startsWith('still held') && daysBetween(dayInZone(nowMs, marketOf(r)), r.delivery_day) >= 0);
+    // Orders with nothing recorded that would qualify the moment a payment
+    // lands (the invoice, the date and the window all pass), so the owner
+    // can chase the deposit while there is time. Two lists: 'invoiced'
+    // with no money is simply unpaid; deposit_paid or paid_full with no
+    // money means the stage and QuickBooks disagree (a hand-set stage),
+    // and the owner checks QuickBooks before anything sends.
+    const wouldQualify = (o) => !reconfirmMoneyRecorded(o) && reconfirmEligibility({ ...o, deposit_cents: 1, balance_cents: 0 }, nowMs).eligible;
+    const unpaid = orders.filter((o) => String(o.stage || '') === 'invoiced' && wouldQualify(o));
+    const stageOnly = orders.filter((o) => RECONFIRM_PAID_STAGES.includes(String(o.stage || '')) && wouldQualify(o));
+    const nameOfOrder = (o) => collapseSpaces(o.client_name || 'Unnamed');
+    const reasons = [...new Set(held.flatMap((r) => r.hold_reasons || []))];
+    let line = 'Reconfirmations: ' + sendToday.length + ' send today, ' + held.length + ' held' +
+      (reasons.length ? ' (' + reconfirmReasonWords(reasons) + ')' : '') + ', ' + confirmed.length + ' confirmed, ' +
+      unpaid.length + ' not sent, no payment yet' + (unpaid.length ? ' (' + unpaid.map(nameOfOrder).join(', ') + ')' : '');
+    if (expired.length) line += ', ' + expired.length + ' expired unsent (' + expired.map(nameOf).join(', ') + ')';
+    const out = [line];
+    if (stageOnly.length) out.push('Stage says paid but nothing recorded, check QuickBooks: ' + stageOnly.map(nameOfOrder).join(', '));
+    return out;
+  } catch (e) {
+    console.error('reconfirmation digest error:', e);
+    return [];
+  }
+}
+// ════════════════════════════════════════════════════════════════════
+// end of the reconfirmation block
+// ════════════════════════════════════════════════════════════════════
 
 // Hourly — find events whose delivery was 4-5 hours ago and prompt for debrief
 async function runDebriefScan(env) {
@@ -1503,6 +2807,14 @@ async function sendIntakeCard(env, chatId, text, intakeId) {
 
 // The every-5-minutes scan itself.
 async function runIntakeCardScan(env) {
+  // Replies to the reconfirmation email are sorted FIRST (2026-09-14): a
+  // plain "confirmed" is stamped on its row and dismissed here, so it
+  // never becomes a card; a reply that changes something still gets its
+  // card, with one extra line (below). Never throws.
+  let reconfirmReplies = new Set();
+  try { reconfirmReplies = (await runReconfirmationReplyScan(env)).changedIntakeIds; }
+  catch (e) { console.error('runReconfirmationReplyScan error:', e); }
+
   // Up to 5 rows per tick, oldest first, so a burst of email can never
   // flood the chat in one go. Filters, in plain English: still waiting
   // for review, no card sent yet, Jarvis has classified it, and the
@@ -1561,6 +2873,12 @@ async function runIntakeCardScan(env) {
       // that), so the card only points the way.
       if (row.order_id) {
         notes.push('Linked to a booked job. A changed delivery time is decided in the HC Field app (Needs you), not here.');
+      }
+      // The customer answered the reconfirmation email with a change (a
+      // new count, a new address, a question). The row is already stamped
+      // 'changed'; Sidd fixes the fact where it lives, then taps Resend.
+      if (reconfirmReplies.has(Number(row.id))) {
+        notes.push('Reply to the reconfirmation email');
       }
       // The summary is written BY A MODEL FROM the sender's own email, so
       // a determined sender can influence its wording. Label it, and put
@@ -5120,7 +6438,11 @@ function isMailHeaderLine(line) {
   return MAIL_HEADER_RE.test(String(line || '').trim());
 }
 export function extractArrivalTimes(rawText) {
-  const lines = String(rawText || '').slice(0, 100000).split(/\r?\n/);
+  // Quoted text goes first (2026-09-14): a customer replying to our own
+  // reconfirmation email quotes "Delivery: ..., arriving 3:30 PM" back,
+  // and that line must never be read as their answer. Attachment sections
+  // survive the strip (stripQuotedText).
+  const lines = stripQuotedText(String(rawText || '').slice(0, 100000)).split(/\r?\n/);
   const entries = [];
   let where = 'body';
   for (const raw of lines) {
