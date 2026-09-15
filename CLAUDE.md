@@ -405,6 +405,23 @@ Probed from the droplet with the app's exact parameter names.
   and a garbage token both answer 401 {"ok":false,"error":"Authentication
   required"} with Cache-Control no-store; GET still falls through to the
   "bot is running" text. Rollback target: acb7b4de.
+- RECONFIRMATION EMAIL LIVE IN PHASE A (2026-09-15 01:45 UTC, Sidd's "yes
+  do it"): migration 044 applied ~01:25 UTC (24,430 bytes, sha1 27fea548;
+  verify with partials-2026-09-14/verify044.py from the droplet); worker
+  version 5525e3df from feature/departure-plan d069010 (secrets OWNER_CELL,
+  then RECONFIRM_MODE=auto and RECONFIRM_TEST_TO=sidd@... -> version
+  f590675f); Jarvis PR #171 merged (main 8836816, poller restarted on the
+  time-based poll with .outlook_poll_state.json), droplet .env
+  RECONFIRM_SEND_ENABLED=1 + RECONFIRM_TEST_TO. Every released draft goes to
+  Sidd's own inbox with a [TEST for ...] subject tag and hands the slot
+  back; no customer receives anything until RECONFIRM_TEST_TO is removed
+  from the droplet .env (Phase B, needs "yes do it"). The hourly scan
+  logs `reconfirmation scan: {mode, seen, drafted, held, ...}`; it drafts
+  only 08:00 to 21:00 market time (seen 0 outside those hours is normal).
+  Rollback: worker RECONFIRM_MODE=off (secret) stops drafting; droplet
+  RECONFIRM_SEND_ENABLED unset stops sending; 044 rollback file exists.
+  Plan: ../RECONFIRMATION-EMAIL-PLAN-2026-09-14.md; names:
+  ../RECONFIRMATION-CONTRACT-2026-09-14.md.
 - WORKER DEPLOYED 2026-09-14 16:45 UTC (Sidd's "yes do it"): live version
   1dcf73f0-5e52-4053-a714-6abbfdefa065 from feature/departure-plan head
   42086c9. THE FIRST REAL FALSE ALARM of the proposal scan: a customer's
