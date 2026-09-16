@@ -352,6 +352,155 @@ scenarios). Apply after 041 (any time). The HC Field Team screen (build 34)
 is the caller. Offboarding by hand until then: scratchpad offboard scripts
 (roster flag + tokens on the droplet, TestFlight tester on the laptop).
 
+## Address proposals from customer email (migration 045, BUILT 2026-09-16, NOT deployed)
+
+Plan: `../PHASE2-ADDRESS-PROPOSALS-PLAN-2026-09-15.md` (sections 4 and 5a are
+the worker's half). Built on `feature/address-proposals` (cut from
+feature/departure-plan, NEVER main). The why: invoice 2049 carried Alison
+Sheeley's Englewood, NJ address on one line and QuickBooks taxed it as NYC,
+while the address sat in her August email the whole time.
+
+- `runProposalScan` (5-minute chain) now also reads a drop off address out
+  of every linked, invoiced intake email (`extractDeliveryAddresses` over the
+  full raw_text, PDF sections included: street plus city and state, delivery
+  context, never a signature, billing block, vendor list, PO box or our own
+  garage; two distinct sites at the best rank = nothing). One pass per email,
+  stamped in `intake_messages.address_scanned_at` (left null while the order
+  has no invoice, so it is read again once invoiced). Agreement with a
+  STRUCTURED invoice address (`invoice_fulfillment.address_structured` true,
+  written by Jarvis) is silent; agreement with a one-line address still
+  proposes (that is the tax bug); a structured address the owner wrote AFTER
+  the email is stale and drops. A missing ZIP gets ONE Apple geocode, taken
+  only when the house, town and state match; never a gate. Newest email wins
+  within a tick (walked oldest first) and across ticks (a pending row from a
+  newer email is never retired by an older one; same guard added to time
+  proposals). The row lands in `order_address_proposals`; the banner is
+  owner-only, city and state only, never the street, kind `address_change`,
+  collapse `addr-<intake_id>`, thread `prop-<intake_id>`.
+- Accept in HC Field (build 36, `hc_decide_proposed_address`) only QUEUES
+  the address (status accepted, apply_status queued). Jarvis writes it to
+  QuickBooks on the droplet behind `JARVIS_ADDRESS_APPLY` and re-syncs the
+  order. The scan's follow-up loop then sends `address_applied` ("Address on
+  the invoice: ...", from invoice_doc_number, total_moved, tax_zero) or
+  `address_failed` once, stamping notified_at, and retires pending rows whose
+  order was cancelled or whose on-file address moved (superseded / cancelled
+  or owner_edit, apply_status null).
+- The reconfirmation draft holds while an Address? row is pending or
+  accepted-but-not-applied (queued, applying, failed): hold reason
+  `pending_address_proposal`, words "an Address? row is waiting". 045
+  widens 044's `order_reconfirmations.hold_reasons` check by that one word
+  (dropped and re-added under the 044 name); without it every
+  reconfirmation insert or rewrite for such an order would fail 23514 and
+  the hold would never land. The 045 rollback puts 044's list back and
+  refuses while any row still holds with the new word.
+- An accepted address waiting for Jarvis is never undone by a newer email:
+  the same address again is a repeat (no row), a different one is proposed
+  beside it, and once Jarvis writes the accepted one the follow-up loop
+  re-snapshots the newer pending row against the new invoice address
+  (`resnapshotted` in the scan counts) instead of retiring it as
+  owner_edit, so the owner decides it with both facts on the row.
+- A replayed row on a job with no invoice yet is NOT dismissed on its first
+  tick (the address pass did not run): it stays pending_review, hidden by
+  the replayed_at filters, and is read again once the job is invoiced. So
+  `intake_messages?status=eq.pending_review&replayed_at=not.is.null` can be
+  non-empty for quoted jobs after a replay; see the rollback note below.
+- The address STALE drop (a structured invoice address edited after the
+  email) is logged per intake id (`address scan: intake #N stale ...`) and
+  recorded in the replay note, never silent: QuickBooks' edit stamp moves on
+  ANY save (a count edit re-synced by Jarvis too), so a customer's newer
+  address behind a wrong structured one is a known gap. Decision for Sidd.
+- The proposal scan's own intake read (`fetchProposalIntakes`) retries once
+  without `replayed_at,address_scanned_at` on a 400 naming either column,
+  so a worker deployed ahead of 045 keeps making time proposals.
+- The time branch gained the STALE rule: an owner-confirmed
+  `delivery_request` checked AFTER the email arrived means no time proposal.
+  A LIVE email gets an hour of grace (TIME_STALE_LIVE_GRACE_MS): it is
+  classified minutes after it lands, so a customer's correction that arrived
+  seconds before the owner's tap on the previous email would otherwise read
+  as stale and be lost. A replayed row keeps the strict compare.
+- Replay (Jarvis `scripts/replay_intake_since.py`, section 6 of the plan)
+  stamps old mail with `intake_messages.replayed_at`. `fetchIntakeLive`
+  hides those rows from the cards, the reply scan, the digest and the nag
+  (`&replayed_at=is.null`; a 400 naming the column, i.e. a worker ahead of
+  045, retries once without it and logs). The proposal scan dismisses a
+  replayed row on its first address-scanned tick with error_detail
+  `replay: time=<...>, address=<...>`, and a replayed row on a cancelled
+  order on its cancelled path with `replay: order cancelled` (neither
+  branch runs there); with ADDRESS_PROPOSALS off replayed rows stay
+  pending_review, invisible, until the switch comes on. Rows the scan
+  never reads (a replayed row on a job whose delivery day passed before
+  its first address pass, or on a quoted job never invoiced) stay
+  pending_review on their own and need the one-line dismissal by stamp
+  (PATCH `intake_messages?replayed_at=eq.<run stamp>&status=eq.pending_review`
+  to dismissed, its own "yes do it"); the replay's `--report` lists them
+  as still pending_review.
+- A repeat is judged by the AGREE test (house number, first street word,
+  the direction word when both sides carry one, the whole town or the
+  ZIP), not the exact normalized key: a customer re-quoting the address
+  without its ZIP or its direction word never retires an Accept-able
+  pending row for a Dismiss-only one, brings back a kept address inside
+  30 days, or adds a row beside an accepted one. 491 N Dean and 491 S Dean
+  are two houses (a direction correction is proposed, never a repeat or
+  a silent agree), and Englewood never agrees with Englewood Cliffs (the
+  words after the town on file must be a state, a ZIP or nothing). The one
+  exception: a pending row with no ZIP (Dismiss-only) is superseded by a
+  newer email that brings the ZIP, so the owner gets Accept instead of a
+  chat errand. The email's OWN pending row (a lost stamp, re-read next
+  tick) is never superseded by itself: a ZIP found only on the re-read is
+  written into that row in place (`zip_filled` in the log, no new banner).
+- A forwarded email's `From:` line is found through the Date:/Sent:,
+  Subject: and To: lines (Importance:/Attachments: too), the greeting and
+  any distance a real Gmail, Outlook or Apple Mail forward puts between
+  the header block and the message (`forwardedFromLine`): everything
+  under a header block belongs to the forwarded sender. A one-line
+  Outlook mobile header is cut at its next label, so only the sender part
+  is tested. The customer's own forward is tested FIRST (her address on
+  the order's client_email, her full name, or a first name or surname
+  alone on the From: line), so a caterer or a DJ buying coconuts is the
+  customer, not a vendor; then a vendor sender (ADDRESS_VENDOR_RE) rejects
+  `vendor` and any other sender is the plan's forwarded From: `billing`
+  rule. A lone `From:` label pasted paragraphs up with no header line
+  beside it is not a block. A forward's own Subject: line is never read as
+  a vendor label.
+- A failed row that carries applied_at (QuickBooks holds the address, the
+  app sync gave up after two days, address_apply.py MSG_SYNC_GAVE_UP) gets
+  the "Address on the invoice, app not refreshed" banner, never "Address
+  not saved".
+- Two switches, both worker secrets, both default off (documented in
+  `worker/wrangler.toml`): `ADDRESS_PROPOSALS` ('on' enables the branch;
+  delete the secret to kill it) and `OWN_ADDRESS_DENYLIST` (comma separated
+  "house number plus first street word" prefixes of our own addresses; the
+  NJ garage is pinned in code as OWN_ADDRESS_MARKS).
+- Tests: `node worker/test-address-extract.mjs` (the extractor, the key,
+  the geocode match, the agreement verdict), `node worker/test-proposal-scan.mjs`
+  (cases 8 to 24: switch, blank/differs/one-line/agree/stale, replay
+  including the no-street outcome, the guarded dismissal URL and the
+  cancelled-order row, time STALE, newest-email guards, follow-ups,
+  geocode, texts, the pre-045 read fallback, state assumed from a town, a
+  lost stamp (with the ZIP found only on the re-read), an accepted row in
+  flight, the denylist and the 30-day edge, the AGREE-test repeat rule and
+  the N-for-S correction, the sync give-up banner),
+  `node worker/test-reconfirmation.mjs` (the hold, the reply scan's
+  replayed_at filter), `node worker/test-intake-suppression.mjs` (cases 12
+  to 16: fetchIntakeLive's retry rule and the card, nag, digest, dead-man
+  and thread-sibling reads never touching a replayed row), and the
+  migration rehearsal
+  `node rehearsal/run-045-address-proposals-pglite.mjs <pglite dir>` (110
+  scenarios, including the widened hold_reasons check and its rollback, and
+  a no-break space on the invoice address that must not count as a move).
+- Deploy order (plan section 8, each step its own "yes do it"): 045 through
+  the SQL editor recipe FIRST (the filtered intake reads 400 otherwise),
+  Jarvis PR (address_structured, apply step, replay script), then
+  `npx wrangler deploy` from feature/address-proposals with ADDRESS_PROPOSALS
+  unset, then build 36 on Sidd's phone, then `wrangler secret put
+  ADDRESS_PROPOSALS` (on) and the denylist, then JARVIS_ADDRESS_APPLY on the
+  droplet, then the replay (Alison's order first, dry run before --apply).
+  Rollback note: a worker without the replayed_at filter must never run while
+  `intake_messages?status=eq.pending_review&replayed_at=not.is.null` is
+  non-empty, or the card scan would card every replayed row within minutes.
+  Replayed rows on past-day or never-invoiced jobs never enter the scan, so
+  that set only empties after the one-line dismissal by stamp above.
+
 ## Departure plan, stage 0 truth checks (recorded 2026-09-13, read-only)
 
 Plan: `../DEPARTURE-PLAN-2026-09-12.md` (original + the app-only revision).

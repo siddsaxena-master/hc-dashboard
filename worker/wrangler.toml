@@ -109,3 +109,29 @@ crons = [
 # Push bodies from this scan never carry an email, phone or dollar; the
 # email body never carries an amount, a crew name, the garage, or internal
 # notes. Deploy from feature/departure-plan, never from main.
+# ADDRESS PROPOSALS (2026-09-15, PHASE2-ADDRESS-PROPOSALS-PLAN-2026-09-15.md
+# sections 4 and 5a). The 5-minute runProposalScan also reads a drop off
+# address out of every linked, invoiced customer email (body and PDF text)
+# and, when it is not already on the invoice in full, writes one
+# order_address_proposals row (migration 045 must be live first) and sends
+# one owner-only "Address?" banner. Accept in HC Field (build 36) only
+# QUEUES the address; Jarvis writes it to QuickBooks on the droplet behind
+# its own JARVIS_ADDRESS_APPLY switch. Two settings, both secrets, both
+# default off, never in this file:
+# ADDRESS_PROPOSALS - 'on' enables the address branch, the replayed-row
+#   dismissal and the applied/failed follow-up banners; unset (or any other
+#   value) means off and the scan behaves exactly as before. Keep it unset
+#   until build 36 is on Sidd's phone (build 35 would get a banner with no
+#   row to act on). `wrangler secret put ADDRESS_PROPOSALS`, value on;
+#   `wrangler secret delete ADDRESS_PROPOSALS` is the kill switch (the next
+#   tick proposes nothing; rows already made stay for the phone).
+# OWN_ADDRESS_DENYLIST - comma separated "house number plus first street
+#   word" prefixes of our OWN addresses (home, any office, a Vegas address,
+#   anything in Sidd's signature), so a forwarded email can never propose
+#   them. The NJ garage (55 cambridge) is pinned in code (OWN_ADDRESS_MARKS);
+#   Sidd supplies the rest before the switch goes on. Example value:
+#   "12 main, 3708 las" (a direction word may be left out or written; both
+#   match "3708 S Las Vegas Blvd"). Unset means only the garage is denied.
+# The replay script's rows (intake_messages.replayed_at set) are hidden from
+# every Telegram-facing read by fetchIntakeLive; a worker deployed before
+# 045 logs the missing column once and reads without the filter.

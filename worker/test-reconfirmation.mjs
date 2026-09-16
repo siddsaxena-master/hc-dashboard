@@ -181,6 +181,12 @@ function harness(opts = {}) {
       if (opts.proposalsMissing) return reply(404, { code: 'PGRST205' });
       return reply(200, query(proposals, path));
     }
+    // Address? rows (migration 045): the scan reads pending ones and
+    // accepted ones Jarvis has not finished. Missing before 045: a 404.
+    if (table === 'order_address_proposals' && method === 'GET') {
+      if (!opts.addressProposals) return reply(404, { code: 'PGRST205' });
+      return reply(200, query(opts.addressProposals, path));
+    }
     if (table === 'intake_messages') {
       if (method === 'GET') {
         // The hourly nag scan's own read: nothing waiting, so no Telegram.
@@ -462,6 +468,8 @@ const FULL_BODY = [
   assert.deepEqual(reconfirmHolds(reconfirmFacts(order({ crack_type: 'circle' })), { recipients: ['jamie@example.invalid'] }), ['cracking_unknown']);
   assert.deepEqual(reconfirmHolds(reconfirmFacts(order({ crack_type: 'straw' })), { recipients: ['jamie@example.invalid'] }), []);
   assert.deepEqual(reconfirmHolds(f, { recipients: ['jamie@example.invalid'], pendingProposal: true }), ['pending_time_proposal']);
+  assert.deepEqual(reconfirmHolds(f, { recipients: ['jamie@example.invalid'], pendingAddressProposal: true }), ['pending_address_proposal']);
+  assert.deepEqual(reconfirmHolds(f, { recipients: ['jamie@example.invalid'], pendingProposal: true, pendingAddressProposal: true }), ['pending_time_proposal', 'pending_address_proposal']);
   assert.deepEqual(reconfirmHolds(f, { recipients: [] }), ['no_email']);
   assert.deepEqual(reconfirmHolds(f, { recipients: ['ap@example.invalid'] }), ['billing_email_only']);
   assert.deepEqual(reconfirmHolds(reconfirmFacts(order({ delivery_at_utc: null }), { deliveryDay: '2026-09-19' }), { recipients: ['jamie@example.invalid'] }), ['date_unverified']);
@@ -577,6 +585,7 @@ const FULL_BODY = [
   assert.equal(reconfirmPushTexts('bounced', ctx).body, 'Reconfirmation email bounced: Rivera / Pridwin. Check the customer email on the invoice.');
   assert.equal(reconfirmReasonWords(['owner_hold', 'pending_time_proposal', 'billing_email_only', 'too_many_emails', 'date_unverified', 'address_missing', 'cracking_unknown']),
     'held by you, a Time change? proposal is waiting, only an accounting email on file, more than 4 email addresses, delivery date unverified, drop off address missing, cracking unknown');
+  assert.equal(reconfirmReasonWords(['pending_address_proposal']), 'an Address? row is waiting');
   const a = await reconfirmQueueId('previewed', 7, '2026-09-15T14:00:00.000Z');
   assert.equal(a, await reconfirmQueueId('previewed', 7, '2026-09-15T14:00:00.000Z'));
   assert.notEqual(a, await reconfirmQueueId('previewed', 8, '2026-09-15T14:00:00.000Z'));
@@ -813,6 +822,21 @@ const FULL_BODY = [
   const prop = await scanAt(MON_0805, ENV_AUTO, { orders: [order()], proposals: [{ order_id: ORDER_ID, status: 'pending' }] });
   assert.deepEqual(prop.h.all()[0].hold_reasons, ['pending_time_proposal']);
   assert.equal(prop.h.pushes()[0].payload.aps.alert.body, 'Reconfirmation needs details: Rivera / Pridwin, a Time change? proposal is waiting.');
+  // The pending Address? hold (migration 045): an undecided row holds, and
+  // so does an accepted row Jarvis has not finished (queued, applying,
+  // failed). An applied row and a kept row do not.
+  const addr = await scanAt(MON_0805, ENV_AUTO, { orders: [order()], addressProposals: [{ order_id: ORDER_ID, status: 'pending', apply_status: null }] });
+  assert.deepEqual(addr.h.all()[0].hold_reasons, ['pending_address_proposal']);
+  assert.equal(addr.h.pushes()[0].payload.aps.alert.body, 'Reconfirmation needs details: Rivera / Pridwin, an Address? row is waiting.');
+  for (const applyStatus of ['queued', 'applying', 'failed']) {
+    const q = await scanAt(MON_0805, ENV_AUTO, { orders: [order()], addressProposals: [{ order_id: ORDER_ID, status: 'accepted', apply_status: applyStatus }] });
+    assert.deepEqual(q.h.all()[0].hold_reasons, ['pending_address_proposal'], applyStatus);
+  }
+  const applied = await scanAt(MON_0805, ENV_AUTO, { orders: [order()], addressProposals: [{ order_id: ORDER_ID, status: 'accepted', apply_status: 'applied' }, { order_id: ORDER_ID, status: 'kept', apply_status: null }] });
+  assert.deepEqual(applied.h.all()[0].hold_reasons, []); assert.equal(applied.h.all()[0].status, 'ready');
+  // Before 045 the table answers 404 and nothing is held.
+  const no045 = await scanAt(MON_0805, ENV_AUTO, { orders: [order()] });
+  assert.deepEqual(no045.h.all()[0].hold_reasons, []);
   // Same reasons next hour: no second push. New reason set: one more push.
   const same = await scanAt('2026-09-14T13:05:00Z', ENV_AUTO, { orders: [order({ coconuts_qty: null, client_email: 'ar@example.invalid' })], rows: held.h.all() });
   assert.equal(same.h.pushes().length, 0); assert.equal(same.counts.rewritten, 0);
@@ -829,6 +853,22 @@ const FULL_BODY = [
   const lost = await scanAt('2026-09-15T19:05:00Z', ENV_AUTO, { orders: [order({ invoice_fulfillment: { ...order().invoice_fulfillment, cracking: 'review' } })], rows: fixed.h.all() });
   assert.equal(lost.h.all()[0].status, 'held'); assert.deepEqual(lost.h.all()[0].hold_reasons, ['cracking_unknown']);
   assert.equal(lost.h.pushes()[0].payload.aps.alert.body, 'Reconfirmation needs details: Rivera / Pridwin, cracking unknown.');
+  assert.equal(lost.h.all()[0].send_after, null, 'a ready row that becomes held loses its send clock');
+  // The Address? hold on the REWRITE path (the common case: the draft
+  // exists days before the address email arrives). A ready row with a send
+  // clock plus a pending Address? row comes back held, clock cleared, with
+  // one held push naming the row (plan 5a: the draft cannot go out with
+  // the old address between the tap and Jarvis's write).
+  const addrHold = await scanAt('2026-09-15T19:05:00Z', ENV_AUTO, { orders: [order()], rows: fixed.h.all(), addressProposals: [{ order_id: ORDER_ID, status: 'pending', apply_status: null }] });
+  assert.equal(addrHold.h.all()[0].status, 'held'); assert.deepEqual(addrHold.h.all()[0].hold_reasons, ['pending_address_proposal']);
+  assert.equal(addrHold.h.all()[0].send_after, null);
+  assert.equal(addrHold.h.pushes().length, 1); assert.equal(addrHold.h.pushes()[0].payload.body.kind, 'reconfirm_held');
+  assert.equal(addrHold.h.pushes()[0].payload.aps.alert.body, 'Reconfirmation needs details: Rivera / Pridwin, an Address? row is waiting.');
+  // Jarvis applied it: the hold lifts to ready with a fresh clock and a preview push.
+  const addrLift = await scanAt('2026-09-15T20:05:00Z', ENV_AUTO, { orders: [order()], rows: addrHold.h.all(), addressProposals: [{ order_id: ORDER_ID, status: 'accepted', apply_status: 'applied' }] });
+  assert.equal(addrLift.h.all()[0].status, 'ready'); assert.deepEqual(addrLift.h.all()[0].hold_reasons, []);
+  assert.equal(addrLift.h.all()[0].send_after, '2026-09-15T23:05:00.000Z', 'scheduled as if drafted now');
+  assert.equal(addrLift.h.pushes().length, 1); assert.equal(addrLift.h.pushes()[0].payload.body.kind, 'reconfirm_previewed');
   // Owner hold: the worker never lifts it, never nags about it, but adds
   // and clears its own reasons beside it (a fact change rewrites the text).
   const ownerHeld = { ...fixed.h.all()[0], status: 'held', hold_reasons: ['owner_hold'], decision: 'hold' };
@@ -1337,7 +1377,13 @@ const FULL_BODY = [
   assert.ok(!intakeRead.includes('status=in.(pending_review,ignored)'));
   assert.ok(intakeRead.includes('created_at=gte.2026-09-08T15%3A05%3A00.000Z'), 'bounded to the last week');
   assert.ok(intakeRead.includes('&order=created_at.desc,id.desc&limit=200'), 'newest first');
-  pass('reply step: confirmed (stamp, dismiss, one push), time (left to the proposal scan), changed (safe excerpt, card line), auto reply, bounce via conversation id (from an ignored row too, two days back), sender rule needs arrival after the send, the customer name gates the signature (a title or a buried answer under it is a change), a worker-flagged changed row only takes the stamp, no match, second thanks quiet, newest-first read walked oldest first (the last reply wins), the belt re-opens an ignored thread reply for its card');
+  // Replayed rows (old mail re-read by the replay script, migration 045)
+  // never reach the reply scan: the filter rides on the read itself.
+  assert.ok(intakeRead.includes('&replayed_at=is.null'), 'replayed rows are filtered out of the reply scan');
+  const replayedReply = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(70, { raw_text: 'Confirmed' + quote, replayed_at: '2026-09-15T13:00:00Z' })] });
+  assert.equal(replayedReply.result.counts.seen, 0); assert.equal(replayedReply.h.row(1).status, 'sent'); assert.equal(replayedReply.h.pushes().length, 0);
+  assert.equal(replayedReply.h.intakes.get(70).status, 'pending_review', 'never stamped or dismissed');
+  pass('reply step: confirmed (stamp, dismiss, one push), time (left to the proposal scan), changed (safe excerpt, card line), auto reply, bounce via conversation id (from an ignored row too, two days back), sender rule needs arrival after the send, the customer name gates the signature (a title or a buried answer under it is a change), a worker-flagged changed row only takes the stamp, no match, second thanks quiet, newest-first read walked oldest first (the last reply wins), the belt re-opens an ignored thread reply for its card, a replayed row is never read');
 }
 
 // ── 15. The digest line ─────────────────────────────────────────────

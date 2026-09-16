@@ -11,7 +11,7 @@
 // touch Supabase, Telegram, or Claude.
 
 import assert from 'node:assert/strict';
-import { normalizeSubject, findHandledThreadSibling } from './worker.js';
+import { normalizeSubject, findHandledThreadSibling, fetchIntakeLive, buildIntakeDigestLines, runIntakeNagScan, runIntakeCardScan } from './worker.js';
 
 // ── fake Supabase ──────────────────────────────────────────────────
 // findHandledThreadSibling reads recent rows through the worker's
@@ -198,6 +198,161 @@ test('the returned sibling carries its sender for the card note', async () => {
   assert.ok(found);
   assert.equal(found.from_addr, 'kristi@nameandnumber.com');
   assert.equal(found.status, 'drafting');
+});
+
+// ── 12) replayed rows never reach Telegram (migration 045) ─────────
+// The one-time replay script re-reads old mail and stamps each row with
+// replayed_at. fetchIntakeLive adds `&replayed_at=is.null` to every
+// Telegram-facing read (cards, reply scan, digest, nag) and retries once
+// WITHOUT the filter only on a 400 that names the column (a worker
+// deployed ahead of 045). The filters, not the proposal scan's later
+// dismissal, are the guard, so the URLs themselves are pinned here.
+//
+// A second fake: it records every URL, applies the few filters these
+// reads use (status eq/in, replayed_at is.null, reviewed_at gte, channel
+// eq, limit) to `liveRows`, and answers the other tables with nothing.
+// Anything that is not a Supabase REST call (Telegram, Claude) is recorded
+// in `leaked` and refused, so a leaked card or nag is visible to the case.
+let liveRows = [];
+let liveUrls = [];
+let leaked = [];
+let liveFail = null;
+function fakeLive() {
+  liveUrls = [];
+  leaked = [];
+  globalThis.fetch = async (urlValue) => {
+    const url = String(urlValue);
+    if (!url.startsWith(env.SUPABASE_URL + '/rest/v1/')) { leaked.push(url); throw new Error('leaked non-Supabase call: ' + url); }
+    const path = url.slice((env.SUPABASE_URL + '/rest/v1/').length);
+    const table = path.split('?')[0];
+    if (table !== 'intake_messages') return { ok: true, status: 200, text: async () => '', json: async () => [] };
+    liveUrls.push(path);
+    if (liveFail) return { ok: false, status: liveFail.status, text: async () => liveFail.text, json: async () => null };
+    const qs = new URLSearchParams(path.split('?')[1] || '');
+    let out = liveRows.filter((r) => {
+      for (const [k, v] of qs.entries()) {
+        if (['select', 'order', 'limit'].includes(k)) continue;
+        if (v === 'is.null') { if (r[k] != null) return false; continue; }
+        if (v === 'not.is.null') { if (r[k] == null) return false; continue; }
+        if (v.startsWith('eq.')) { if (String(r[k]) !== v.slice(3)) return false; continue; }
+        if (v.startsWith('in.(')) { if (!v.slice(4, -1).split(',').includes(String(r[k]))) return false; continue; }
+        if (v.startsWith('gte.')) { if (!(String(r[k] || '') >= v.slice(4))) return false; continue; }
+      }
+      return true;
+    });
+    const limit = Number(qs.get('limit') || out.length);
+    return { ok: true, status: 200, text: async () => '', json: async () => out.slice(0, limit) };
+  };
+}
+const HOUR = 3600 * 1000;
+const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
+const errors = [];
+const origError = console.error;
+const catchErrors = () => { errors.length = 0; console.error = (...a) => { errors.push(a.join(' ')); }; };
+const releaseErrors = () => { console.error = origError; };
+
+test('fetchIntakeLive filters replayed rows and retries once, without the filter, only on a 400 naming replayed_at', async () => {
+  fakeLive();
+  liveRows = [{ id: 1, status: 'pending_review', replayed_at: null }, { id: 2, status: 'pending_review', replayed_at: '2026-09-16T13:00:00Z' }];
+  const rows = await fetchIntakeLive(env, 'select=id&status=eq.pending_review');
+  assert.deepEqual(rows.map((r) => r.id), [1], 'the replayed row is filtered out');
+  assert.equal(liveUrls.length, 1); assert.ok(liveUrls[0].endsWith('&replayed_at=is.null'), liveUrls[0]);
+  // Ahead of 045: PostgREST names the missing column; one retry without it, one logged error.
+  catchErrors();
+  try {
+    liveFail = { status: 400, text: JSON.stringify({ code: '42703', message: 'column intake_messages.replayed_at does not exist' }) };
+    let calls = 0;
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (u) => { calls++; if (calls === 2) { liveFail = null; } return inner(u); };
+    const retried = await fetchIntakeLive(env, 'select=id&status=eq.pending_review');
+    assert.equal(calls, 2, 'exactly one retry');
+    assert.ok(!liveUrls[2].includes('replayed_at'), 'the retry carries no filter');
+    assert.deepEqual(retried.map((r) => r.id), [1, 2], 'without 045 nothing tells the rows apart');
+    assert.equal(errors.length, 1); assert.ok(errors[0].includes('replayed_at column missing'));
+  } finally { releaseErrors(); liveFail = null; }
+  // A 500, or a 400 naming some other column: null and NO second fetch.
+  for (const fail of [{ status: 500, text: 'boom' }, { status: 400, text: 'column intake_messages.nope does not exist' }]) {
+    fakeLive();
+    liveFail = fail;
+    catchErrors();
+    try {
+      const out = await fetchIntakeLive(env, 'select=id&status=eq.pending_review');
+      assert.equal(out, null);
+      assert.equal(liveUrls.length, 1, 'no blind retry on ' + fail.status);
+      assert.equal(errors.length, 1);
+    } finally { releaseErrors(); liveFail = null; }
+  }
+});
+
+test('the card scan never cards a replayed row (its read carries the filter; no Claude, no Telegram)', async () => {
+  fakeLive();
+  liveRows = [{ id: 7, status: 'pending_review', telegram_message_id: null, classified_at: iso(HOUR), classification: 'maybe_order', from_addr: 'old@example.invalid', subject: 'August order', raw_text: 'Deliver to 491 S Dean Street, Englewood, NJ 07631', created_at: '2026-08-22T14:00:00Z', replayed_at: '2026-09-16T13:00:00Z', order_id: 'o1' }];
+  catchErrors();
+  try { await runIntakeCardScan({ ...env, TG_BOT_TOKEN: 'x', ALLOWED_CHAT_IDS: '1', ANTHROPIC_API_KEY: 'x' }); } finally { releaseErrors(); }
+  const cardRead = liveUrls.find((u) => u.includes('telegram_message_id=is.null') && u.includes('classification=in.(order,maybe_order)'));
+  assert.ok(cardRead, 'the card read happened: ' + liveUrls.join(' | '));
+  assert.ok(cardRead.includes('&replayed_at=is.null'), cardRead);
+  assert.deepEqual(leaked, [], 'no Claude summary, no Telegram card');
+  assert.equal(liveRows[0].telegram_message_id, null, 'no card stamp');
+});
+
+test('the hourly nag never names a replayed row', async () => {
+  fakeLive();
+  liveRows = [{ id: 8, status: 'pending_review', from_addr: 'old@example.invalid', created_at: iso(4.5 * HOUR), reviewed_at: null, replayed_at: '2026-09-16T13:00:00Z' }];
+  await runIntakeNagScan({ ...env, TG_BOT_TOKEN: 'x', ALLOWED_CHAT_IDS: '1' });
+  const nagReads = liveUrls.filter((u) => u.includes('status=in.(pending_review,approved)'));
+  assert.equal(nagReads.length, 2, 'one read per window');
+  for (const u of nagReads) assert.ok(u.includes('&replayed_at=is.null'), u);
+  assert.deepEqual(leaked, [], 'no Telegram nag');
+  // The same row, live: the nag goes to Telegram (this fake refuses it and
+  // records the attempt), which proves the filter is what kept it quiet.
+  liveRows[0].replayed_at = null;
+  catchErrors();
+  try { await runIntakeNagScan({ ...env, TG_BOT_TOKEN: 'x', ALLOWED_CHAT_IDS: '1' }); } finally { releaseErrors(); }
+  assert.equal(leaked.length, 1); assert.ok(leaked[0].includes('api.telegram.org'), leaked[0]);
+});
+
+test('the 8am digest counts no replayed row: not as waiting, not as skipped, not as set aside', async () => {
+  fakeLive();
+  const replayedDismissed = { id: 9, channel: 'email', status: 'dismissed', reviewed_at: iso(HOUR), created_at: '2026-08-22T14:00:00Z', replayed_at: '2026-09-16T13:00:00Z' };
+  const replayedIgnored = { id: 10, channel: 'email', status: 'ignored', reviewed_at: iso(HOUR), created_at: '2026-08-23T14:00:00Z', replayed_at: '2026-09-16T13:00:00Z' };
+  const replayedWaiting = { id: 11, channel: 'email', status: 'pending_review', reviewed_at: null, created_at: '2026-08-24T14:00:00Z', replayed_at: '2026-09-16T13:00:00Z' };
+  const liveLead = { id: 12, channel: 'email', status: 'pending_review', reviewed_at: null, created_at: iso(HOUR), replayed_at: null };
+  liveRows = [replayedDismissed, replayedIgnored, replayedWaiting, liveLead];
+  const lines = await buildIntakeDigestLines(env);
+  assert.equal(lines.filter((l) => l.includes('skipped in the last 2 days')).length, 0, lines.join(' | '));
+  assert.equal(lines.filter((l) => l.includes('set aside as not-orders')).length, 0, lines.join(' | '));
+  assert.equal(lines.filter((l) => l.startsWith('Intake: 1 awaiting review')).length, 1, lines.join(' | '));
+  for (const u of liveUrls.filter((x) => /status=eq\.(dismissed|ignored)|status=in\.\(pending_review,approved\)/.test(x))) assert.ok(u.includes('&replayed_at=is.null'), u);
+  // The same skip and set-aside on LIVE rows are still reported (the audit lines stay).
+  liveRows = [{ ...replayedDismissed, replayed_at: null }, { ...replayedIgnored, replayed_at: null }, liveLead];
+  const live = await buildIntakeDigestLines(env);
+  assert.equal(live.filter((l) => l.includes('1 email skipped in the last 2 days (double check with: show 9)')).length, 1, live.join(' | '));
+  assert.equal(live.filter((l) => l.includes('1 email set aside as not-orders in the last 2 days (double check with: show 10)')).length, 1, live.join(' | '));
+});
+
+test('the thread-sibling window and the digest dead-man read are live rows only', async () => {
+  // Sibling window: a replayed row (fresh id, old created_at) never fills
+  // the 60-row window and never counts as the handled sibling; the live
+  // handled sibling behind it is still found.
+  fakeLive();
+  const live = { id: 90, subject: 'Coconut order', from_addr: 'mary@favouragency.com', status: 'invoiced', error_detail: null, created_at: '2026-07-22T12:00:00Z', replayed_at: null };
+  const replayed = { id: 91, subject: 'Coconut order', from_addr: 'old@example.invalid', status: 'invoiced', error_detail: null, created_at: '2026-07-23T12:00:00Z', replayed_at: '2026-09-16T13:00:00Z' };
+  liveRows = [replayed, live];
+  const found = await findHandledThreadSibling(env, subjectRow());
+  const sibRead = liveUrls.find((u) => u.includes('order=id.desc&limit=60'));
+  assert.ok(sibRead, 'the sibling read happened: ' + liveUrls.join(' | '));
+  assert.ok(sibRead.includes('&replayed_at=is.null'), sibRead);
+  assert.equal(found && found.id, 90, 'the live handled sibling, never the replayed one');
+  // Dead-man: the only email in the last day is a replayed row, so the
+  // poller warning still fires (the newest-email read carries the filter).
+  fakeLive();
+  liveRows = [{ id: 92, channel: 'email', status: 'dismissed', reviewed_at: iso(HOUR), created_at: iso(HOUR), replayed_at: '2026-09-16T13:00:00Z' }];
+  const lines = await buildIntakeDigestLines(env);
+  const deadMan = liveUrls.find((u) => u.includes('channel=eq.email&order=created_at.desc&limit=1'));
+  assert.ok(deadMan, 'the newest-email read happened: ' + liveUrls.join(' | '));
+  assert.ok(deadMan.includes('&replayed_at=is.null'), deadMan);
+  assert.equal(lines.filter((l) => l.includes('no email intake seen in 24h')).length, 1, lines.join(' | '));
 });
 
 // ── run ────────────────────────────────────────────────────────────

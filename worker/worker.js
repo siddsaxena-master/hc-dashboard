@@ -1397,6 +1397,12 @@ export function reconfirmHolds(facts, ctx = {}) {
   if (!f.derived.address) reasons.push('address_missing');
   if (!f.derived.cracking_words) reasons.push('cracking_unknown');
   if (ctx.pendingProposal) reasons.push('pending_time_proposal');
+  // An Address? row that is undecided, or accepted but not yet written to
+  // the invoice by Jarvis (queued, applying, failed), holds the draft: it
+  // must never go out with the old address in the minutes between the tap
+  // and the QuickBooks write, and a failed apply holds until Sidd fixes it
+  // by hand and taps Dismiss.
+  if (ctx.pendingAddressProposal) reasons.push('pending_address_proposal');
   reasons.push(...reconfirmRecipientHolds(ctx.recipients));
   if (!f.source.delivery_at_utc) reasons.push('date_unverified');
   return reasons;
@@ -1535,6 +1541,7 @@ const RECONFIRM_REASON_WORDS = {
   address_missing: 'drop off address missing',
   cracking_unknown: 'cracking unknown',
   pending_time_proposal: 'a Time change? proposal is waiting',
+  pending_address_proposal: 'an Address? row is waiting',
   no_email: 'no usable customer email',
   billing_email_only: 'only an accounting email on file',
   too_many_emails: 'more than 4 email addresses',
@@ -1831,7 +1838,7 @@ function reconfirmDraft(order, ctx) {
   const facts = reconfirmFacts(order, { deliveryDay: ctx.deliveryDay });
   const recipients = reconfirmRecipients(order.client_email);
   const picture = reconfirmPicture(order);
-  const holds = reconfirmHolds(facts, { pendingProposal: ctx.pendingProposal, recipients });
+  const holds = reconfirmHolds(facts, { pendingProposal: ctx.pendingProposal, pendingAddressProposal: ctx.pendingAddressProposal, recipients });
   const text = reconfirmTemplate(facts, { ownerCell: ctx.ownerCell, venueWord: ctx.venueWord, updated: ctx.updated, picture, today: ctx.today, deliveryDay: ctx.deliveryDay });
   return { facts, recipients, picture, holds, subject: text.subject, body: text.body };
 }
@@ -1904,6 +1911,13 @@ export async function runReconfirmationScan(env) {
       ? (await fetchSb(env, 'order_time_proposals?select=order_id&status=eq.pending&order_id=in.(' + candidateIds.map((id) => encodeURIComponent('"' + id + '"')).join(',') + ')&limit=500') || [])
       : [];
     const pendingSet = new Set(pending.map((p) => p.order_id));
+    // Address? rows hold too (migration 045): undecided ones, and accepted
+    // ones Jarvis has not finished writing to the invoice (queued, applying,
+    // failed). Before 045 the read answers null and nothing is held.
+    const pendingAddress = candidateIds.length
+      ? (await fetchSb(env, 'order_address_proposals?select=order_id&or=(status.eq.pending,and(status.eq.accepted,apply_status.in.(queued,applying,failed)))&order_id=in.(' + candidateIds.map((id) => encodeURIComponent('"' + id + '"')).join(',') + ')&limit=500') || [])
+      : [];
+    const pendingAddressSet = new Set(pendingAddress.map((p) => p.order_id));
     const venueWords = reconfirmVenueWords(orders);
     const activeByKey = new Map();
     // Orders with a superseded row (the owner tapped Resend): the next
@@ -2000,7 +2014,7 @@ export async function runReconfirmationScan(env) {
           // row: a hold that was fixed lifts, a stale body (the droplet's
           // 'facts changed at send time' requeue included) is rewritten,
           // and only then does the release step below look at it.
-          const draft = reconfirmDraft(o, { deliveryDay: row.delivery_day, pendingProposal: pendingSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(row.order_id), today });
+          const draft = reconfirmDraft(o, { deliveryDay: row.delivery_day, pendingProposal: pendingSet.has(o.id), pendingAddressProposal: pendingAddressSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(row.order_id), today });
           const diff = reconfirmSourceDiff(row.facts && row.facts.source, draft.facts.source);
           const wantHeld = draft.holds.length > 0;
           const wasHeld = row.status === 'held';
@@ -2031,6 +2045,10 @@ export async function runReconfirmationScan(env) {
               || JSON.stringify(draft.picture || null) !== JSON.stringify(row.picture || null);
             // A row that just became ready is scheduled as if drafted now.
             if (becomesReady && wasHeld) body.send_after = reconfirmSendAfter({ deliveryDay: row.delivery_day, daysOut, nowMs, market });
+            // A ready row that just became held loses its send clock, the
+            // way a row held at insert has none; the clock is recomputed
+            // above when the hold lifts.
+            if (!becomesReady && !wasHeld) body.send_after = null;
             const updated = await patchReconfirmation(env, row.id, 'status=in.(ready,held)', body);
             if (!updated) { counts.failed++; continue; }
             counts.rewritten++;
@@ -2137,7 +2155,7 @@ export async function runReconfirmationScan(env) {
         if (emailedOrders.has(o.id)) { counts.skipped++; continue; }
         if (!reconfirmInDraftHours(nowMs, e.market)) continue;
         counts.seen++;
-        const draft = reconfirmDraft(o, { deliveryDay: e.deliveryDay, pendingProposal: pendingSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(o.id), today: e.today });
+        const draft = reconfirmDraft(o, { deliveryDay: e.deliveryDay, pendingProposal: pendingSet.has(o.id), pendingAddressProposal: pendingAddressSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(o.id), today: e.today });
         const held = draft.holds.length > 0;
         const sendAfter = held ? null : reconfirmSendAfter({ deliveryDay: e.deliveryDay, daysOut: e.daysOut, nowMs, market: e.market });
         const inserted = await insertReconfirmation(env, {
@@ -2204,7 +2222,7 @@ export async function runReconfirmationReplyScan(env) {
     // reply ends up on the row.
     const since = new Date(nowMs - 7 * 86400000).toISOString();
     const ignoredSince = new Date(nowMs - 2 * 86400000).toISOString();
-    const intakes = await fetchIntake(env,
+    const intakes = await fetchIntakeLive(env,
       'select=id,from_addr,subject,raw_text,order_id,conversation_id,created_at,status' +
       '&or=(status.eq.pending_review,and(status.eq.ignored,created_at.gte.' + encodeURIComponent(ignoredSince) + '))' +
       '&telegram_message_id=is.null&or=(order_id.not.is.null,conversation_id.not.is.null)' +
@@ -2484,6 +2502,36 @@ async function fetchIntake(env, query) {
     return null;
   }
 }
+// The same read for everything that faces Telegram (cards, the reply
+// scan, the digest, the nag): rows the one-time replay script re-read
+// from old mail (replayed_at set, migration 045) are never carded,
+// digested or nagged, so they are filtered out here. A worker deployed
+// ahead of 045 would get a 400 naming the missing column; ONLY that
+// failure retries once without the filter (with a logged error), so
+// real lead cards never stop. Any other failure answers null like
+// fetchIntake, never a blind retry: a transient 500 on the filtered read
+// must not card replayed rows. Exported (with the digest, nag and card
+// scans) so test-intake-suppression.mjs can pin the filter and the retry.
+export async function fetchIntakeLive(env, query) {
+  const filtered = query + '&replayed_at=is.null';
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/intake_messages?' + filtered, { headers: sbHeaders(env) });
+    if (resp.ok) {
+      const rows = await resp.json();
+      return Array.isArray(rows) ? rows : null;
+    }
+    const text = await resp.text();
+    if (resp.status === 400 && /replayed_at/.test(String(text || ''))) {
+      console.error('intake_messages read: replayed_at column missing (migration 045 not applied?), retrying without the filter');
+      return fetchIntake(env, query);
+    }
+    console.error('intake_messages read error:', resp.status, text);
+    return null;
+  } catch (e) {
+    console.error('intake_messages read exception:', e);
+    return null;
+  }
+}
 
 // When a row STARTED waiting on whoever owns it now. For a tapped
 // ('approved') row that is the tap time (reviewed_at); otherwise it is
@@ -2498,7 +2546,7 @@ function intakeWaitingSince(row) {
 
 // Lines appended to the 8am digest: how many intake messages are waiting,
 // plus a dead-man warning if the email channel itself looks dead.
-async function buildIntakeDigestLines(env) {
+export async function buildIntakeDigestLines(env) {
   const lines = [];
 
   // Everything still in flight, oldest first. Two statuses count as
@@ -2506,7 +2554,7 @@ async function buildIntakeDigestLines(env) {
   // on Jarvis). Approved rows MUST be reported too - if Jarvis is down
   // or its auto-draft flag is off, a tapped lead would otherwise sit
   // there forever with nobody watching it.
-  const waiting = await fetchIntake(env,
+  const waiting = await fetchIntakeLive(env,
     'select=id,created_at,reviewed_at,status&status=in.(pending_review,approved)&order=created_at.asc');
   // NOTE: no early return on a failed read (2026-07-25 review). Each
   // section below stands on its own, so one flaky query only drops its
@@ -2539,8 +2587,12 @@ async function buildIntakeDigestLines(env) {
   // classified late, and a created_at window would silently skip
   // exactly those rows (2026-07-25 review). 48 hours, so one missed or
   // failed digest still self-heals the next morning.
+  // Both audit reads go through fetchIntakeLive: a replayed row the scan
+  // dismisses (or that Jarvis filed ignored) must never become a digest
+  // line, or the day after a replay Sidd would be sent to "show <id>" on
+  // dozens of old emails.
   const cutoff = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-  const ignored = await fetchIntake(env,
+  const ignored = await fetchIntakeLive(env,
     'select=id&status=eq.ignored&reviewed_at=gte.' + cutoff +
     '&order=reviewed_at.desc');
   if (ignored && ignored.length > 0) {
@@ -2554,7 +2606,7 @@ async function buildIntakeDigestLines(env) {
   // silent (2026-07-25 security review): a mis-tap, or a forged tap if
   // the webhook secret is ever missing, would otherwise bury a real
   // lead with nobody told.
-  const dismissed = await fetchIntake(env,
+  const dismissed = await fetchIntakeLive(env,
     'select=id&status=eq.dismissed&reviewed_at=gte.' + cutoff +
     '&order=reviewed_at.desc');
   if (dismissed && dismissed.length > 0) {
@@ -2565,10 +2617,13 @@ async function buildIntakeDigestLines(env) {
   }
 
   // Channel dead-man: if the pipeline has EVER stored a message but no
-  // email has arrived in 24h, the outlook-poller is probably down.
+  // email has arrived in 24h, the outlook-poller is probably down. The
+  // newest-email read is live rows only: a replayed row carries its real
+  // (old) received time, but the replay walks mail up to now, so one
+  // received yesterday would otherwise hide a poller outage.
   const anyRow = await fetchIntake(env, 'select=id&limit=1');
   if (anyRow && anyRow.length > 0) {
-    const newestEmail = await fetchIntake(env,
+    const newestEmail = await fetchIntakeLive(env,
       'select=created_at&channel=eq.email&order=created_at.desc&limit=1');
     if (newestEmail && (newestEmail.length === 0 || hoursSince(newestEmail[0].created_at) >= 24)) {
       lines.push('no email intake seen in 24h - check the outlook-poller service on the droplet');
@@ -2584,7 +2639,7 @@ async function buildIntakeDigestLines(env) {
 // crossed a threshold within the LAST hour (4h <= age < 5h, and again
 // 24h <= age < 25h), so every row nags exactly once per threshold with
 // nothing to store.
-async function runIntakeNagScan(env) {
+export async function runIntakeNagScan(env) {
   for (const hours of [4, 24]) {
     const newestCutoff = Date.now() - hours * 3600000;
     const oldestCutoff = Date.now() - (hours + 1) * 3600000;
@@ -2600,7 +2655,7 @@ async function runIntakeNagScan(env) {
     // exists precisely to catch "the tap went nowhere". PostgREST
     // cannot filter on "whichever column is later", so fetch the
     // in-flight rows and window them here - this queue is small.
-    const inFlight = await fetchIntake(env,
+    const inFlight = await fetchIntakeLive(env,
       'select=id,from_addr,status,created_at,reviewed_at' +
       '&status=in.(pending_review,approved)&order=created_at.asc&limit=500');
     if (!inFlight || !inFlight.length) continue;
@@ -2670,8 +2725,11 @@ export async function findHandledThreadSibling(env, row) {
   const subj = normalizeSubject(row.subject);
   if (!subj) return null; // an empty subject can never match a thread
 
-  // Recent rows to compare against.
-  const recent = await fetchIntake(env,
+  // Recent rows to compare against: the 60 newest LIVE rows. Replayed
+  // rows (migration 045) get fresh ids at insert but old created_at, so
+  // without the filter a replay of dozens of rows would fill this window
+  // and push a real handled sibling from the last 14 days out of it.
+  const recent = await fetchIntakeLive(env,
     'select=id,subject,from_addr,status,error_detail,created_at' +
     '&order=id.desc&limit=60');
   if (!recent) return null; // read failed; never suppress on a guess
@@ -2806,7 +2864,7 @@ async function sendIntakeCard(env, chatId, text, intakeId) {
 }
 
 // The every-5-minutes scan itself.
-async function runIntakeCardScan(env) {
+export async function runIntakeCardScan(env) {
   // Replies to the reconfirmation email are sorted FIRST (2026-09-14): a
   // plain "confirmed" is stamped on its row and dismissed here, so it
   // never becomes a card; a reply that changes something still gets its
@@ -2818,8 +2876,12 @@ async function runIntakeCardScan(env) {
   // Up to 5 rows per tick, oldest first, so a burst of email can never
   // flood the chat in one go. Filters, in plain English: still waiting
   // for review, no card sent yet, Jarvis has classified it, and the
-  // classifier thought it is (or might be) an order.
-  const rows = await fetchIntake(env,
+  // classifier thought it is (or might be) an order. Replayed rows (old
+  // mail re-read by the replay script) never get a card: this scan runs
+  // BEFORE the proposal scan on the same tick, so without the
+  // fetchIntakeLive filter a replayed row would be carded before it is
+  // scanned.
+  const rows = await fetchIntakeLive(env,
     'select=id,from_addr,subject,raw_text,classification,created_at,external_invoice_id,order_id' +
     '&status=eq.pending_review' +
     '&telegram_message_id=is.null' +
@@ -6510,6 +6572,446 @@ export function extractArrivalTimes(rawText) {
   return out;
 }
 
+// ── reading a drop off address out of an email ──────────────────────
+// The address twin of extractArrivalTimes (PHASE2-ADDRESS-PROPOSALS-PLAN
+// section 4). Reads intake_messages.raw_text, PDF sections included, and
+// returns at most ONE candidate: a street line plus a city and state, in
+// delivery context, never a signature, a billing block, a vendor list or
+// our own garage. Two distinct candidates at the best rank mean nothing
+// (the owner is never asked to pick between a ceremony and a reception).
+// Pure: no network, no clock. The ZIP fill (geocode) and the agreement
+// with what is on file are decided in the scan.
+//
+// Our own addresses, as "house number plus first street word" prefixes of
+// the normalized key. 55 Cambridge Dr is the NJ garage (GARAGE_LAT). More
+// come from the OWN_ADDRESS_DENYLIST secret (comma separated), never code.
+export const OWN_ADDRESS_MARKS = ['55 cambridge'];
+const ADDRESS_STREET_TYPES = 'street|st|avenue|ave|road|rd|lane|ln|drive|dr|boulevard|blvd|highway|hwy|way|court|ct|place|pl|terrace|ter|trail|trl|parkway|pkwy|circle|cir|turnpike|tpke|path|route|rte|loop|landing|point|pt|square|sq|plaza|row|walk|cove|crossing|bend|run|hollow|hill|ridge|farm';
+const ADDRESS_DIRECTIONS = 'n|s|e|w|north|south|east|west';
+// House number, optional direction, then either a numbered road (County
+// Road 39, Route 27, CR-39) or one to five name words and a street type,
+// then an optional unit. Searched inside a line, so "deliver to 491 S Dean
+// Street, Englewood, NJ 07631 by 6pm" still reads.
+const ADDRESS_STREET_RE = new RegExp(
+  '(?:^|[\\s,:;(>])(' +
+    '(\\d{1,6}[a-z]?)\\s+' +
+    '(?:(' + ADDRESS_DIRECTIONS + ')\\.?\\s+)?' +
+    '(?:' +
+      '((?:county\\s+road|cr|route|rte|state\\s+route|sr)[\\s-]*\\d{1,4}[a-z]?)' +
+    '|' +
+      '((?:(?:\\d{1,3}(?:st|nd|rd|th)|[a-z][a-z\'.-]*)\\s+){0,4}(?:\\d{1,3}(?:st|nd|rd|th)|[a-z][a-z\'.-]*))\\s+(' + ADDRESS_STREET_TYPES + ')\\.?' +
+    ')' +
+    '(?=[\\s,.;)]|$)' +
+    '(?:,?\\s*(?:apt|apartment|suite|ste|unit|fl|floor|#)\\.?\\s*[a-z0-9-]+)?' +
+  ')', 'i');
+const ADDRESS_STATE_CODES = { ny: 'NY', nj: 'NJ', ct: 'CT', pa: 'PA', fl: 'FL', nv: 'NV', ca: 'CA', ma: 'MA', ri: 'RI', de: 'DE', md: 'MD',
+  'new york': 'NY', 'new jersey': 'NJ', connecticut: 'CT', pennsylvania: 'PA', florida: 'FL', nevada: 'NV', california: 'CA', massachusetts: 'MA', 'rhode island': 'RI', delaware: 'DE', maryland: 'MD' };
+const ADDRESS_STATE_WORDS = Object.keys(ADDRESS_STATE_CODES).sort((a, b) => b.length - a.length).join('|');
+// "Englewood, NJ 07631", "Shelter Island NY", "Southampton, New York 11968".
+const ADDRESS_CITYSTATE_RE = new RegExp('^[\\s,]*(?:in\\s+)?([a-z][a-z .\'-]{0,39}?)\\s*,?\\s+(' + ADDRESS_STATE_WORDS + ')\\b\\.?(?=[\\s,.;)]|$)(?:\\s*,?\\s*(\\d{5})(?:-\\d{4})?\\b)?', 'i');
+// A known town with no state written: the state comes from this map and
+// the candidate is marked state_inferred (a geocode must confirm it).
+const ADDRESS_TOWN_STATES = { 'shelter island': 'NY', montauk: 'NY', southampton: 'NY', 'east hampton': 'NY', 'sag harbor': 'NY', bridgehampton: 'NY',
+  'water mill': 'NY', amagansett: 'NY', westhampton: 'NY', sagaponack: 'NY', 'las vegas': 'NV', henderson: 'NV', miami: 'FL', 'miami beach': 'FL' };
+const ADDRESS_TOWN_RE = new RegExp('^[\\s,]*(?:in\\s+)?(' + Object.keys(ADDRESS_TOWN_STATES).sort((a, b) => b.length - a.length).join('|') + ')\\b(?:\\s*,?\\s*(\\d{5})(?:-\\d{4})?\\b)?', 'i');
+const ADDRESS_STRONG = ['deliver', 'drop off', 'drop-off', 'dropoff', 'ship to', 'shipping address', 'send to', 'bring to', 'coconuts to', 'venue', 'event address', 'event location', 'site address', 'load in', 'load-in', 'party is at', 'event is at', 'wedding is at', 'held at', 'taking place at'];
+const ADDRESS_WEAK = ['address', 'location', 'located at', 'here is', 'we are at', "we're at", 'the house', 'our home', 'residence', 'arrive', 'arriving', 'setup', 'set up', 'ceremony', 'reception'];
+const ADDRESS_BILLING_RE = /\b(?:bill to|billing|invoice to|remit|mail (?:a|the) check|send the check|payable to|accounts payable|our office|office address|headquarters|hq|return address|mailing address|registered address|w-9|tax id|ein)\b/i;
+// Plural and possessive forms count too ("Vendors:", "Caterers", "the
+// florist's"), so a vendor list header never slips past.
+const ADDRESS_VENDOR_RE = /\b(?:vendor|supplier|caterer|catering|rental|florist|floral|photographer|videographer|dj|band|bakery|cake|officiant|hair|makeup|transportation|limo|tent|lighting|warehouse|pick up|pickup|pick-up)(?:s|'s|’s)?\b/i;
+const ADDRESS_SIGNOFF_RE = /^(?:thanks|thank you|thx|best|best regards|kind regards|warm regards|warmest regards|regards|cheers|sincerely|talk soon|see you (?:then|there|soon)|xo|xoxo)[,.!]?$/i;
+// Matched at a word start, so "deliver" still covers "delivery" and
+// "delivered" but "venue" never fires inside "Park Avenue" (which would
+// rank every Avenue address as if "deliver to" were written on it).
+const addressWordRe = (words) => new RegExp('\\b(?:' + words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'i');
+const ADDRESS_STRONG_RE = addressWordRe(ADDRESS_STRONG);
+const ADDRESS_WEAK_RE = addressWordRe(ADDRESS_WEAK);
+// Inside a signature block a STRONG word rescues a street only in an
+// instruction shape: the word followed by "to" or "at" ("deliver to",
+// "drop off at", "held at", "coconuts to") or a STRONG label with a colon
+// ("Delivery:", "Drop off:", "Venue:", "Event address:"). A company
+// tagline in a coordinator's footer ("We Deliver Joy LLC" above the
+// office street) carries the word but not the instruction, and must not
+// turn the office into a proposal.
+const ADDRESS_SIGNATURE_RESCUE_RE = /\b(?:deliver\w*|drop[ -]?off|dropoff|ship\w*|send\w*|bring\w*|coconuts|venue|load[ -]?in|(?:party|event|wedding) is|held|taking place)\s+(?:to|at)\b|\b(?:deliver\w*|drop[ -]?off|dropoff|shipping address|venue|event address|event location|site address|load[ -]?in)\s*:/i;
+const hasStrongAddressWord = (text) => ADDRESS_STRONG_RE.test(text);
+const hasWeakAddressWord = (text) => ADDRESS_WEAK_RE.test(text);
+// Lower case, punctuation to spaces, suffixes and directions to their
+// short forms, usa and united states dropped, spaces collapsed. Two
+// addresses written differently ("491 S. Dean Street" and "491 South
+// Dean St") share one key.
+const ADDRESS_SHORT_FORMS = { street: 'st', avenue: 'ave', road: 'rd', drive: 'dr', lane: 'ln', boulevard: 'blvd', highway: 'hwy', route: 'rte', court: 'ct', place: 'pl', terrace: 'ter', parkway: 'pkwy', turnpike: 'tpke', north: 'n', south: 's', east: 'e', west: 'w' };
+export function normalizeAddressKey(text) {
+  const words = String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(Boolean)
+    .map((w) => ADDRESS_SHORT_FORMS[w] || w);
+  const joined = ' ' + words.join(' ') + ' ';
+  return joined.replace(/ united states of america /g, ' ').replace(/ united states /g, ' ').replace(/ usa /g, ' ').replace(/ us /g, ' ').trim().replace(/\s+/g, ' ');
+}
+// The house number, the direction word (null when none is written) and
+// the first street word of a normalized key, or null when the text has
+// no house number. 491 N Dean St and 491 S Dean St are two houses in
+// Englewood, so the direction is kept for addressesAgree.
+export function addressKeyParts(key) {
+  const m = /(?:^| )(\d{1,6}[a-z]?) (?:(n|s|e|w|ne|nw|se|sw) )?([a-z0-9]+)(?: |$)/.exec(String(key || ''));
+  return m ? { house: m[1], dir: m[2] || null, word: m[3] } : null;
+}
+// Names the way intake_link.normalize_text does (lower, accents stripped,
+// '&' as 'and', apostrophes inside words dropped, punctuation to one space).
+function normalizeNameKey(text) {
+  return String(text || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/&/g, ' and ')
+    .replace(/(?<=[a-z])['’](?=[a-z])/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+}
+// "dean" stays "Dean"; "DEAN" and "dean" become "Dean"; "S", "NJ" and
+// "07631" are left alone (a PDF often shouts an address in capitals).
+function tidyAddressWord(w) {
+  if (w.length > 2 && w === w.toUpperCase() && /[a-z]/i.test(w)) return w[0] + w.slice(1).toLowerCase();
+  if (w === w.toLowerCase() && /^[a-z]/.test(w)) return w[0].toUpperCase() + w.slice(1);
+  return w;
+}
+const tidyAddressText = (text) => collapseSpaces(text).replace(/[.,;]+$/, '').split(' ').map(tidyAddressWord).join(' ');
+function addressText(c) {
+  return `${c.line1}${c.line2 ? ', ' + c.line2 : ''}, ${c.city}, ${c.state}${c.postal_code ? ' ' + c.postal_code : ''}`;
+}
+// City and state out of the text after a street: written in full, or a
+// known town alone (state inferred). Null when neither shape is there;
+// consumed is how much of the text the match used.
+function parseCityState(text) {
+  const t = String(text || '');
+  const m = ADDRESS_CITYSTATE_RE.exec(t);
+  if (m) {
+    const city = tidyAddressText(m[1]);
+    if (city.replace(/[^a-z]/gi, '').length < 2) return null;
+    return { city, state: ADDRESS_STATE_CODES[m[2].toLowerCase()], postal_code: m[3] || null, state_inferred: false, state_from: null, consumed: m[0].length };
+  }
+  const town = ADDRESS_TOWN_RE.exec(t);
+  if (town) {
+    const city = tidyAddressText(town[1]);
+    return { city, state: ADDRESS_TOWN_STATES[town[1].toLowerCase()], postal_code: town[2] || null, state_inferred: true, state_from: city, consumed: town[0].length };
+  }
+  return null;
+}
+// The first street at or after offset `from` on entry i, plus its city
+// and state on the same line or on the next one or two non-empty lines of
+// the same section. Returns the candidate with how many entries it used
+// and where it ended on the line (so a second address on the same line is
+// found too), or null.
+function parseAddressAt(entries, i, from) {
+  const e = entries[i];
+  if (/\bp\.?\s*o\.?\s*box\b|\bpmb\b/i.test(e.safe)) return null;
+  const text = e.safe.slice(from);
+  const m = ADDRESS_STREET_RE.exec(text);
+  if (!m) return null;
+  const whole = collapseSpaces(m[1]);
+  const unit = /,?\s*((?:apt|apartment|suite|ste|unit|fl|floor|#)\.?\s*[a-z0-9-]+)$/i.exec(whole);
+  const line1 = tidyAddressText(unit ? whole.slice(0, unit.index) : whole);
+  const line2 = unit ? tidyAddressText(unit[1]) : null;
+  const streetEnd = m.index + m[0].length;
+  const tail = text.slice(streetEnd);
+  let cs = parseCityState(tail);
+  let used = 1;
+  let end = from + streetEnd + (cs ? cs.consumed : 0);
+  let extraLine2 = null;
+  if (!cs && !/[a-z0-9]/i.test(tail)) {
+    // The street ended its line: the city and state may sit on the next
+    // line, or on the one after a unit line ("Apt 4B").
+    const next = entries[i + 1];
+    const sameSection = (x) => x && !x.marker && !x.header && x.where === e.where && x.safe;
+    if (sameSection(next)) {
+      cs = parseCityState(next.safe);
+      if (cs) used = 2;
+      else if (/^(?:apt|apartment|suite|ste|unit|fl|floor|#)\b/i.test(next.safe) && sameSection(entries[i + 2])) {
+        cs = parseCityState(entries[i + 2].safe);
+        if (cs) { used = 3; extraLine2 = tidyAddressText(next.safe); }
+      }
+    }
+    end = e.safe.length;
+  }
+  if (!cs) return null;
+  const c = { line1, line2: line2 || extraLine2, city: cs.city, state: cs.state, postal_code: cs.postal_code, state_inferred: cs.state_inferred, state_from: cs.state_from, house: m[2].toLowerCase(), used, start: from + m.index, end };
+  c.text = addressText(c);
+  c.key = normalizeAddressKey(c.text);
+  const parts = addressKeyParts(c.key);
+  c.distinct = parts ? parts.house + '|' + parts.word + '|' + c.state : c.key;
+  return c;
+}
+// Up to n entries before i (or after i) in the same section, stopping at
+// a mail header or an attachment marker, nearest first.
+function addressWindow(entries, i, n, dir) {
+  const out = [];
+  for (let j = i + dir; j >= 0 && j < entries.length && out.length < n; j += dir) {
+    const x = entries[j];
+    if (x.marker || x.header || x.where !== entries[i].where) break;
+    out.push(x);
+  }
+  return out;
+}
+// The forwarded "From:" line of the header block above the candidate, or
+// null. Everything under a real forward header belongs to the forwarded
+// sender, so the lookup walks up the whole section (to an attachment
+// marker) and takes the nearest From: line that is part of a header
+// block: a Date:/Sent:/Subject:/To: line directly above or below it, the
+// same labels inline (Outlook mobile collapses the header onto one line,
+// "From: x Sent: y To: z Subject: w"), or, the plan's original rule, a
+// From: line within the two lines directly above the candidate. A lone
+// "From: Jane (my planner)" pasted paragraphs above is not a block. Gmail,
+// Outlook and Apple Mail all put a greeting and a blank line between the
+// header and the message, so a stop at the first paragraph would miss
+// every real forward. Our own From: line never gets here: stripQuotedText
+// drops it with everything under it. Returns { safe, raw } (the line with
+// contact shapes blanked, and as written), both cut at the first inline
+// label so only the sender part reaches the vendor and customer tests.
+const FORWARD_HEADER_LINE_RE = /^(?:>\s*)*(?:from|to|cc|bcc|subject|date|sent|reply-to|received|importance|attachments?|priority):\s/i;
+const FORWARD_FROM_LINE_RE = /^(?:>\s*)*from:\s/i;
+const FORWARD_INLINE_LABEL_RE = /\s(?:sent|to|cc|bcc|date|subject):\s/i;
+function forwardedFromLine(entries, i) {
+  const headerish = (x) => !!x && !x.marker && !!x.safe && (x.header || FORWARD_HEADER_LINE_RE.test(x.safe));
+  const cut = (s) => { const m = FORWARD_INLINE_LABEL_RE.exec(s); return m ? s.slice(0, m.index) : s; };
+  let crossedBlank = false;
+  for (let j = i - 1; j >= 0; j--) {
+    const x = entries[j];
+    if (x.marker || x.where !== entries[i].where) return null;
+    if (!x.safe) { crossedBlank = true; continue; }
+    if (!FORWARD_FROM_LINE_RE.test(x.safe)) continue;
+    const block = FORWARD_INLINE_LABEL_RE.test(x.safe) || headerish(entries[j - 1]) || headerish(entries[j + 1]) || (!crossedBlank && i - j <= 2);
+    if (!block) continue;
+    return { safe: cut(x.safe), raw: cut(x.raw) };
+  }
+  return null;
+}
+// Whether a forwarded From: line names the order's customer: its address
+// is one of the order's customer addresses (client_email, often a list);
+// or every word of the normalized client name is on the line, in any
+// order ("Sheeley, Alison" too); or every name word on the line (initials
+// and the blanked [email] aside) is one of the customer's, so a first
+// name or surname alone ("Alison <...>", "A. Sheeley") still names her,
+// while "Blooms Catering" never names "Feast Co Catering".
+function fromLineNamesClient(fwd, clientKey, clientEmails) {
+  const addr = (/[^\s<>,;"']+@[^\s<>,;"']+/.exec(String(fwd.raw || '').toLowerCase()) || [''])[0];
+  if (addr && rowEmailMatches({ client_email: clientEmails }, addr)) return true;
+  if (!clientKey) return false;
+  const clientWords = clientKey.split(' ');
+  const words = normalizeNameKey(fwd.safe).split(' ').filter((w) => w.length > 1 && w !== 'from' && w !== 'email' && w !== 'phone');
+  return clientWords.every((w) => words.includes(w)) || (words.length > 0 && words.every((w) => clientWords.includes(w)));
+}
+export function extractDeliveryAddresses(rawText, ctx) {
+  const c = ctx || {};
+  const ownMarks = [...OWN_ADDRESS_MARKS, ...(Array.isArray(c.ownMarks) ? c.ownMarks : [])].map(normalizeAddressKey).filter(Boolean);
+  const clientKey = normalizeNameKey(c.clientName);
+  const venueWords = normalizeNameKey(c.venue).split(' ').slice(0, 2).join(' ');
+  // Quoted replies and reply headers are dropped first: our own
+  // reconfirmation email quotes the address back, and a customer's reply
+  // must never be read as new. Attachment sections survive the strip.
+  const lines = stripQuotedText(String(rawText || '').slice(0, 100000)).split(/\r?\n/);
+  const entries = [];
+  let where = 'body';
+  for (const raw of lines) {
+    const head = /^=== ATTACHMENT: (.+?) \(/.exec(raw);
+    if (head) { where = 'attachment:' + head[1]; entries.push({ raw: '', safe: '', where, marker: true, header: false }); continue; }
+    // Every line is read with emails and phones blanked; the raw line is
+    // kept for the own-address check only. A sign-off line is classified
+    // first: "Sent from my iPhone" would otherwise read as a Sent: header.
+    const safe = stripContactShapes(raw);
+    const signoff = !!safe && (ADDRESS_SIGNOFF_RE.test(safe) || /^(?:--|__)$/.test(safe) || /^sent from my\b/i.test(safe));
+    entries.push({ raw: String(raw || ''), safe, where, marker: false, signoff, header: !!safe && !signoff && isMailHeaderLine(safe) });
+  }
+  // Signature blocks, body only: after a sign-off line every later line is
+  // in the signature until the next mail header or attachment marker.
+  let inSig = false;
+  for (const e of entries) {
+    if (e.marker || e.header || e.where !== 'body') { inSig = false; e.inSignature = false; continue; }
+    e.inSignature = inSig;
+    if (e.signoff) inSig = true;
+  }
+  const found = [];
+  const rejected = [];
+  const lowerText = (list) => list.map((x) => x.safe.toLowerCase()).join('\n');
+  const contactPair = (list) => list.some((x) => x.safe.includes('[phone]')) && list.some((x) => x.safe.includes('[email]') || /https?:\/\/|www\./i.test(x.safe));
+  // The context rules for one candidate starting on entry i.
+  const consider = (cand, i) => {
+    const e = entries[i];
+    const last = i + cand.used - 1;
+    const candLines = entries.slice(i, last + 1);
+    const before3 = addressWindow(entries, i, 3, -1);
+    const before2 = before3.slice(0, 2);
+    const after1 = addressWindow(entries, last, 1, 1);
+    const after3 = addressWindow(entries, last, 3, 1);
+    const window = lowerText([...before3, ...candLines, ...after1]);
+    const strong = hasStrongAddressWord(window);
+    const weak = hasWeakAddressWord(window);
+    // A STRONG word on the candidate's own line outranks one on a
+    // neighbouring line, so "please deliver to X" wins over the ceremony
+    // site written just above it.
+    const ownStrong = hasStrongAddressWord(lowerText(candLines));
+    // The signature rescue: an instruction-shaped STRONG word on the
+    // candidate's own lines or the line above (see ADDRESS_SIGNATURE_RESCUE_RE).
+    const sigRescue = ADDRESS_SIGNATURE_RESCUE_RE.test(lowerText(candLines)) || ADDRESS_SIGNATURE_RESCUE_RE.test(lowerText(before3.slice(0, 1)));
+    const reject = (reason) => { rejected.push({ reason, line: e.safe.slice(0, 200), where: e.where }); };
+    // Our own address, read on the RAW lines (before emails are blanked). A
+    // mark is "house number plus first street word" (55 cambridge); it is
+    // matched with a direction in the way ("3708 s las vegas") or without.
+    const ownText = [...before2, ...candLines].map((x) => x.raw.toLowerCase()).join('\n');
+    const parts = addressKeyParts(cand.key);
+    const short = parts ? parts.house + ' ' + parts.word : cand.key;
+    if (ownMarks.some((mark) => cand.key.startsWith(mark) || short.startsWith(mark)) || /hamptonscoconuts\.com|sidd saxena/.test(ownText)) return reject('own_address');
+    // A forwarded email: the From: line of the header block above
+    // (through the Date:/Sent:, Subject: and To: lines and the greeting,
+    // see forwardedFromLine). The customer's own forward (from her other
+    // address, or her name or address on the From: line) reads, and is
+    // tested FIRST: a caterer or a DJ buying coconuts carries a vendor
+    // word in her own name. Any other sender: a vendor's forwarded message
+    // names the vendor's drop point, not ours (rejected 'vendor'); anyone
+    // else is the plan's "forwarded From: header" billing rule.
+    const fwdFrom = forwardedFromLine(entries, i);
+    const otherSender = fwdFrom !== null && !fromLineNamesClient(fwdFrom, clientKey, c.clientEmails);
+    if (otherSender && ADDRESS_VENDOR_RE.test(fwdFrom.safe.toLowerCase())) return reject('vendor');
+    // A billing block, or a forwarded From: header above. A billing
+    // word on the candidate's own lines always rejects; one on a
+    // neighbouring line only when the candidate's own lines carry no
+    // STRONG word ("Bill to: X" one line above "Deliver to: Y" must not
+    // take Y down with X).
+    const ownLower = lowerText(candLines);
+    if (ADDRESS_BILLING_RE.test(ownLower) || (!ownStrong && ADDRESS_BILLING_RE.test(window)) || otherSender) return reject('billing');
+    // A vendor list entry. The label is the vendor word before the street
+    // on the candidate's own line ("Florist: 12 Bridge St"), else the
+    // nearest vendor word on the two lines above plus everything from it
+    // down to the candidate ("Vendors:" / "Coconuts: Hamptons Coconuts" /
+    // the street). Only THAT label text and the candidate's own lines can
+    // name us and exempt the entry: our own entry directly above another
+    // vendor's line must not exempt that vendor's street.
+    const ownPrefix = e.safe.slice(0, cand.start).toLowerCase();
+    let vendorLabel = null;
+    if (ADDRESS_VENDOR_RE.test(ownPrefix)) vendorLabel = ownLower;
+    else {
+      // A forward's own To:/Subject: lines never label a vendor: the
+      // customer's "Subject: florist and cake" above her instruction is
+      // not a vendor list (the From: line decides whose message it is).
+      const at = before2.findIndex((x) => !FORWARD_HEADER_LINE_RE.test(x.safe) && ADDRESS_VENDOR_RE.test(x.safe.toLowerCase()));
+      if (at >= 0) vendorLabel = lowerText(before2.slice(0, at + 1)) + '\n' + ownLower;
+    }
+    if (vendorLabel !== null && !/coconut|hamptons/.test(vendorLabel)) return reject('vendor');
+    if (e.where === 'body') {
+      if (e.inSignature && !sigRescue) return reject('signature');
+      const wide = lowerText([...before3, ...candLines, ...after3]);
+      const anyWord = hasStrongAddressWord(wide) || hasWeakAddressWord(wide);
+      // A phone and an email (or a URL) within three lines on either side,
+      // and no delivery word anywhere near: a footer.
+      if ((contactPair(before3) || contactPair(after3)) && !anyWord) return reject('signature');
+      // The customer's own name directly above the street: a footer, not an
+      // instruction.
+      const above = entries[i - 1];
+      if (clientKey && above && !above.marker && !above.header && normalizeNameKey(above.safe) === clientKey && !anyWord) return reject('signature');
+    } else {
+      // A PDF line counts only with a delivery word or the venue's own words
+      // on it or just above it; a vendor list full of streets yields nothing.
+      const near = lowerText([...before2, ...candLines]);
+      if (!hasStrongAddressWord(near) && !(venueWords && normalizeNameKey(near).includes(venueWords))) return reject('attachment_no_context');
+    }
+    // Rank: 0 a STRONG word on the line itself, 1 a STRONG word in the
+    // window, 2 a WEAK word, 3 no keyword (kept only when it is the only
+    // candidate). Body beats attachment at equal rank, then first seen.
+    found.push({ ...cand, rank: ownStrong ? 0 : strong ? 1 : weak ? 2 : 3, where: e.where, isBody: e.where === 'body', order: found.length,
+      evidence: candLines.map((x) => x.safe).join(', ').slice(0, 200) });
+  };
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.marker || e.header || !e.safe) continue;
+    // Every address on the line ("ceremony at X, reception at Y" is two).
+    let from = 0;
+    for (;;) {
+      const cand = parseAddressAt(entries, i, from);
+      if (!cand) break;
+      consider(cand, i);
+      if (cand.used > 1) { i += cand.used - 1; break; }
+      from = cand.end;
+    }
+  }
+  if (!found.length) return { candidate: null, reason: 'no_candidate', rejected, found };
+  found.sort((a, b) => a.rank - b.rank || (a.isBody === b.isBody ? 0 : a.isBody ? -1 : 1) || a.order - b.order);
+  const best = found.filter((f) => f.rank === found[0].rank);
+  const distinct = new Set(best.map((f) => f.distinct));
+  if (distinct.size > 1) return { candidate: null, reason: 'ambiguous', rejected, found };
+  const { used, start, end, isBody, order, ...candidate } = best[0];
+  return { candidate, reason: null, rejected, found };
+}
+// The ZIP out of an Apple geocode answer, taken only when the answer is
+// the same house: house number, state and city (locality, sub locality
+// or a dependent locality) must all agree. confirmed false on any
+// mismatch, missing field or empty answer; the proposal then goes out
+// with no ZIP.
+export function geocodeZipFor(cand, geo) {
+  const hit = geo && Array.isArray(geo.results) && geo.results[0];
+  const sa = hit && hit.structuredAddress && typeof hit.structuredAddress === 'object' ? hit.structuredAddress : null;
+  if (!sa || !cand) return { confirmed: false, postal_code: null };
+  const houseOk = normalizeAddressKey(sa.subThoroughfare) === normalizeAddressKey(cand.house);
+  const stateOk = String(sa.administrativeAreaCode || '').toUpperCase() === String(cand.state || '').toUpperCase();
+  const city = normalizeAddressKey(cand.city);
+  const localities = [sa.locality, sa.subLocality, ...(Array.isArray(sa.dependentLocalities) ? sa.dependentLocalities : [])].map(normalizeAddressKey).filter(Boolean);
+  if (!houseOk || !stateOk || !city || !localities.includes(city)) return { confirmed: false, postal_code: null };
+  const zip = /^\d{5}/.exec(String(sa.postCode || '').trim());
+  return { confirmed: true, postal_code: zip ? zip[0] : null };
+}
+// AGREE: same house number, same first street word, the same direction
+// word when BOTH sides carry one (one side without it still agrees: "491
+// Dean Street" re-quotes "491 S Dean Street", but 491 N Dean is another
+// house), and the same city or the same ZIP, both sides through
+// normalizeAddressKey. The city must be the whole town: the words after
+// it on file must be a state, a ZIP or nothing, so Englewood never agrees
+// with Englewood Cliffs, nor Miami with Miami Beach (adjacent towns,
+// different ZIPs).
+const ADDRESS_KEY_AFTER_CITY_RE = new RegExp('^(?:$|(?:' + ADDRESS_STATE_WORDS + '|\\d{5})(?: |$))');
+export function addressesAgree(cand, onFileAddress) {
+  if (!cand || !onFileAddress) return false;
+  const file = normalizeAddressKey(onFileAddress);
+  const a = addressKeyParts(cand.key || normalizeAddressKey(cand.text));
+  const b = addressKeyParts(file);
+  if (!a || !b || a.house !== b.house || a.word !== b.word || (a.dir && b.dir && a.dir !== b.dir)) return false;
+  const padded = ' ' + file + ' ';
+  const city = normalizeAddressKey(cand.city);
+  let at = city ? padded.indexOf(' ' + city + ' ') : -1;
+  while (at >= 0) {
+    if (ADDRESS_KEY_AFTER_CITY_RE.test(padded.slice(at + city.length + 2))) return true;
+    at = padded.indexOf(' ' + city + ' ', at + 1);
+  }
+  return !!cand.postal_code && padded.includes(' ' + cand.postal_code + ' ');
+}
+// City and state words out of an on-file address ("Southampton, NY"), for
+// a banner. Null when the text names no city and state. The city must be
+// its own comma-delimited segment (the start of the text or the words
+// after a comma): a one-line address typed without commas ("491 S Dean
+// Street Englewood NJ 07631") answers null, never the street, because
+// the street is never in a banner or the push payload (plan section 2).
+export function addressPlaceWords(address) {
+  const m = new RegExp('(?:^|,)\\s*([a-z][a-z .\'-]{0,39}?)\\s*,?\\s+(' + ADDRESS_STATE_WORDS + ')\\b(?=[\\s,.;)]|$)', 'i').exec(String(address || ''));
+  if (!m) return null;
+  const city = tidyAddressText(m[1]);
+  return city ? city + ', ' + ADDRESS_STATE_CODES[m[2].toLowerCase()] : null;
+}
+// Whether the owner is asked (plan section 4 step 7). On file is
+// departureDestination(order).address, the precedence the plan, the app
+// and the reconfirmation email share. Verdicts: no_invoice (nothing to
+// write to; the row is read again once invoiced), agree (the invoice
+// holds it structured: silent), one_line (the words agree but the invoice
+// has it on one line, or the match came from the notes or the venue: the
+// NJ versus NYC tax bug, one tap), stale (the owner put a structured
+// address on the invoice AFTER this email arrived: not news), conflict.
+export function addressProposalVerdict(cand, order, emailCreatedAt) {
+  const o = order || {};
+  const dest = departureDestination(o);
+  const inv = o.invoice_fulfillment && typeof o.invoice_fulfillment === 'object' ? o.invoice_fulfillment : null;
+  const structured = inv && typeof inv.address_structured === 'boolean' ? inv.address_structured : null;
+  const updated = inv && inv.source_updated_at ? Date.parse(inv.source_updated_at) : NaN;
+  const received = Date.parse(emailCreatedAt);
+  const onFileNewer = finite(updated) && finite(received) && updated > received;
+  const fromInvoice = dest.source === 'invoice';
+  let verdict;
+  if (!factText(o.external_invoice_id)) verdict = 'no_invoice';
+  else if (dest.address && addressesAgree(cand, dest.address)) verdict = structured === true && fromInvoice ? 'agree' : 'one_line';
+  else if (onFileNewer && structured === true && fromInvoice) verdict = 'stale';
+  else verdict = 'conflict';
+  return { verdict, dest, structured, onFileNewer };
+}
+
 // ── keeping a push body under Apple's limit ──────────────────────────
 // Cuts at line breaks only, so a multi-byte character is never split,
 // and says how many bullet lines were dropped.
@@ -7451,6 +7953,35 @@ export function proposalTexts(kind, order, ctx) {
       : 'No attachment; no clock time in the email. Open it in Outlook.';
     return { title: `Coordinator email: ${tag}${venue ? ' / ' + venue : ''}, ${day}`, body: why, managerBody: null };
   }
+  // The address banners (plan section 2): city and state only, never the
+  // street, never a dollar. ctx: { day, city, state, variant: 'blank' |
+  // 'differs' | 'one_line', onFilePlace, docNumber, totalMoved, taxZero }.
+  const place = `${c.city}, ${c.state}`;
+  if (kind === 'address_change') {
+    const body = c.variant === 'one_line'
+      ? `A customer email gives the drop off address in ${place}. The invoice has it on one line, so QuickBooks may tax it wrong. Open Needs you to Accept or Keep.`
+      : c.variant === 'differs'
+        ? `A customer email gives a drop off address in ${place}; the invoice says ${c.onFilePlace || 'a different address'}. Open Needs you to Accept or Keep.`
+        : `A customer email gives a drop off address in ${place}. The invoice has none. Open Needs you to Accept or Keep.`;
+    return { title: `Address? ${tag}, ${day}`, body, managerBody: null };
+  }
+  const invoiceWord = c.docNumber ? 'Invoice #' + c.docNumber : 'The invoice';
+  const applyFlags = () => (c.totalMoved ? ' The total moved; open the invoice in QuickBooks.' : '') + (c.taxZero ? ' Tax came back zero: check the QuickBooks tax center.' : '');
+  if (kind === 'address_applied') {
+    const body = `${invoiceWord} now ships to ${place}. Sales tax re-calculated. The plan, the app and the reconfirmation draft follow within the hour.` + applyFlags();
+    return { title: `Address on the invoice: ${tag}, ${day}`, body, managerBody: null };
+  }
+  if (kind === 'address_failed') {
+    // appliedAt: QuickBooks holds the address (Jarvis's write landed) but
+    // the app never caught up and the sync gave up after two days, so the
+    // row failed with applied_at set. The opposite banner would say the
+    // address was not saved; the flags stamped with the write ride here
+    // because no applied banner follows for this row.
+    if (c.appliedAt) {
+      return { title: `Address on the invoice, app not refreshed: ${tag}, ${day}`, body: `${invoiceWord} has the address in QuickBooks, but the app could not be refreshed. Open Needs you.` + applyFlags(), managerBody: null };
+    }
+    return { title: `Address not saved: ${tag}, ${day}`, body: `Jarvis could not put the email's address on ${c.docNumber ? 'invoice #' + c.docNumber : 'the invoice'}. Open Needs you for the reason.`, managerBody: null };
+  }
   return null;
 }
 // Why a linked email yielded no time, from the attachment markers.
@@ -7462,84 +7993,451 @@ export function linkedNoTimeReason(rawText) {
   return 'no_attachment';
 }
 const LINKED_NO_TIME_MARK = 'linked_no_time notified ';
+// How much newer than a LIVE email an owner time confirmation must be
+// before the email counts as stale (the time STALE rule in the scan).
+// Covers the classify lag (Jarvis 5 rows per 2-minute tick plus the
+// worker's 5-minute tick) with room to spare. Replayed rows use 0.
+const TIME_STALE_LIVE_GRACE_MS = 60 * 60 * 1000;
+// ── proposals: a drop off address read out of the same email ─────────
+// Behind the ADDRESS_PROPOSALS switch (a worker secret, 'on' to enable,
+// unset means off; wrangler.toml). Off: the address branch is skipped and
+// the scan behaves exactly as before. On: every linked, invoiced email
+// gets ONE address pass (stamped in intake_messages.address_scanned_at),
+// and a found address that is not already on the invoice in full becomes
+// an order_address_proposals row (migration 045) plus one owner-only
+// "Address?" banner. Nothing here writes an order or an invoice: the
+// owner's Accept queues it for Jarvis.
+const ADDRESS_TABLE = 'order_address_proposals';
+export function addressProposalsOn(env) {
+  return String((env && env.ADDRESS_PROPOSALS) || '').toLowerCase() === 'on';
+}
+function ownAddressMarksFromEnv(env) {
+  return String((env && env.OWN_ADDRESS_DENYLIST) || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+// The UTC calendar day of the delivery marker, else of the event start:
+// the same day the 045 decision function compares its snapshot against.
+function deliveryDaySnapshot(o) {
+  for (const v of [o && o.delivery_at_utc, o && o.event_start_at]) {
+    const ms = Date.parse(v || '');
+    if (finite(ms)) return new Date(ms).toISOString().slice(0, 10);
+  }
+  return null;
+}
+// One intake row's address pass. Returns the outcome word for the replay
+// note ('proposed', 'agree', 'stale', 'none' or 'rejected:<reason>'), or
+// null when the pass could not run (the proposals table unreadable, an
+// insert that failed) so the row is read again next tick and a replayed
+// row is not dismissed yet. Every outcome except no-invoice stamps
+// address_scanned_at, so the extraction and the one geocode call run
+// once per email.
+async function scanAddressForRow(env, row, o, ctx) {
+  const { counts, nowMs, nowIso, market, day } = ctx;
+  const id = row.id;
+  const log = (reason) => { console.log('address scan: intake #' + id + ' ' + reason); counts.rejected++; };
+  if (row.address_scanned_at) return 'none';
+  // No invoice yet: nothing to write to. Not stamped, so the row is read
+  // again once the job is invoiced; the geocode never runs before then.
+  // A replayed row answers null here, not 'none': the pass did not run,
+  // so the replay dismissal below waits too. The row stays pending_review
+  // (invisible to cards, digest and nag through the replayed_at filters)
+  // until the job is invoiced, and a quoted job's replayed address is not
+  // lost. A live row's 'none' changes nothing (it is never dismissed here).
+  if (!factText(o.external_invoice_id)) {
+    counts.noInvoice++;
+    if (row.replayed_at) { console.log('address scan: intake #' + id + ' no_invoice (replayed row left pending until the job is invoiced)'); return null; }
+    return 'none';
+  }
+  const stamp = () => webhookFetch(env.SUPABASE_URL + '/rest/v1/intake_messages?id=eq.' + id, {
+    method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ address_scanned_at: nowIso }),
+  }, 15000);
+  const ex = extractDeliveryAddresses(row.raw_text, { venue: o.venue, clientName: o.client_name, clientEmails: o.client_email, ownMarks: ownAddressMarksFromEnv(env) });
+  for (const r of ex.rejected) log(r.reason);
+  const cand = ex.candidate;
+  if (!cand) {
+    // No candidate: 'rejected:ambiguous' when two sites tied, else
+    // 'rejected:<reason>' when every street read was rejected (the first
+    // reason names the miss in the replay note, which the report counts),
+    // else 'none' (no street read at all). Each rejection was logged above.
+    if (ex.reason === 'ambiguous') { log('ambiguous'); await stamp(); return 'rejected:ambiguous'; }
+    if (ex.rejected.length) { await stamp(); return 'rejected:' + ex.rejected[0].reason; }
+    counts.none++;
+    await stamp();
+    return 'none';
+  }
+  // The proposals already made for this order: pending ones (the newest
+  // email wins, across ticks too), ones kept in the last 30 days (a
+  // customer re-quoting an address the owner refused must not come back),
+  // and accepted ones (the same address again is a repeat while Jarvis
+  // writes it; a different one is proposed beside it, and once Jarvis's
+  // write lands the follow-up loop re-snapshots it instead of retiring it).
+  // Read BEFORE the geocode: an unreadable table (a worker ahead of 045,
+  // a PostgREST outage) leaves the row unstamped for the next tick, and
+  // that retry must not cost an Apple call every tick (plan section 4
+  // step 6: at most one geocode per email). The checks against these rows
+  // sit below, after the ZIP fill has made the candidate's key final.
+  const existing = await fetchSb(env, ADDRESS_TABLE + '?select=intake_id,status,apply_status,proposed_text,decided_at,intake_messages!inner(created_at)' +
+    '&order_id=eq.' + encodeURIComponent(o.id) + '&status=in.(pending,kept,accepted)&limit=100');
+  if (!existing) { counts.failed++; console.error('address scan: proposals table missing or unreadable (migration 045?), intake #' + id + ' left for the next tick'); return null; }
+  // ZIP fill, never a gate: one Apple geocode when the ZIP is missing
+  // (or the state was inferred from a town, which the answer must then
+  // confirm). Any mismatch, error or missing provider leaves the ZIP null
+  // and the proposal still goes out (a Dismiss-only row on the phone).
+  if (!cand.postal_code || cand.state_inferred) {
+    let geo = null;
+    if (routeProvider(env) === 'apple_maps') {
+      counts.geocoded++;
+      try { geo = await appleGet(env, '/geocode', { q: cand.text, limitToCountries: 'US', lang: 'en-US' }, nowMs); }
+      catch (e) { console.error('address scan: geocode failed for intake #' + id + ':', e && e.message ? e.message : e); }
+    }
+    const zip = geocodeZipFor(cand, geo);
+    if (cand.state_inferred && !zip.confirmed) { log('state_missing'); await stamp(); return 'rejected:state_missing'; }
+    if (!cand.postal_code && zip.postal_code) { cand.postal_code = zip.postal_code; cand.text = addressText(cand); cand.key = normalizeAddressKey(cand.text); }
+  }
+  const v = addressProposalVerdict(cand, o, row.created_at);
+  if (v.verdict === 'agree') { counts.agree++; await stamp(); return 'agree'; }
+  // STALE (plan section 4 step 7): a structured invoice address written
+  // after this email arrived. The invoice's edit stamp moves on ANY
+  // QuickBooks save (a count edit re-synced by Jarvis too), so this drop
+  // is named per intake id in the log and the replay note, never silent.
+  if (v.verdict === 'stale') { counts.stale++; console.log('address scan: intake #' + id + ' stale (structured invoice address edited after the email; on file: ' + (addressPlaceWords(v.dest.address) || 'no town read') + ', email: ' + cand.city + ', ' + cand.state + ')'); await stamp(); return 'stale'; }
+  const rowMs = Date.parse(row.created_at);
+  const pending = existing.filter((p) => p.status === 'pending');
+  if (pending.some((p) => p.intake_messages && Date.parse(p.intake_messages.created_at) > rowMs)) { log('older_than_pending'); await stamp(); return 'rejected:older_than_pending'; }
+  // A repeat is the same address by the AGREE test (house number, first
+  // street word, city or ZIP), not the exact key: a customer re-quoting
+  // the address without its ZIP or its direction word must not retire an
+  // Accept-able row for a Dismiss-only one, bring back a kept address, or
+  // add a second row beside an accepted one. One exception: a pending row
+  // with no ZIP (Dismiss-only) is superseded when this email brings the
+  // ZIP, so the owner gets an Accept button instead of a chat errand.
+  const sameKey = (p) => addressesAgree(cand, p.proposed_text) || normalizeAddressKey(p.proposed_text) === cand.key;
+  const hasZip = (p) => /\d{5}$/.test(String(p.proposed_text || '').trim());
+  const pendingRepeat = (p) => sameKey(p) && (hasZip(p) || !cand.postal_code);
+  const kept30 = existing.filter((p) => p.status === 'kept' && p.decided_at && (nowMs - Date.parse(p.decided_at)) <= 30 * 86400000);
+  const acceptedRows = existing.filter((p) => p.status === 'accepted');
+  // This email's OWN pending row, from an earlier tick whose stamp was
+  // lost (the banner went out, the row stands). Never superseded by
+  // itself: the insert below would be ignored on the intake_id key and
+  // the order left with no pending row. When that tick found no ZIP and
+  // this one did, the ZIP is written into the row in place, so the owner
+  // gets an Accept button; any other shape is the repeat the stamp missed.
+  const own = pending.find((p) => Number(p.intake_id) === Number(id));
+  if (own && sameKey(own) && !hasZip(own) && cand.postal_code) {
+    const proposedNow = { line1: cand.line1, city: cand.city, state: cand.state, postal_code: cand.postal_code };
+    if (cand.line2) proposedNow.line2 = cand.line2;
+    if (cand.state_inferred) { proposedNow.state_inferred = true; proposedNow.state_from = cand.state_from; }
+    const fill = await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + ADDRESS_TABLE + '?intake_id=eq.' + id + '&status=eq.pending', {
+      method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ proposed_address: proposedNow, proposed_text: cand.text.slice(0, 200), updated_at: nowIso }),
+    }, 15000);
+    if (!fill.ok) { counts.failed++; console.error('address scan: ZIP fill on the pending row failed for intake #' + id + ':', fill.status); return null; }
+    console.log('address scan: intake #' + id + ' zip_filled (its own pending row from an earlier tick now carries the ZIP; no new banner)');
+    counts.proposed++;
+    await stamp();
+    return 'proposed';
+  }
+  if (own || pending.some(pendingRepeat) || kept30.some(sameKey) || acceptedRows.some(sameKey)) { log('repeat'); await stamp(); return 'rejected:repeat'; }
+  // The owner already accepted a different address and Jarvis has not
+  // written it yet: the tap stands, this newer email is proposed beside
+  // it, and the log says so.
+  if (acceptedRows.some((p) => p.apply_status === 'queued' || p.apply_status === 'applying')) console.log('address scan: intake #' + id + ' accepted_in_flight (an accepted address is waiting for Jarvis; this newer email is proposed beside it)');
+  // A newer email about the same job retires older undecided proposals.
+  await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + ADDRESS_TABLE + '?order_id=eq.' + encodeURIComponent(o.id) + '&status=eq.pending', {
+    method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ status: 'superseded', decided_via: 'newer_email', decided_at: nowIso, updated_at: nowIso }),
+  }, 15000);
+  const proposed = { line1: cand.line1, city: cand.city, state: cand.state, postal_code: cand.postal_code || null };
+  if (cand.line2) proposed.line2 = cand.line2;
+  // The state came from a town name (geocode-confirmed); the row says so.
+  if (cand.state_inferred) { proposed.state_inferred = true; proposed.state_from = cand.state_from; }
+  const insert = await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + ADDRESS_TABLE, {
+    method: 'POST',
+    headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'resolution=ignore-duplicates,return=minimal' }),
+    body: JSON.stringify({
+      intake_id: id, order_id: o.id, proposed_address: proposed, proposed_text: cand.text.slice(0, 200),
+      evidence_line: stripContactShapes(cand.evidence).slice(0, 200), evidence_where: String(cand.where || 'body').slice(0, 120),
+      on_file_address: v.dest.address, on_file_source: v.dest.source, on_file_structured: v.structured, on_file_newer: v.onFileNewer,
+      invoice_id_snapshot: String(o.external_invoice_id), delivery_day_snapshot: deliveryDaySnapshot(o),
+      found_at: nowIso, updated_at: nowIso,
+    }),
+  }, 15000);
+  if (!insert.ok) { counts.failed++; console.error('address proposal insert failed for intake #' + id + ':', insert.status); return null; }
+  const variant = v.verdict === 'one_line' ? 'one_line' : v.dest.source === 'invoice' ? 'differs' : 'blank';
+  const texts = proposalTexts('address_change', o, { day, city: cand.city, state: cand.state, variant, onFilePlace: addressPlaceWords(v.dest.address) });
+  const queueId = await derivedQueueId('hc-addrprop-v1\0' + id, 'owner');
+  // Owner only, app only. The data payload carries the intake id and never
+  // the street: it stays off the push queue and the drainer log. The banner
+  // goes BEFORE the stamp, and a lost stamp (timeout) is logged, not
+  // thrown: the next tick then re-reads the email, finds its own pending
+  // row (a repeat) and stamps it then. The other order would lose the
+  // banner for good, since the repeat rule never pushes.
+  const sent = await sendPushToMarket(env, market, texts.title, texts.body, {
+    recipients: 'manage', ownersOnly: true, queueId, collapseId: 'addr-' + id, threadId: 'prop-' + id,
+    kind: 'address_change', orderId: o.id, day, data: { intake_id: id },
+  });
+  if (sent.queued) counts.proposed++; else counts.failed++;
+  try { await stamp(); } catch (e) { console.error('address scan: address_scanned_at stamp failed for intake #' + id + ' (re-read next tick):', e && e.message ? e.message : e); }
+  return 'proposed';
+}
+// After Jarvis acted: one applied or failed banner per row, then the row
+// is stamped notified_at. A row still 'applying' (QuickBooks written, the
+// dashboard re-sync pending) is not pushed yet. Then the retire step:
+// pending rows whose order is cancelled or whose on-file address moved
+// since the scan are superseded, the address twin of runStillWaitingScan,
+// except when the move is Jarvis's own apply of another proposal on the
+// same order: that pending row is re-snapshotted and left for the owner.
+async function runAddressFollowUps(env, counts, nowMs, nowIso) {
+  const done = await fetchSb(env, ADDRESS_TABLE + '?select=*,orders!inner(id,client_name,market,delivery_at_utc,stage)' +
+    '&status=eq.accepted&apply_status=in.(applied,failed)&notified_at=is.null&limit=20');
+  for (const p of done || []) {
+    try {
+      const o = p.orders || {};
+      const market = marketKey(o.market);
+      const day = String(o.delivery_at_utc || '').slice(0, 10);
+      const addr = p.proposed_address && typeof p.proposed_address === 'object' ? p.proposed_address : {};
+      const kind = p.apply_status === 'applied' ? 'address_applied' : 'address_failed';
+      // appliedAt on a failed row: QuickBooks was written, the app sync gave up (the other failed banner).
+      const texts = proposalTexts(kind, o, { day, city: addr.city, state: addr.state, docNumber: factText(p.invoice_doc_number), totalMoved: p.total_moved === true, taxZero: p.tax_zero === true, appliedAt: !!p.applied_at });
+      const queueId = await derivedQueueId('hc-addrdone-v1\0' + p.intake_id, String(p.apply_status));
+      const sent = await sendPushToMarket(env, market, texts.title, texts.body, {
+        recipients: 'manage', ownersOnly: true, queueId, collapseId: 'addr-' + p.intake_id, threadId: 'prop-' + p.intake_id,
+        kind, orderId: o.id, day, data: { intake_id: p.intake_id },
+      });
+      if (!sent.queued) { counts.failed++; continue; }
+      await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + ADDRESS_TABLE + '?intake_id=eq.' + p.intake_id + '&notified_at=is.null', {
+        method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ notified_at: nowIso, updated_at: nowIso }),
+      }, 15000);
+      counts.notified++;
+    } catch (e) {
+      counts.failed++;
+      console.error('address follow-up failed on intake #' + (p && p.intake_id) + ':', e);
+    }
+  }
+  const pending = await fetchSb(env, ADDRESS_TABLE + '?select=intake_id,order_id,on_file_address,found_at,intake_messages!inner(created_at),orders!inner(id,stage,venue,delivery_notes,invoice_fulfillment)&status=eq.pending&limit=100');
+  // Addresses Jarvis has written on these orders (accepted rows past the
+  // QuickBooks write). When the on-file address moved to one of THOSE, the
+  // move is Jarvis's own apply of an older email, not the owner's hand:
+  // the newer email's pending row is re-snapshotted against the new
+  // invoice address instead of retired, so the owner still decides it with
+  // both facts on the row (the phone and the decision function compare the
+  // snapshot with the invoice; a stale snapshot would show no buttons and
+  // refuse the tap).
+  const orderIds = [...new Set((pending || []).map((p) => p.order_id).filter(Boolean))];
+  const applied = orderIds.length ? await fetchSb(env, ADDRESS_TABLE + '?select=order_id,proposed_text,proposed_address&status=eq.accepted&apply_status=in.(applying,applied)&applied_at=not.is.null' +
+    '&order_id=in.(' + orderIds.map(encodeURIComponent).join(',') + ')&limit=200') : [];
+  const appliedFor = (orderId, onFile) => (applied || []).some((a) => a.order_id === orderId && a.proposed_address && typeof a.proposed_address === 'object'
+    && addressesAgree({ text: a.proposed_text, key: normalizeAddressKey(a.proposed_text), city: a.proposed_address.city, postal_code: a.proposed_address.postal_code }, onFile));
+  for (const p of pending || []) {
+    try {
+      const o = p.orders;
+      const dest = o ? departureDestination(o) : { address: null, source: null };
+      const nowFile = o ? String(dest.address || '').toLowerCase() : null;
+      const wasFile = collapseSpaces(p.on_file_address).slice(0, 400).toLowerCase();
+      const moved = (nowFile || '') !== (wasFile || '');
+      if (o && o.stage !== 'cancelled' && moved && nowFile && appliedFor(p.order_id, dest.address)) {
+        const inv = o.invoice_fulfillment && typeof o.invoice_fulfillment === 'object' ? o.invoice_fulfillment : null;
+        const updated = inv && inv.source_updated_at ? Date.parse(inv.source_updated_at) : NaN;
+        const received = Date.parse(p.intake_messages && p.intake_messages.created_at);
+        await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + ADDRESS_TABLE + '?intake_id=eq.' + p.intake_id + '&status=eq.pending', {
+          method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+          body: JSON.stringify({
+            on_file_address: dest.address, on_file_source: dest.source,
+            on_file_structured: inv && typeof inv.address_structured === 'boolean' ? inv.address_structured : null,
+            on_file_newer: finite(updated) && finite(received) && updated > received, updated_at: nowIso,
+          }),
+        }, 15000);
+        console.log('address follow-up: intake #' + p.intake_id + ' re-snapshotted (the invoice now carries an applied proposal; the newer email still waits for a decision)');
+        counts.resnapshotted++;
+        continue;
+      }
+      const retire = !o || o.stage === 'cancelled' ? 'cancelled' : moved ? 'owner_edit' : null;
+      if (!retire) continue;
+      await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + ADDRESS_TABLE + '?intake_id=eq.' + p.intake_id + '&status=eq.pending', {
+        method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ status: 'superseded', decided_via: retire, apply_status: null, decided_at: nowIso, updated_at: nowIso }),
+      }, 15000);
+      counts.retired++;
+    } catch (e) {
+      counts.failed++;
+      console.error('address retire failed on intake #' + (p && p.intake_id) + ':', e);
+    }
+  }
+}
+// The scan's intake read: the 50 newest linked, classified, undecided
+// emails about upcoming jobs, with the two 045 columns. A worker running
+// ahead of 045 (or after its rollback) gets a 400 naming a missing column;
+// through fetchSb that would be null, and the whole scan (time proposals,
+// Coordinator email banners) would stop until 045 lands. So exactly that
+// 400 retries once WITHOUT the two columns (read as null) with a logged
+// error, the fetchIntakeLive shape. Any other failure answers null.
+async function fetchProposalIntakes(env, since) {
+  const select = (withReplayColumns) => 'intake_messages?select=id,subject,raw_text,order_id,created_at,error_detail' +
+    (withReplayColumns ? ',replayed_at,address_scanned_at' : '') + ',' +
+    'orders!inner(id,client_name,client_email,market,venue,delivery_notes,delivery_at_utc,delivery_request,stage,invoice_fulfillment,external_invoice_id,event_start_at)' +
+    '&status=eq.pending_review&order_id=not.is.null&classified_at=not.is.null' +
+    '&orders.delivery_at_utc=gte.' + since + 'T00:00:00Z&order=created_at.desc&limit=50';
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + select(true), { headers: sbHeaders(env) });
+    if (resp.ok) {
+      const rows = await resp.json();
+      return Array.isArray(rows) ? rows : null;
+    }
+    const text = await resp.text();
+    if (resp.status === 400 && /replayed_at|address_scanned_at/.test(String(text || ''))) {
+      console.error('proposal scan: intake_messages.replayed_at or address_scanned_at missing (migration 045 not applied?), reading without them');
+      return fetchSb(env, select(false));
+    }
+    console.error('supabase read error:', 'intake_messages', resp.status);
+    return null;
+  } catch (e) {
+    console.error('supabase read exception:', e);
+    return null;
+  }
+}
 export async function runProposalScan(env) {
-  const counts = { seen: 0, proposed: 0, noTime: 0, agree: 0, skipped: 0, failed: 0 };
+  const counts = { seen: 0, proposed: 0, noTime: 0, agree: 0, stale: 0, skipped: 0, failed: 0, replayed: 0, address: null };
+  const addressOn = addressProposalsOn(env);
+  // geocoded counts Apple calls this tick: more than one per email across
+  // ticks would show a repeat in the log.
+  if (addressOn) counts.address = { proposed: 0, agree: 0, stale: 0, none: 0, rejected: 0, noInvoice: 0, notified: 0, retired: 0, resnapshotted: 0, failed: 0, geocoded: 0 };
   try {
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
     const since = new Date(Date.UTC(...dayInZone(nowMs, 'ny').split('-').map(Number).map((v, i) => (i === 1 ? v - 1 : v))) - 86400000).toISOString().slice(0, 10);
-    const rows = await fetchSb(env, 'intake_messages?select=id,subject,raw_text,order_id,created_at,error_detail,' +
-      'orders!inner(id,client_name,market,venue,delivery_notes,delivery_at_utc,delivery_request,stage)' +
-      '&status=eq.pending_review&order_id=not.is.null&classified_at=not.is.null' +
-      '&orders.delivery_at_utc=gte.' + since + 'T00:00:00Z&order=created_at.desc&limit=50');
-    if (!rows || !rows.length) return counts;
-    const ids = rows.map((r) => r.id).join(',');
-    const existing = await fetchSb(env, 'order_time_proposals?select=intake_id,status&intake_id=in.(' + ids + ')&limit=100');
-    if (!existing) { console.error('proposal scan: proposals table missing or unreadable (migration 042?), nothing done'); return counts; }
-    const have = new Set(existing.map((p) => Number(p.intake_id)));
-    for (const row of rows) {
-      counts.seen++;
-      try {
-        if (have.has(Number(row.id))) { counts.skipped++; continue; }
-        const o = row.orders;
-        if (!o || o.stage === 'cancelled') { counts.skipped++; continue; }
-        const market = marketKey(o.market);
-        const day = String(o.delivery_at_utc || '').slice(0, 10);
-        const dr = o.delivery_request && typeof o.delivery_request === 'object' ? o.delivery_request : null;
-        const onFileText = dr && dr.status === 'confirmed' ? String(dr.window || '').trim() : '';
-        const onFileParsed = onFileText ? parseArrivalTime(onFileText, day, marketZone(market)) : null;
-        const times = extractArrivalTimes(row.raw_text);
-        if (!times.length) {
-          // Linked but no readable time: tell the owner once, mark the row.
-          if (String(row.error_detail || '').startsWith(LINKED_NO_TIME_MARK)) { counts.skipped++; continue; }
-          const texts = proposalTexts('linked_no_time', o, { day, why: linkedNoTimeReason(row.raw_text) });
-          const id = await derivedQueueId('hc-linked-v1', String(row.id));
-          const sent = await sendPushToMarket(env, market, texts.title, texts.body, { recipients: 'manage', queueId: id, collapseId: 'link-' + row.id, threadId: 'link-' + row.id, kind: 'linked_no_time', orderId: o.id, day, data: { intake_id: row.id } });
-          if (sent.queued) {
+    // Newest first so the 50-row window keeps the newest mail, walked
+    // OLDEST first below so the last email's proposal is the one standing.
+    const rows = await fetchProposalIntakes(env, since);
+    if (rows && rows.length) {
+      const ids = rows.map((r) => r.id).join(',');
+      const existing = await fetchSb(env, 'order_time_proposals?select=intake_id,status&intake_id=in.(' + ids + ')&limit=100');
+      if (!existing) { console.error('proposal scan: proposals table missing or unreadable (migration 042?), nothing done'); return counts; }
+      const have = new Set(existing.map((p) => Number(p.intake_id)));
+      for (const row of rows.slice().reverse()) {
+        counts.seen++;
+        try {
+          const o = row.orders;
+          if (!o || o.stage === 'cancelled') {
+            counts.skipped++;
+            // A replayed row on a cancelled order has nothing left to
+            // propose, and neither branch runs on it, so it is dismissed
+            // here: a replayed row must never stay pending_review for good
+            // (the 045 rollback and an old-worker deploy both need that set
+            // empty). Only with the switch on, like the dismissal below.
+            if (addressOn && o && row.replayed_at) {
+              await webhookFetch(env.SUPABASE_URL + '/rest/v1/intake_messages?id=eq.' + row.id + '&status=eq.pending_review', {
+                method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ status: 'dismissed', reviewed_at: nowIso, error_detail: 'replay: order cancelled' }),
+              }, 15000);
+              counts.replayed++;
+            }
+            continue;
+          }
+          const market = marketKey(o.market);
+          const day = String(o.delivery_at_utc || '').slice(0, 10);
+          // Old mail re-read by the replay script: never a Telegram-facing
+          // banner, and dismissed below once both branches have run.
+          const replayed = !!row.replayed_at;
+          // The address branch runs BEFORE the time check: a row that already
+          // has a time proposal still needs its one address pass.
+          const addressOutcome = addressOn ? await scanAddressForRow(env, row, o, { counts: counts.address, nowMs, nowIso, market, day }) : null;
+          const timeBranch = async () => {
+            if (have.has(Number(row.id))) { counts.skipped++; return 'proposed'; }
+            const dr = o.delivery_request && typeof o.delivery_request === 'object' ? o.delivery_request : null;
+            const onFileText = dr && dr.status === 'confirmed' ? String(dr.window || '').trim() : '';
+            const onFileParsed = onFileText ? parseArrivalTime(onFileText, day, marketZone(market)) : null;
+            const times = extractArrivalTimes(row.raw_text);
+            if (!times.length) {
+              // Linked but no readable time: tell the owner once, mark the row.
+              // A replayed row gets no such banner (old mail is not news).
+              if (replayed) { counts.noTime++; return 'none'; }
+              if (String(row.error_detail || '').startsWith(LINKED_NO_TIME_MARK)) { counts.skipped++; return 'none'; }
+              const texts = proposalTexts('linked_no_time', o, { day, why: linkedNoTimeReason(row.raw_text) });
+              const id = await derivedQueueId('hc-linked-v1', String(row.id));
+              const sent = await sendPushToMarket(env, market, texts.title, texts.body, { recipients: 'manage', queueId: id, collapseId: 'link-' + row.id, threadId: 'link-' + row.id, kind: 'linked_no_time', orderId: o.id, day, data: { intake_id: row.id } });
+              if (sent.queued) {
+                await webhookFetch(env.SUPABASE_URL + '/rest/v1/intake_messages?id=eq.' + row.id + '&status=eq.pending_review', {
+                  method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+                  body: JSON.stringify({ error_detail: LINKED_NO_TIME_MARK + nowIso }),
+                }, 15000);
+              }
+              counts.noTime++;
+              return 'none';
+            }
+            const best = times[0];
+            const conflicts = !onFileParsed || !onFileParsed.ok || windowsConflict({ hh: best.hh, mm: best.mm }, { hh: onFileParsed.hh, mm: onFileParsed.mm });
+            if (!conflicts) { counts.agree++; return 'agree'; }
+            // The STALE rule: the owner confirmed a time in the app AFTER this
+            // email arrived, so the email is not news (a replayed August email
+            // must never propose over a September confirmation). A live email
+            // is classified minutes after it lands, so a correction that
+            // arrived seconds before the owner's tap on the previous email
+            // would read as stale and be lost; a live row is stale only when
+            // the confirmation is more than an hour newer than the email. A
+            // replayed row (weeks old by construction) keeps the strict compare.
+            const checkedMs = dr && dr.checked_at ? Date.parse(dr.checked_at) : NaN;
+            const staleGraceMs = replayed ? 0 : TIME_STALE_LIVE_GRACE_MS;
+            if (dr && dr.source === 'owner' && dr.status === 'confirmed' && finite(checkedMs) && checkedMs - Date.parse(row.created_at) > staleGraceMs) { counts.stale++; return 'stale'; }
+            const proposedArrive = wallClockToUtc(day, best.hh, best.mm, marketZone(market));
+            if (!proposedArrive) { counts.skipped++; return 'none'; }
+            // Newest email wins, across ticks too: a pending proposal from a
+            // NEWER email than this one stands, and this row is skipped
+            // instead of retiring it.
+            const pendingTimes = await fetchSb(env, 'order_time_proposals?select=intake_id,intake_messages!inner(created_at)&order_id=eq.' + encodeURIComponent(o.id) + '&status=eq.pending&limit=100') || [];
+            if (pendingTimes.some((p) => p.intake_messages && Date.parse(p.intake_messages.created_at) > Date.parse(row.created_at))) {
+              console.log('proposal scan: intake #' + row.id + ' older_than_pending');
+              counts.skipped++;
+              return 'none';
+            }
+            // A newer email about the same job retires older undecided proposals.
+            await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_time_proposals?order_id=eq.' + encodeURIComponent(o.id) + '&status=eq.pending', {
+              method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+              body: JSON.stringify({ status: 'superseded', decided_via: 'newer_email', decided_at: nowIso, updated_at: nowIso }),
+            }, 15000);
+            const insert = await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_time_proposals', {
+              method: 'POST',
+              headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'resolution=ignore-duplicates,return=minimal' }),
+              body: JSON.stringify({
+                intake_id: row.id, order_id: o.id, proposed_arrive_at: proposedArrive, proposed_label: best.label,
+                evidence_line: stripContactShapes(best.line).slice(0, 200), evidence_where: String(best.where || 'body').slice(0, 120),
+                on_file_window: onFileText || null, on_file_checked_at: dr && dr.checked_at ? String(dr.checked_at) : null,
+                found_at: nowIso, updated_at: nowIso,
+              }),
+            }, 15000);
+            if (!insert.ok) { counts.failed++; console.error('proposal insert failed for intake #' + row.id + ':', insert.status); return 'none'; }
+            const texts = proposalTexts('time_change', o, {
+              day, label: best.label, evidence: stripContactShapes(best.line).slice(0, 120), where: best.where,
+              onFileText, onFileSource: onFileSourceLabel(dr), onFileChecked: dr && dr.checked_at,
+            });
+            const ownerId = await derivedQueueId('hc-proposal-v1\0' + row.id, 'owner');
+            const sent = await sendPushToMarket(env, market, texts.title, texts.body, {
+              recipients: 'manage', managerBody: texts.managerBody, queueId: ownerId, collapseId: 'prop-' + row.id, threadId: 'prop-' + row.id,
+              kind: 'time_change', orderId: o.id, day, data: { intake_id: row.id, proposed_label: best.label },
+            });
+            if (sent.queued) counts.proposed++; else counts.failed++;
+            return 'proposed';
+          };
+          const timeOutcome = await timeBranch();
+          // A replayed row leaves pending_review on its first address-scanned
+          // tick, whatever the outcome, so it is never carded, digested or
+          // nagged. Only when the address branch actually ran: with the switch
+          // off the row keeps pending_review (invisible through the replayed_at
+          // filters) and gets its one address pass once the switch comes on.
+          if (replayed && addressOutcome !== null) {
             await webhookFetch(env.SUPABASE_URL + '/rest/v1/intake_messages?id=eq.' + row.id + '&status=eq.pending_review', {
               method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-              body: JSON.stringify({ error_detail: LINKED_NO_TIME_MARK + nowIso }),
+              body: JSON.stringify({ status: 'dismissed', reviewed_at: nowIso, error_detail: 'replay: time=' + timeOutcome + ', address=' + addressOutcome }),
             }, 15000);
+            counts.replayed++;
           }
-          counts.noTime++;
-          continue;
+        } catch (e) {
+          counts.failed++;
+          console.error('proposal scan failed on intake #' + (row && row.id) + ':', e);
         }
-        const best = times[0];
-        const conflicts = !onFileParsed || !onFileParsed.ok || windowsConflict({ hh: best.hh, mm: best.mm }, { hh: onFileParsed.hh, mm: onFileParsed.mm });
-        if (!conflicts) { counts.agree++; continue; }
-        const proposedArrive = wallClockToUtc(day, best.hh, best.mm, marketZone(market));
-        if (!proposedArrive) { counts.skipped++; continue; }
-        // A newer email about the same job retires older undecided proposals.
-        await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_time_proposals?order_id=eq.' + encodeURIComponent(o.id) + '&status=eq.pending', {
-          method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-          body: JSON.stringify({ status: 'superseded', decided_via: 'newer_email', decided_at: nowIso, updated_at: nowIso }),
-        }, 15000);
-        const insert = await webhookFetch(env.SUPABASE_URL + '/rest/v1/order_time_proposals', {
-          method: 'POST',
-          headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'resolution=ignore-duplicates,return=minimal' }),
-          body: JSON.stringify({
-            intake_id: row.id, order_id: o.id, proposed_arrive_at: proposedArrive, proposed_label: best.label,
-            evidence_line: stripContactShapes(best.line).slice(0, 200), evidence_where: String(best.where || 'body').slice(0, 120),
-            on_file_window: onFileText || null, on_file_checked_at: dr && dr.checked_at ? String(dr.checked_at) : null,
-            found_at: nowIso, updated_at: nowIso,
-          }),
-        }, 15000);
-        if (!insert.ok) { counts.failed++; console.error('proposal insert failed for intake #' + row.id + ':', insert.status); continue; }
-        const texts = proposalTexts('time_change', o, {
-          day, label: best.label, evidence: stripContactShapes(best.line).slice(0, 120), where: best.where,
-          onFileText, onFileSource: onFileSourceLabel(dr), onFileChecked: dr && dr.checked_at,
-        });
-        const ownerId = await derivedQueueId('hc-proposal-v1\0' + row.id, 'owner');
-        const sent = await sendPushToMarket(env, market, texts.title, texts.body, {
-          recipients: 'manage', managerBody: texts.managerBody, queueId: ownerId, collapseId: 'prop-' + row.id, threadId: 'prop-' + row.id,
-          kind: 'time_change', orderId: o.id, day, data: { intake_id: row.id, proposed_label: best.label },
-        });
-        if (sent.queued) counts.proposed++; else counts.failed++;
-      } catch (e) {
-        counts.failed++;
-        console.error('proposal scan failed on intake #' + (row && row.id) + ':', e);
       }
     }
+    if (addressOn) await runAddressFollowUps(env, counts.address, nowMs, nowIso);
   } catch (e) {
     console.error('runProposalScan error:', e);
   }
