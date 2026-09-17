@@ -501,6 +501,86 @@ while the address sat in her August email the whole time.
   Replayed rows on past-day or never-invoiced jobs never enter the scan, so
   that set only empties after the one-line dismissal by stamp above.
 
+## Live Activity START and END claims (migration 046, BUILT 2026-09-17, NOT applied)
+
+The lock-screen shift card on Sidd's phone the moment a crew member clocks
+in, without opening the app. The worker (fd3befe9) and the droplet drainer
+already run the START and END paths every five minutes and die at the claim:
+the live database has no `hc_claim_live_activity_starts_v2`,
+`hc_claim_live_activity_starts`, `hc_claim_live_activity_ends` or
+`hc_validate_live_activity_start_delivery` (404 PGRST202 in the worker log).
+`migrations/046_live_activity_claims.sql` adds exactly those four, the START
+ledger `live_activity_start_deliveries` (service role only, RLS on, no
+policy), the END lease columns on `live_activity_tokens`, and the queue and
+ledger guards, copied from 017/018/022/025 with 025's manager market rule
+inlined. It never touches `hc_sync_notification_device` (041), the 015
+RPCs, the 015c functions or the 010/015 token indexes (the preflight
+fingerprints them, the postflight compares).
+
+- SIDD'S "YES DO IT" COVERS THREE SEPARATE THINGS (the 046 header lists
+  them): (1) the plumbing above, which the rollback removes. (2) A ONE-WAY
+  change on the live table: 046 CLOSES the 010 anonymous lane on
+  `live_activity_tokens` (the two anon policies dropped, anon and PUBLIC
+  revoked). With it open, the public anon key in index.html could rewrite
+  Sidd's push_to_start token or plant one for a manager and be sent the
+  crew card (proved in the rehearsal). Every phone has written tokens
+  through the 015 RPC since the 2026-08-25 secure-auth build; the preflight
+  refuses (55000) while a no-device token row (a pre-2026-08-25 phone) was
+  written within 7 days and its message names the SELECT to run. The
+  rollback does NOT reopen the lane. push_tokens and its 008 policies are
+  untouched (041's marker rule). (3) LATENCY: the card lands on the
+  worker's next five-minute cron tick after clock-in (`wrangler.toml`
+  `*/5 * * * *` is the only call site of runLiveActivityStartScan; the app
+  clocks in through the Supabase RPC hc_start_shift and never calls the
+  worker), so "within about five minutes, without opening the app". A card
+  at the moment of clock-in is a separate worker change, not 046.
+- PAUSE WITHOUT ROLLBACK (mid-shift, reversible, no data loss): the
+  rollback refuses while an open shift holds a START receipt, so to stop
+  new claims run `revoke execute on function
+  public.hc_claim_live_activity_starts_v2(timestamptz, timestamptz,
+  timestamptz, integer), public.hc_claim_live_activity_starts(timestamptz,
+  timestamptz, timestamptz, integer),
+  public.hc_claim_live_activity_ends(timestamptz, timestamptz, integer)
+  from service_role;`. The worker's scans return on the non-404 error
+  within one tick, the drainer keeps finishing rows already queued (the
+  validator is left alone), and the matching `grant execute` or a 046
+  re-run resumes. Rehearsed. Roll back only once the shifts have closed.
+- NEVER RUN 017, 018, 022 OR 025 AFTER 046: 025's preflight passes once the
+  claim exists and silently replaces it (demonstrated in the rehearsal);
+  017/022 also break 041 (section above). 018 as written refuses today for
+  ONE reason only: authenticated still holds its Supabase default grants on
+  `live_activity_tokens` (SELECT, TRUNCATE, REFERENCES, TRIGGER; 015:561
+  revoked only insert, update, delete), and 018 names SELECT first (42501
+  "client role retains direct live_activity_tokens SELECT"). The
+  anon-policy refusal it had first is gone once 046 closes the lane, and
+  its registration-RPC regex already matches 015. A `revoke all on table
+  public.live_activity_tokens from authenticated` (016:563's text, a
+  020-style cleanup) and 018 installs over 046 with no error, replacing the
+  market-scoped claim and validator with its unscoped copies (a Vegas
+  manager is then seeded for a NY crew shift; demonstrated in the
+  rehearsal). Retire 018 as written before those grants are ever touched.
+- Rollback `046_live_activity_claims_rollback.sql` refuses while a START
+  receipt is claimed, unqueued and unanswered, while an open shift has any
+  receipt, while push_queue holds an unfinished la_start/la_end, and while a
+  token row carries an END lease. A receipt Apple already answered keeps its
+  lease stamp (the worker's lost-response path) and never blocks. Releasing
+  an END lease BY HAND needs one transaction with
+  `select set_config('request.jwt.claim.role', 'service_role', true);`
+  before the UPDATE: the SQL editor is not service_role and 046's reset
+  trigger silently keeps the lease otherwise (recipe in both file headers).
+- Verify from the droplet: `python3 verify046.py` (the file lives at the
+  workspace root, `../partials-2026-09-14/verify046.py`, outside this repo;
+  copy it up) is read-only; `--claim` runs the two real claims (seeds and
+  leases, the worker re-claims within 5 minutes; tokens are never printed).
+- Rehearse: `node rehearsal/run-046-live-activity-claims-pglite.mjs <pglite dir>`
+  (110 scenarios: the worker's and drainer's exact calls and PATCH filters,
+  the anon lane before and after, both rollback shapes, the pause lever,
+  the 025 trap and the 018 trap).
+- Install note: the first START scan after 046 seeds every open shift
+  clocked in within 48 h; a phone already showing a locally started card
+  (build 31+) carries two until its next foreground sweep. Apply with no
+  open shift when possible. Needs Sidd's exact "yes do it".
+
 ## Departure plan, stage 0 truth checks (recorded 2026-09-13, read-only)
 
 Plan: `../DEPARTURE-PLAN-2026-09-12.md` (original + the app-only revision).
