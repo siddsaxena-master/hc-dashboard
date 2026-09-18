@@ -234,7 +234,35 @@ async function replyScanAt(iso, env, opts) {
 }
 // Monday 2026-09-14 08:05 ET (delivery day minus 5 for the Saturday job).
 const MON_0805 = '2026-09-14T12:05:00Z';
+// Case A, everything known, with the picture: the wording Sidd approved
+// on 2026-09-18, byte for byte. Bullet lines start with "• " and read
+// "Label: value" (the droplet bolds the label up to the first colon).
+const FULL_SUBJECT = 'Your coconuts for Saturday, September 19: quick check';
 const FULL_BODY = [
+  'Hi Jamie,',
+  '',
+  'We are set for Saturday, September 19. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change by Wednesday, September 16.',
+  '',
+  '• Delivery: Saturday, September 19, arriving 3:30 PM',
+  '• Drop off: Pridwin Hotel, 81 Shore Rd, Shelter Island, NY 11964',
+  '• Count: 100 custom branded coconuts (picture below)',
+  '• Cracking: straw hole pre-cracked, ready for straws',
+  '• On site contact: Ana, (631) 555-0100',
+  '• Your contact: Sidd, 732-555-0199',
+  '',
+  'We brand and box on Friday, September 18, the day before, so changes need to reach us by Wednesday, September 16.',
+  '',
+  'Invoice, if you need it: https://connect.intuit.com/pay/abc',
+  '',
+  'Thanks so much,',
+  'Sidd',
+  'Hamptons Coconuts',
+].join('\n');
+// The wording the worker made before 2026-09-18, as a row drafted then
+// still carries it. Used to pin that a template change rewrites an
+// existing draft once.
+const OLD_SUBJECT = 'Your coconuts for Saturday, September 19: quick reconfirm';
+const OLD_BODY = [
   'Hi Jamie,',
   '',
   'Your coconuts for Saturday, September 19 are locked in. One quick read through before we brand them.',
@@ -479,87 +507,158 @@ const FULL_BODY = [
   pass('facts: source and derived per section 4 (null numbers stay null, balance open = not paid_full, first name skips articles and titles), address precedence, window rules, cracking words (a box and invoice disagreement is unknown), the picture choice, and every hold reason (soft gaps never hold)');
 }
 
-// ── 6. The template, byte for byte ──────────────────────────────────
+// ── 6. The template, byte for byte (the 2026-09-18 wording) ─────────
 {
-  const full = reconfirmTemplate(reconfirmFacts(order()), { ownerCell: CELL, picture: reconfirmPicture(order()), today: '2026-09-14', deliveryDay: '2026-09-19' });
-  assert.equal(full.subject, 'Your coconuts for Saturday, September 19: quick reconfirm');
+  const OPTS = { ownerCell: CELL, picture: reconfirmPicture(order()), today: '2026-09-14', deliveryDay: '2026-09-19' };
+  // The first paragraph of case A and the two bullets case B changes.
+  const CASE_A_OPENER = 'We are set for Saturday, September 19. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change by Wednesday, September 16.';
+  const DELIVERY_KNOWN = '• Delivery: Saturday, September 19, arriving 3:30 PM';
+  const DELIVERY_ASK = '• Delivery: Saturday, September 19, arrival time: please tell us';
+  const CONTACT_KNOWN = '• On site contact: Ana, (631) 555-0100';
+  const CONTACT_ASK = '• On site contact: please send a name and cell';
+  // Case A with the picture: the approved email, byte for byte.
+  const full = reconfirmTemplate(reconfirmFacts(order()), OPTS);
+  assert.equal(full.subject, FULL_SUBJECT);
   assert.equal(full.body, FULL_BODY);
-  // No cell: the contact line drops the number and the sign-off ends at the company.
-  const noCell = reconfirmTemplate(reconfirmFacts(order()), { picture: {}, today: '2026-09-14', deliveryDay: '2026-09-19' }).body;
-  assert.ok(noCell.includes('\nYour contact on our side: Sidd, sidd@hamptonscoconuts.com\n'));
+  // Case A without a picture: plain "coconuts", no "(picture below)", and
+  // every other line the same.
+  const noPic = reconfirmTemplate(reconfirmFacts(order({ logo_url: null, logo_received: false })), { ...OPTS, picture: null });
+  assert.equal(noPic.subject, FULL_SUBJECT);
+  assert.equal(noPic.body, FULL_BODY.replace('• Count: 100 custom branded coconuts (picture below)', '• Count: 100 coconuts'));
+  assert.ok(!/picture|branded/i.test(noPic.body), 'no picture is mentioned when none goes with the email');
+  // No cell: the contact bullet is the name alone, never an email address,
+  // and the sign-off ends at the company.
+  const noCell = reconfirmTemplate(reconfirmFacts(order()), { ...OPTS, ownerCell: '' }).body;
+  assert.equal(noCell, FULL_BODY.replace('• Your contact: Sidd, 732-555-0199', '• Your contact: Sidd'));
+  assert.ok(!noCell.includes('@'), 'never an email address in the body');
   assert.ok(noCell.endsWith('\nThanks so much,\nSidd\nHamptons Coconuts'));
-  // Arrival time missing: the question, no example clock time anywhere.
-  const noTime = reconfirmTemplate(reconfirmFacts(order({ delivery_request: { ...order().delivery_request, window: null } })), { ownerCell: CELL, picture: {}, today: '2026-09-14', deliveryDay: '2026-09-19' }).body;
-  assert.ok(noTime.includes("\nDelivery: Saturday, September 19. What exact time should our driver arrive? One line like 'please arrive at ...' with the time is perfect.\n"));
-  assert.ok(noTime.includes('\nOn site contact: Ana, (631) 555-0100\n'));
-  assert.ok(noTime.includes('\nIf it all looks right, just reply "confirmed" and we are set.\n'));
-  assert.ok(!/\d{1,2}:\d{2}/.test(noTime.split('\nYour contact on our side')[0]));
-  // Site contact missing.
-  const noContact = reconfirmTemplate(reconfirmFacts(order({ delivery_request: { ...order().delivery_request, contact_name: null, contact_phone: null } })), { ownerCell: CELL, picture: {}, today: '2026-09-14', deliveryDay: '2026-09-19' }).body;
-  assert.ok(noContact.includes('\nDelivery: Saturday, September 19, arriving 3:30 PM\n'));
-  assert.ok(noContact.includes('\nOn site contact: who should our driver call when we arrive? A name and cell is perfect.\n'));
-  // Both missing: one merged question, the changed "reply with that" line, no On site contact line.
-  const both = reconfirmTemplate(reconfirmFacts(order({ delivery_request: null })), { ownerCell: CELL, picture: {}, today: '2026-09-14', deliveryDay: '2026-09-19' }).body;
-  assert.ok(both.includes('\nDelivery: Saturday, September 19. What exact time should our driver arrive, and who should they call on arrival? A time, a name and a cell is perfect.\n'));
-  assert.ok(!both.includes('On site contact:'));
-  assert.ok(both.includes('\nIf everything else looks right, reply with that and we are set.\n'));
-  assert.ok(!both.includes('reply "confirmed"'));
+  // The shape the droplet renders (reconfirm_sender.py): every fact line
+  // starts with the bullet and a space and reads "Label: value" (the label
+  // up to the first colon goes bold), in this order, and no other line
+  // starts with a bullet.
+  const bullets = full.body.split('\n').filter((l) => l.startsWith('•'));
+  assert.deepEqual(bullets.map((l) => l.slice('• '.length).split(':')[0]), ['Delivery', 'Drop off', 'Count', 'Cracking', 'On site contact', 'Your contact']);
+  for (const l of bullets) assert.ok(/^• [A-Z][a-z ]+: \S/.test(l), l);
+  const deliveryLine = full.body.split('\n').find((l) => l.startsWith('• Delivery:'));
+  assert.equal(deliveryLine, DELIVERY_KNOWN);
+  assert.ok(deliveryLine.slice('•'.length).trim().toLowerCase().startsWith('delivery:'), 'the Delivery bullet keeps its label shape once the bullet is stripped');
+  assert.equal(full.body.split('\n').filter((l) => /^delivery:/i.test(l)).length, 0, 'no bare Delivery line without the bullet');
+  // The bullets sit as one block between two blank lines (one <ul>).
+  assert.ok(full.body.includes('\n\n' + bullets.join('\n') + '\n\n'));
+  // The picture hook (the fix of 2026-09-18): the droplet puts the picture
+  // UNDER the facts, right after the paragraph that starts "We brand and
+  // box" and the blank line beneath it, so "(picture below)" on the Count
+  // bullet is true. That paragraph must keep its opening words, sit as a
+  // plain line (never a bullet) AFTER the bullets, and be followed by a
+  // blank line, in case A and in case B alike.
+  const PREP_LINE = 'We brand and box on Friday, September 18, the day before, so changes need to reach us by Wednesday, September 16.';
+  const lines = full.body.split('\n');
+  const prepAt = lines.findIndex((l) => l.toLowerCase().startsWith('we brand and box'));
+  assert.equal(lines[prepAt], PREP_LINE);
+  assert.ok(prepAt > lines.lastIndexOf(bullets[bullets.length - 1]), 'the picture hook paragraph comes after the bullets');
+  assert.equal(lines[prepAt + 1], '', 'a blank line under the hook paragraph, then the picture');
+  assert.equal(lines.filter((l) => /we brand and box/i.test(l)).length, 1, 'exactly one hook paragraph');
+  assert.ok(full.body.indexOf('(picture below)') < full.body.indexOf(PREP_LINE), 'the promise reads above where the picture goes');
+  const askBoth = reconfirmTemplate(reconfirmFacts(order({ delivery_request: null })), OPTS).body;
+  assert.ok(askBoth.includes('\n\n' + PREP_LINE + '\n\n'), 'case B keeps the same hook paragraph');
+  // Case B, time only: the one-thing ask, the Delivery bullet asks, the
+  // contact bullet stays, the second paragraph stays, no clock time anywhere.
+  const noTime = reconfirmTemplate(reconfirmFacts(order({ delivery_request: { ...order().delivery_request, window: null } })), OPTS).body;
+  assert.equal(noTime, FULL_BODY
+    .replace(CASE_A_OPENER, 'One thing we still need: what time our driver should arrive. Reply with that and we are set.')
+    .replace(DELIVERY_KNOWN, DELIVERY_ASK));
+  assert.ok(!/\d{1,2}:\d{2}/.test(noTime), 'no example clock time');
+  assert.ok(noTime.includes(CONTACT_KNOWN) && noTime.includes('\nWe brand and box on Friday, September 18, the day before, so changes need to reach us by Wednesday, September 16.\n'));
+  // Case B, contact only.
+  const noContact = reconfirmTemplate(reconfirmFacts(order({ delivery_request: { ...order().delivery_request, contact_name: null, contact_phone: null } })), OPTS).body;
+  assert.equal(noContact, FULL_BODY
+    .replace(CASE_A_OPENER, 'One thing we still need: who our driver should call on site. Reply with a name and cell and we are set.')
+    .replace(CONTACT_KNOWN, CONTACT_ASK));
+  assert.ok(noContact.includes(DELIVERY_KNOWN));
+  // Case B, both missing: the two-things ask and both bullets ask.
+  const both = reconfirmTemplate(reconfirmFacts(order({ delivery_request: null })), OPTS).body;
+  assert.equal(both, FULL_BODY
+    .replace(CASE_A_OPENER, 'Two things we still need: what time our driver should arrive and who they should call on site. Reply with those and we are set.')
+    .replace(DELIVERY_KNOWN, DELIVERY_ASK)
+    .replace(CONTACT_KNOWN, CONTACT_ASK));
+  // Case B never asks for a "confirmed" and never names the customer's own
+  // phone as the site contact.
+  for (const body of [noTime, noContact, both]) {
+    assert.ok(!/confirmed/.test(body));
+    assert.ok(!body.includes('(631) 555-0177'));
+  }
+  // The run-of-show sentence is gone (removed 2026-09-18).
+  for (const body of [full.body, noTime, noContact, both]) assert.ok(!/run of show|vendor timeline/i.test(body));
   // Cracking variants.
   const mixed = reconfirmTemplate(reconfirmFacts(order({ invoice_fulfillment: { ...order().invoice_fulfillment, cracking: 'mixed', cracking_note: 'Cocktail cut on 60 of 100 coconuts; straw hole on the other 40.' } })), { ownerCell: CELL, picture: {} }).body;
-  assert.ok(mixed.includes('\nCracking: 60 cocktail cut, 40 straw hole pre-cracked.\n'));
+  assert.ok(mixed.includes('\n• Cracking: 60 cocktail cut, 40 straw hole pre-cracked.\n'));
   // The invoice reader says 'review' for a whole request; the ticked whole box then prints.
-  assert.ok(reconfirmTemplate(reconfirmFacts(order({ crack_type: 'whole', invoice_fulfillment: { ...order().invoice_fulfillment, cracking: 'review', cracking_note: 'Invoice requests whole or unopened coconuts.' } })), { ownerCell: CELL, picture: {} }).body.includes('\nCracking: whole, unopened.\n'));
+  assert.ok(reconfirmTemplate(reconfirmFacts(order({ crack_type: 'whole', invoice_fulfillment: { ...order().invoice_fulfillment, cracking: 'review', cracking_note: 'Invoice requests whole or unopened coconuts.' } })), { ownerCell: CELL, picture: {} }).body.includes('\n• Cracking: whole, unopened.\n'));
   // Branding (decided 2026-09-14): the picture alone decides the Count
   // line. A logo file on file (an approved preview or a png/jpeg logo_url,
-  // the same rule as reconfirmPicture) -> "custom branded coconuts" and the
-  // picture rides along; no picture -> plain "coconuts", no picture, no
-  // logo sentence, no branding line, whatever logo_received says (it is a
-  // boolean column and no value means plain coconuts). The owner sees
-  // "no image" on the row instead; the customer is never asked for a logo.
-  const plainLines = '\nDrop off: Pridwin Hotel, 81 Shore Rd, Shelter Island, NY 11964\nCount: 100 coconuts\nCracking: straw hole pre-cracked, ready for straws\nOn site contact: Ana, (631) 555-0100\n';
+  // the same rule as reconfirmPicture) -> "custom branded coconuts (picture
+  // below)" and the picture rides along; no picture -> plain "coconuts", no
+  // picture, no logo sentence, no branding line, whatever logo_received
+  // says (it is a boolean column and no value means plain coconuts). The
+  // owner sees "no image" on the row instead; the customer is never asked
+  // for a logo.
+  const plainLines = '\n• Drop off: Pridwin Hotel, 81 Shore Rd, Shelter Island, NY 11964\n• Count: 100 coconuts\n• Cracking: straw hole pre-cracked, ready for straws\n• On site contact: Ana, (631) 555-0100\n';
   const noPicture = (extra) => reconfirmTemplate(reconfirmFacts(order({ logo_url: null, logo_received: false, ...extra })), { ownerCell: CELL, picture: null }).body;
   const plain = noPicture({});
   for (const body of [plain, noPicture({ logo_received: null }), noPicture({ logo_received: true }), noPicture({ logo_url: 'https://files.example.invalid/logo.ai' }), noPicture({ logo_received: 'unbranded' }), noPicture({ logo_asset: { status: 'needs_review', files: [] } })]) {
     assert.ok(body.includes(plainLines), body);
-    assert.ok(!/logo|branding|branded|stamp/i.test(body), 'no logo sentence, no branding line, no ask');
+    assert.ok(!/logo|branding|branded|stamp|picture/i.test(body), 'no logo sentence, no branding line, no picture word, no ask');
   }
   // With the picture: the branded count, and still no logo sentence.
   const branded = reconfirmTemplate(reconfirmFacts(order({ logo_received: false })), { ownerCell: CELL, picture: reconfirmPicture(order()) }).body;
-  assert.ok(branded.includes('\nCount: 100 custom branded coconuts\nCracking: straw hole pre-cracked, ready for straws\nOn site contact: Ana, (631) 555-0100\n'));
+  assert.ok(branded.includes('\n• Count: 100 custom branded coconuts (picture below)\n• Cracking: straw hole pre-cracked, ready for straws\n• On site contact: Ana, (631) 555-0100\n'));
   assert.ok(!/logo|branding|stamp/i.test(branded));
   // The draft's own picture choice drives it end to end: an approved
   // preview or a png/jpeg logo_url brands, a .ai logo or nothing does not.
   const approved = { status: 'approved', files: [{ file_name: 'front.png', preview_path: 'o/front-preview.png', usage: 'Coconut front' }] };
-  const countLine = (o) => reconfirmTemplate(reconfirmFacts(o), { ownerCell: CELL, picture: reconfirmPicture(o) }).body.match(/\nCount: [^\n]+\n/)[0];
-  assert.equal(countLine(order()), '\nCount: 100 custom branded coconuts\n');
-  assert.equal(countLine(order({ logo_url: null, logo_received: false, logo_asset: approved })), '\nCount: 100 custom branded coconuts\n');
-  assert.equal(countLine(order({ logo_url: 'https://files.example.invalid/logos/rivera.JPG?x=1' })), '\nCount: 100 custom branded coconuts\n');
-  assert.equal(countLine(order({ logo_url: 'https://files.example.invalid/logos/rivera.ai', logo_received: true })), '\nCount: 100 coconuts\n');
-  assert.equal(countLine(order({ logo_url: null, logo_received: true })), '\nCount: 100 coconuts\n');
-  assert.equal(countLine(order({ logo_url: null, logo_asset: { ...approved, status: 'needs_review' } })), '\nCount: 100 coconuts\n');
+  const countLine = (o) => reconfirmTemplate(reconfirmFacts(o), { ownerCell: CELL, picture: reconfirmPicture(o) }).body.match(/\n• Count: [^\n]+\n/)[0];
+  assert.equal(countLine(order()), '\n• Count: 100 custom branded coconuts (picture below)\n');
+  assert.equal(countLine(order({ logo_url: null, logo_received: false, logo_asset: approved })), '\n• Count: 100 custom branded coconuts (picture below)\n');
+  assert.equal(countLine(order({ logo_url: 'https://files.example.invalid/logos/rivera.JPG?x=1' })), '\n• Count: 100 custom branded coconuts (picture below)\n');
+  assert.equal(countLine(order({ logo_url: 'https://files.example.invalid/logos/rivera.ai', logo_received: true })), '\n• Count: 100 coconuts\n');
+  assert.equal(countLine(order({ logo_url: null, logo_received: true })), '\n• Count: 100 coconuts\n');
+  assert.equal(countLine(order({ logo_url: null, logo_asset: { ...approved, status: 'needs_review' } })), '\n• Count: 100 coconuts\n');
   // Paid in full: no invoice line. Deposit paid (balance still owed): the
   // link, whatever the received cents say. Balance open with no link: no
   // line either (never an amount).
   const paid = reconfirmTemplate(reconfirmFacts(order({ stage: 'paid_full', balance_cents: 50000 })), { ownerCell: CELL, picture: {} }).body;
-  assert.ok(!paid.includes('Your invoice') && paid.includes('matches it.\n\nThanks so much,'));
-  assert.ok(reconfirmTemplate(reconfirmFacts(order({ stage: 'deposit_paid', balance_cents: 0 })), { ownerCell: CELL, picture: {} }).body.includes('\nYour invoice is here if you need it: https://connect.intuit.com/pay/abc\n'));
-  assert.ok(reconfirmTemplate(reconfirmFacts(order({ stage: 'deposit_paid', balance_cents: null })), { ownerCell: CELL, picture: {} }).body.includes('Your invoice is here'));
-  assert.ok(!reconfirmTemplate(reconfirmFacts(order({ external_invoice_url: null })), { ownerCell: CELL, picture: {} }).body.includes('Your invoice'));
-  // Gate note rides on the Drop off line.
+  assert.ok(!/invoice/i.test(paid) && paid.includes('reach us by Wednesday, September 16.\n\nThanks so much,'));
+  assert.ok(reconfirmTemplate(reconfirmFacts(order({ stage: 'deposit_paid', balance_cents: 0 })), { ownerCell: CELL, picture: {} }).body.includes('\nInvoice, if you need it: https://connect.intuit.com/pay/abc\n\nThanks so much,'));
+  assert.ok(reconfirmTemplate(reconfirmFacts(order({ stage: 'deposit_paid', balance_cents: null })), { ownerCell: CELL, picture: {} }).body.includes('Invoice, if you need it'));
+  assert.ok(!/invoice/i.test(reconfirmTemplate(reconfirmFacts(order({ external_invoice_url: null })), { ownerCell: CELL, picture: {} }).body));
+  // Gate note rides on the Drop off bullet.
   const gate = reconfirmTemplate(reconfirmFacts(order({ delivery_request: { ...order().delivery_request, location: 'service entrance, gate code 4471' } })), { ownerCell: CELL, picture: {} }).body;
-  assert.ok(gate.includes('\nDrop off: Pridwin Hotel, 81 Shore Rd, Shelter Island, NY 11964, service entrance, gate code 4471\n'));
-  // Same customer, two orders on one day, and the resend subject.
-  assert.equal(reconfirmTemplate(reconfirmFacts(order()), { venueWord: 'Pridwin' }).subject, 'Your coconuts for Saturday, September 19 at Pridwin: quick reconfirm');
+  assert.ok(gate.includes('\n• Drop off: Pridwin Hotel, 81 Shore Rd, Shelter Island, NY 11964, service entrance, gate code 4471\n'));
+  // Same customer, two orders on one day, and the resend subject (an
+  // updated draft keeps its own subject).
+  assert.equal(reconfirmTemplate(reconfirmFacts(order()), { venueWord: 'Pridwin' }).subject, 'Your coconuts for Saturday, September 19 at Pridwin: quick check');
   assert.equal(reconfirmTemplate(reconfirmFacts(order()), { updated: true }).subject, 'Updated details for Saturday, September 19');
-  // A late draft on minus 3 or minus 2 says "reply today", never a date in the past.
-  const late = reconfirmTemplate(reconfirmFacts(order()), { ownerCell: CELL, picture: {}, today: '2026-09-17', deliveryDay: '2026-09-19' }).body;
-  assert.ok(late.includes('who meets us), reply today and I will update it.'));
-  // Never money, never the garage, never crew names or internal notes.
-  for (const body of [full.body, noTime, both, plain, late]) {
-    assert.ok(!/\$|\bgarage\b|Colonia|Auto-synced|Hashim|Jayden/i.test(body));
+  // The reply-by flip: from delivery day minus 3 (the reply-by day itself)
+  // on, "by Wednesday, September 16" reads "today" in BOTH places it
+  // appears; the day before, the date still prints; without today and
+  // deliveryDay the date prints too.
+  const late = reconfirmTemplate(reconfirmFacts(order()), { ...OPTS, today: '2026-09-17' }).body;
+  assert.equal(late, FULL_BODY.split('by Wednesday, September 16').join('today'));
+  assert.ok(late.includes('or reply with any change today.\n') && late.includes('so changes need to reach us today.\n') && !late.includes('September 16'));
+  assert.ok(reconfirmTemplate(reconfirmFacts(order()), { ...OPTS, today: '2026-09-16' }).body.includes('reach us today.'));
+  assert.ok(reconfirmTemplate(reconfirmFacts(order()), { ...OPTS, today: '2026-09-15' }).body.includes('reach us by Wednesday, September 16.'));
+  assert.ok(reconfirmTemplate(reconfirmFacts(order()), { ownerCell: CELL, picture: {} }).body.includes('reach us by Wednesday, September 16.'));
+  // Case B late: the second paragraph flips, the ask stays as it is.
+  const bothLate = reconfirmTemplate(reconfirmFacts(order({ delivery_request: null })), { ...OPTS, today: '2026-09-17' }).body;
+  assert.ok(bothLate.startsWith('Hi Jamie,\n\nTwo things we still need: what time our driver should arrive and who they should call on site. Reply with those and we are set.\n'));
+  assert.ok(bothLate.includes('so changes need to reach us today.\n') && !bothLate.includes('September 16'));
+  // Never money, never an email address, never the garage, never crew
+  // names or internal notes, never a dash.
+  for (const body of [full.body, noPic.body, noCell, noTime, noContact, both, plain, late, bothLate]) {
+    assert.ok(!/\$|@|\bgarage\b|Colonia|Auto-synced|Hashim|Jayden/i.test(body));
     assert.ok(!/[–—]/.test(body), 'no dashes');
   }
-  pass('template: the full email byte for byte and every variant (no cell, no time, no contact, both, mixed and whole cracking, the picture alone decides branded versus plain coconuts and there is never a logo sentence, balance, gate note, venue subject, resend subject, reply today)');
+  pass('template: case A byte for byte with and without the picture, no cell, the bullet shape the droplet renders (the brand-and-box paragraph feeds the picture hook, under the facts), case B time only, contact only and both, no run-of-show line, mixed and whole cracking, the picture alone decides branded versus plain coconuts and there is never a logo sentence, balance, gate note, venue subject, resend subject, the reply-today flip in both places');
 }
 
 // ── 7. Push words, stable ids, change notes, quoted text ────────────
@@ -619,7 +718,7 @@ const FULL_BODY = [
   const sig = '\n\nBest,\nJamie Rivera\nEvents Director\nThe Pridwin';
   const quote = '\n\nOn Tue, Sep 15, 2026 at 10:00 AM Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n> Delivery: Saturday, September 19, arriving 3:30 PM\n> Count: 100 custom branded coconuts';
   const NAME = 'Jamie Rivera';
-  const c = (raw, extra = {}) => classifyReconfirmationReply({ subject: 'Re: Your coconuts for Saturday, September 19: quick reconfirm', from_addr: 'jamie@example.invalid', raw_text: raw, client_name: NAME, ...extra });
+  const c = (raw, extra = {}) => classifyReconfirmationReply({ subject: 'Re: Your coconuts for Saturday, September 19: quick check', from_addr: 'jamie@example.invalid', raw_text: raw, client_name: NAME, ...extra });
   // A phone-appended footer ('Sent from my iPhone', 'Get Outlook for iOS',
   // a carrier's '5G Device' line) is the phone's, never the customer's
   // words: it is dropped before the digit test, so the confirmation holds.
@@ -684,7 +783,7 @@ const FULL_BODY = [
   assert.equal(c('I am out of the office until Monday with limited access to email.').kind, 'auto_reply');
   assert.equal(c('Thank you for your email. I am currently out of the office until Monday.').kind, 'auto_reply');
   assert.equal(c("I'll be away from my desk until Thursday.\n\nFor urgent matters call the front desk.").kind, 'auto_reply');
-  assert.equal(c('Confirmed', { subject: 'Automatic reply: Your coconuts for Saturday, September 19: quick reconfirm' }).kind, 'auto_reply');
+  assert.equal(c('Confirmed', { subject: 'Automatic reply: Your coconuts for Saturday, September 19: quick check' }).kind, 'auto_reply');
   // A human reply that mentions the office deeper in the body is content: the site contact it gives must reach the owner.
   assert.equal(c('Hi Sidd, I will be out of the office that day, so please call my assistant Maria on arrival instead. Thanks' + quote).kind, 'changed');
   assert.equal(c('Looks good. Note I am out of the office Friday, Ana will meet you.' + quote).kind, 'changed');
@@ -695,7 +794,7 @@ const FULL_BODY = [
   // announcement.
   for (const t of ['I will be out of the office that day, please call Maria at the gate.', "I'll be out of the office on Saturday, my colleague Dana will receive the delivery.", 'We are out of the office Saturday so please leave the boxes with security.']) assert.equal(c(t + quote).kind, 'changed', t);
   for (const t of ['I am out of the office.', 'I am out of the office', "I'm out of the office right now. I'll get back to you as soon as I can.", 'I am out of the office and will have limited access to email.', 'I am out of the office from September 14 through September 21.', 'I will be out of the office beginning Friday, returning Monday.']) assert.equal(c(t).kind, 'auto_reply', t);
-  assert.equal(c('Delivery has failed to these recipients', { from_addr: 'postmaster@example.invalid', subject: 'Undeliverable: Your coconuts for Saturday, September 19: quick reconfirm' }).kind, 'bounced');
+  assert.equal(c('Delivery has failed to these recipients', { from_addr: 'postmaster@example.invalid', subject: 'Undeliverable: Your coconuts for Saturday, September 19: quick check' }).kind, 'bounced');
   assert.equal(c('x', { from_addr: 'Mail Delivery System <MAILER-DAEMON@example.invalid>', subject: 'Re: whatever' }).kind, 'bounced');
   assert.equal(c('Confirmed').stripped, 'Confirmed');
   pass('reply classifier: every confirmation phrase (with greeting, a name-only signature and our quoted email), digits, questions, change words and any non-name word (a title line or an answer under the name included) refuse the list, attachments are content, time, changed, auto reply by subject or opening line only, bounce');
@@ -725,7 +824,7 @@ const FULL_BODY = [
   assert.equal(row.status, 'ready'); assert.deepEqual(row.hold_reasons, []); assert.equal(row.mode, 'auto');
   assert.equal(row.order_id, ORDER_ID); assert.equal(row.delivery_day, '2026-09-19');
   assert.equal(row.send_after, '2026-09-15T14:00:00.000Z');
-  assert.equal(row.subject, 'Your coconuts for Saturday, September 19: quick reconfirm');
+  assert.equal(row.subject, FULL_SUBJECT);
   assert.equal(row.body, FULL_BODY);
   assert.deepEqual(row.recipients, ['jamie@example.invalid']);
   assert.deepEqual(row.picture, { source: 'logo_url', bucket: null, path: 'https://files.example.invalid/logos/rivera.png', content_type: 'image/png' });
@@ -774,14 +873,14 @@ const FULL_BODY = [
   // A null balance stays null in the stored facts (never 0).
   const nullBalance = await scanAt(MON_0805, ENV_AUTO, { orders: [order({ balance_cents: null })] });
   assert.equal(nullBalance.counts.drafted, 1); assert.equal(nullBalance.h.all()[0].facts.source.balance_cents, null);
-  assert.ok(nullBalance.h.all()[0].body.includes('Your invoice is here'));
+  assert.ok(nullBalance.h.all()[0].body.includes('Invoice, if you need it'));
   // Minus 1 and the day itself: the row is created ready with no
   // send_after (Send now only) and the preview says so; auto mode never
   // releases it.
   const minus1 = await scanAt('2026-09-18T15:05:00Z', ENV_AUTO, { orders: [order()] });
   assert.equal(minus1.counts.drafted, 1); assert.equal(minus1.h.all()[0].status, 'ready'); assert.equal(minus1.h.all()[0].send_after, null);
   assert.equal(minus1.h.pushes()[0].payload.aps.alert.body, 'Reconfirmation ready: Rivera / Pridwin, needs your Send now.');
-  assert.ok(minus1.h.all()[0].body.includes('reply today and I will update it.'));
+  assert.ok(minus1.h.all()[0].body.includes('or reply with any change today.') && minus1.h.all()[0].body.includes('so changes need to reach us today.'));
   const minus1Again = await scanAt('2026-09-18T16:05:00Z', ENV_AUTO, { orders: [order()], rows: minus1.h.all() });
   assert.equal(minus1Again.counts.released, 0); assert.equal(minus1Again.h.all()[0].status, 'ready'); assert.equal(minus1Again.h.pushes().length, 0);
   const dayOf = await scanAt('2026-09-19T15:05:00Z', ENV_AUTO, { orders: [order()] });
@@ -1026,7 +1125,7 @@ const FULL_BODY = [
   assert.equal(before.counts.rewritten, 1);
   const r = before.h.all()[0];
   assert.equal(r.status, 'ready'); assert.equal(r.send_after, '2026-09-15T14:00:00.000Z');
-  assert.ok(r.body.includes('\nCount: 120 custom branded coconuts\n')); assert.equal(r.facts.source.coconuts_qty, 120);
+  assert.ok(r.body.includes('\n• Count: 120 custom branded coconuts (picture below)\n')); assert.equal(r.facts.source.coconuts_qty, 120);
   assert.equal(before.h.pushes().length, 1);
   assert.equal(before.h.pushes()[0].payload.aps.alert.body, 'Reconfirmation ready: Rivera / Pridwin, sends Tue 10:00a unless you hold it.');
   assert.equal(before.h.pushes()[0].id, await reconfirmQueueId('previewed', r.id, r.updated_at));
@@ -1041,7 +1140,7 @@ const FULL_BODY = [
   // The customer pays the balance before the send: the row is rewritten
   // and the invoice line drops out of the body (never an amount either way).
   const paidBefore = await scanAt('2026-09-14T15:05:00Z', ENV_AUTO, { orders: [order({ stage: 'paid_full', balance_cents: 50000 })], rows: drafted });
-  assert.equal(paidBefore.counts.rewritten, 1); assert.ok(!paidBefore.h.all()[0].body.includes('Your invoice'));
+  assert.equal(paidBefore.counts.rewritten, 1); assert.ok(!/invoice/i.test(paidBefore.h.all()[0].body));
   assert.equal(paidBefore.h.pushes().length, 1, 'the body changed, so the owner sees a fresh preview');
   // A received installment landing before the send (balance_cents moves,
   // the stage stays deposit_paid): the facts are rewritten so the
@@ -1061,6 +1160,45 @@ const FULL_BODY = [
   const newAddress = await scanAt('2026-09-14T15:05:00Z', ENV_AUTO, { orders: [order({ client_email: 'jamie@example.invalid, ops@example.invalid' })], rows: drafted });
   assert.equal(newAddress.counts.rewritten, 1); assert.equal(newAddress.h.pushes().length, 1);
   assert.deepEqual(newAddress.h.all()[0].recipients, ['jamie@example.invalid', 'ops@example.invalid']);
+  // A template change shipped in the worker reaches the drafts that
+  // already exist: a ready row still carrying the wording from before
+  // 2026-09-18 (same facts, same day, so no diff) is rewritten ONCE to the
+  // new text, schedule kept, with a fresh preview (the draft the owner saw
+  // is gone). The next tick compares equal and writes nothing, and so does
+  // the one after: the template is deterministic for fixed facts and day,
+  // so the stored text and the template can never ping-pong.
+  const oldWording = { ...drafted[0], subject: OLD_SUBJECT, body: OLD_BODY };
+  const reworded = await scanAt('2026-09-14T15:05:00Z', ENV_AUTO, { orders: [order()], rows: [oldWording] });
+  assert.equal(reworded.counts.rewritten, 1);
+  assert.equal(reworded.h.all()[0].subject, FULL_SUBJECT); assert.equal(reworded.h.all()[0].body, FULL_BODY);
+  assert.equal(reworded.h.all()[0].status, 'ready'); assert.equal(reworded.h.all()[0].send_after, '2026-09-15T14:00:00.000Z', 'the schedule is kept');
+  assert.equal(reworded.h.pushes().length, 1); assert.equal(reworded.h.pushes()[0].payload.body.kind, 'reconfirm_previewed');
+  assert.equal(reworded.h.all()[0].previewed_at, '2026-09-14T15:05:00.000Z');
+  const rewordedQuiet = await scanAt('2026-09-14T16:05:00Z', ENV_AUTO, { orders: [order()], rows: reworded.h.all() });
+  assert.equal(rewordedQuiet.counts.rewritten, 0); assert.equal(rewordedQuiet.h.calls.filter((c) => c.method === 'PATCH').length, 0); assert.equal(rewordedQuiet.h.pushes().length, 0);
+  const rewordedStill = await scanAt('2026-09-14T17:05:00Z', ENV_AUTO, { orders: [order()], rows: rewordedQuiet.h.all() });
+  assert.equal(rewordedStill.counts.rewritten, 0); assert.equal(rewordedStill.h.pushes().length, 0);
+  // The subject alone moving is enough (the old suffix on the new body).
+  const subjectOnly = await scanAt('2026-09-14T15:05:00Z', ENV_AUTO, { orders: [order()], rows: [{ ...drafted[0], subject: OLD_SUBJECT }] });
+  assert.equal(subjectOnly.counts.rewritten, 1); assert.equal(subjectOnly.h.all()[0].subject, FULL_SUBJECT); assert.equal(subjectOnly.h.pushes().length, 1);
+  // A held row with the old wording is brought level too; it stays held
+  // with no clock, and the held push repeats under its stable id (a no-op
+  // on the queue, the reasons did not move).
+  const heldOld = { ...drafted[0], status: 'held', hold_reasons: ['count_missing'], send_after: null, subject: OLD_SUBJECT, body: OLD_BODY.replace('Count: 100 custom', 'Count:  custom'), facts: reconfirmFacts(order({ coconuts_qty: null })) };
+  const heldReworded = await scanAt('2026-09-14T15:05:00Z', ENV_AUTO, { orders: [order({ coconuts_qty: null })], rows: [heldOld] });
+  assert.equal(heldReworded.counts.rewritten, 1); assert.equal(heldReworded.h.all()[0].status, 'held'); assert.deepEqual(heldReworded.h.all()[0].hold_reasons, ['count_missing']);
+  assert.equal(heldReworded.h.all()[0].subject, FULL_SUBJECT); assert.ok(heldReworded.h.all()[0].body.includes('\n• Count:  custom branded coconuts (picture below)\n')); assert.equal(heldReworded.h.all()[0].send_after, null);
+  assert.equal(heldReworded.h.pushes().length, 1); assert.equal(heldReworded.h.pushes()[0].id, await reconfirmQueueId('held', heldOld.id, 'count_missing'));
+  const heldQuiet = await scanAt('2026-09-14T16:05:00Z', ENV_AUTO, { orders: [order({ coconuts_qty: null })], rows: heldReworded.h.all() });
+  assert.equal(heldQuiet.counts.rewritten, 0); assert.equal(heldQuiet.h.pushes().length, 0);
+  // The one dated word: on delivery day minus 3 the stored "by Wednesday,
+  // September 16" flips to "today" in both places (one rewrite, one fresh
+  // preview), and the next day compares equal again. Preview mode, so the
+  // row is not released on top of it.
+  const flip = await scanAt('2026-09-16T15:05:00Z', ENV_PREVIEW, { orders: [order()], rows: drafted });
+  assert.equal(flip.counts.rewritten, 1); assert.equal(flip.h.all()[0].body, FULL_BODY.split('by Wednesday, September 16').join('today')); assert.equal(flip.h.pushes().length, 1);
+  const flipQuiet = await scanAt('2026-09-17T15:05:00Z', ENV_PREVIEW, { orders: [order()], rows: flip.h.all() });
+  assert.equal(flipQuiet.counts.rewritten, 0); assert.equal(flipQuiet.h.calls.filter((c) => c.method === 'PATCH').length, 0); assert.equal(flipQuiet.h.pushes().length, 0);
   // After the send: status changed, a note, one push; the next tick is quiet; Done then stays quiet.
   const sent = { ...before.h.all()[0], status: 'sent', sent_at: '2026-09-15T14:06:00.000Z', sent_conversation_id: 'conv-1' };
   const after = await scanAt('2026-09-16T15:05:00Z', ENV_AUTO, { orders: [order({ coconuts_qty: 150, delivery_request: { ...order().delivery_request, window: '4:00 PM' } })], rows: [sent] });
@@ -1119,7 +1257,7 @@ const FULL_BODY = [
   assert.equal(afterResend.counts.drafted, 1);
   const moving = afterResend.h.all().find((x) => x.status === 'ready');
   assert.equal(moving.delivery_day, '2026-09-20'); assert.equal(moving.subject, 'Updated details for Sunday, September 20');
-  assert.ok(moving.body.includes('Your coconuts for Sunday, September 20 are locked in.'));
+  assert.ok(moving.body.includes('We are set for Sunday, September 20. Here is what we have on file.'));
   const afterDone = await scanAt('2026-09-16T16:05:00Z', ENV_AUTO, { orders: [moved], rows: [{ ...dateMove.h.all()[0], status: 'sent', decision: 'done' }] });
   assert.equal(afterDone.counts.drafted, 0); assert.equal(afterDone.h.all().length, 1);
   // Done keeps holding after the old day passes: Sat 19 moved to Thu 24,
@@ -1170,7 +1308,7 @@ const FULL_BODY = [
   // A bounced row the owner resends is not an update (the customer never
   // got the first one): the fresh draft keeps the first subject.
   const bouncedResend = await scanAt('2026-09-16T15:05:00Z', ENV_AUTO, { orders: [order()], rows: [{ ...sent, status: 'superseded', decision: 'resend', reply_kind: 'bounced' }] });
-  assert.equal(bouncedResend.h.all().find((x) => x.status === 'ready').subject, 'Your coconuts for Saturday, September 19: quick reconfirm');
+  assert.equal(bouncedResend.h.all().find((x) => x.status === 'ready').subject, FULL_SUBJECT);
   // A bounced row is retired when its order moves to another day (the
   // fresh draft for the new day still goes in, with the first-time
   // subject since the customer never got the first one) or when the order
@@ -1182,7 +1320,7 @@ const FULL_BODY = [
   assert.ok(bouncedMoved.h.calls.find((c) => c.method === 'PATCH' && c.body.status === 'expired').url.includes('status=eq.bounced'), 'guarded on bounced');
   assert.equal(bouncedMoved.counts.drafted, 1);
   const afterBounce = bouncedMoved.h.all().find((x) => x.status === 'ready');
-  assert.equal(afterBounce.delivery_day, '2026-09-20'); assert.equal(afterBounce.subject, 'Your coconuts for Sunday, September 20: quick reconfirm');
+  assert.equal(afterBounce.delivery_day, '2026-09-20'); assert.equal(afterBounce.subject, 'Your coconuts for Sunday, September 20: quick check');
   const bouncedCancelled = await scanAt('2026-09-16T15:05:00Z', ENV_AUTO, { orders: [order({ coconuts_qty: 120, stage: 'cancelled' })], rows: [bouncedRow] });
   assert.equal(bouncedCancelled.counts.expired, 1); assert.equal(bouncedCancelled.h.row(bouncedRow.id).status, 'expired'); assert.equal(bouncedCancelled.counts.drafted, 0);
   assert.equal(bouncedCancelled.h.pushes().length, 0);
@@ -1190,22 +1328,68 @@ const FULL_BODY = [
   assert.equal(bouncedKept.counts.expired, 0); assert.equal(bouncedKept.h.row(bouncedRow.id).status, 'bounced'); assert.equal(bouncedKept.counts.drafted, 0);
   assert.equal(bouncedKept.h.calls.filter((c) => c.method === 'PATCH').length, 0);
   // A ready row nobody sent expires the day after delivery (never a Send
-  // now for a past job); on the day itself it stays ready.
+  // now for a past job); on the day itself it stays ready, and it is left
+  // word for word: the "reply today" flip the template would make that
+  // day is a wording change alone, so nothing is written and no push goes.
   const readyOnDay = await scanAt('2026-09-19T15:05:00Z', ENV_AUTO, { orders: [order()], rows: drafted });
-  assert.equal(readyOnDay.h.all()[0].status, 'ready');
+  assert.equal(readyOnDay.h.all()[0].status, 'ready'); assert.equal(readyOnDay.h.all()[0].body, FULL_BODY);
+  assert.equal(readyOnDay.counts.rewritten, 0); assert.equal(readyOnDay.h.calls.filter((c) => c.method === 'PATCH').length, 0); assert.equal(readyOnDay.h.pushes().length, 0);
   const readyAfter = await scanAt('2026-09-20T15:05:00Z', ENV_AUTO, { orders: [order()], rows: drafted });
   assert.equal(readyAfter.h.all()[0].status, 'expired'); assert.equal(readyAfter.h.all()[0].error_detail, 'delivery day passed unsent'); assert.equal(readyAfter.counts.expired, 1);
+  // A wording change shipped in the worker never touches a row on its
+  // delivery day (Sidd, 2026-09-18, the day Alison's job was delivered:
+  // "skip it for Alison, do it for the next event"). Her row's likely
+  // state: ready, send_after null (a Phase A test copy handed it back),
+  // still carrying the old wording. Deployed that day, the scan leaves it
+  // word for word, writes nothing and pushes nothing; the day after it
+  // expires as above, still with no push. The same row for a job the
+  // NEXT day is brought level (a preview push follows), so the next event
+  // gets the approved wording.
+  const alison = { ...drafted[0], subject: OLD_SUBJECT, body: OLD_BODY, send_after: null };
+  const oldOnDay = await scanAt('2026-09-19T15:05:00Z', ENV_AUTO, { orders: [order()], rows: [alison] });
+  assert.equal(oldOnDay.counts.rewritten, 0); assert.equal(oldOnDay.h.calls.filter((c) => c.method === 'PATCH').length, 0); assert.equal(oldOnDay.h.pushes().length, 0);
+  assert.equal(oldOnDay.h.all()[0].status, 'ready'); assert.equal(oldOnDay.h.all()[0].subject, OLD_SUBJECT); assert.equal(oldOnDay.h.all()[0].body, OLD_BODY);
+  const oldOnDayPreview = await scanAt('2026-09-19T15:05:00Z', ENV_PREVIEW, { orders: [order()], rows: [alison] });
+  assert.equal(oldOnDayPreview.counts.rewritten, 0); assert.equal(oldOnDayPreview.h.pushes().length, 0); assert.equal(oldOnDayPreview.h.all()[0].body, OLD_BODY);
+  const oldAfterDay = await scanAt('2026-09-20T15:05:00Z', ENV_AUTO, { orders: [order()], rows: oldOnDay.h.all() });
+  assert.equal(oldAfterDay.h.all()[0].status, 'expired'); assert.equal(oldAfterDay.h.pushes().length, 0); assert.equal(oldAfterDay.counts.expired, 1);
+  const oldDayBefore = await scanAt('2026-09-18T15:05:00Z', ENV_AUTO, { orders: [order()], rows: [alison] });
+  assert.equal(oldDayBefore.counts.rewritten, 1); assert.equal(oldDayBefore.h.all()[0].subject, FULL_SUBJECT);
+  assert.equal(oldDayBefore.h.all()[0].body, FULL_BODY.split('by Wednesday, September 16').join('today'), 'the reply-by day has passed, so "today"');
+  assert.equal(oldDayBefore.h.all()[0].status, 'ready'); assert.equal(oldDayBefore.h.all()[0].send_after, null, 'no clock is invented for it');
+  assert.equal(oldDayBefore.h.pushes().length, 1); assert.equal(oldDayBefore.h.pushes()[0].payload.body.kind, 'reconfirm_previewed');
+  // A FACT that moves on the delivery day still rewrites the row (as it
+  // always did), and the new wording rides along with a fresh preview: the
+  // owner must see what changed.
+  const factOnDay = await scanAt('2026-09-19T15:05:00Z', ENV_AUTO, { orders: [order({ coconuts_qty: 120 })], rows: [alison] });
+  assert.equal(factOnDay.counts.rewritten, 1); assert.equal(factOnDay.h.all()[0].facts.source.coconuts_qty, 120);
+  assert.ok(factOnDay.h.all()[0].body.includes('\n• Count: 120 custom branded coconuts (picture below)\n')); assert.equal(factOnDay.h.all()[0].subject, FULL_SUBJECT);
+  assert.equal(factOnDay.h.pushes().length, 1); assert.equal(factOnDay.h.pushes()[0].payload.body.kind, 'reconfirm_previewed');
+  // A resend draft ("Updated details for ...") is re-judged every tick from
+  // the superseded rows in the week-back read: once the old sent row that
+  // made it an update ages out (a date moved by more than a week), the
+  // subject flips back to the first-time one with ONE rewrite and one
+  // preview, then stays. Rare, accepted as is (2026-09-18 review); this
+  // pins that it is a single flip, never a loop.
+  const updatedAlone = { ...drafted[0], subject: 'Updated details for Saturday, September 19' };
+  const flipBack = await scanAt('2026-09-14T15:05:00Z', ENV_AUTO, { orders: [order()], rows: [updatedAlone] });
+  assert.equal(flipBack.counts.rewritten, 1); assert.equal(flipBack.h.all()[0].subject, FULL_SUBJECT); assert.equal(flipBack.h.pushes().length, 1);
+  const flipBackQuiet = await scanAt('2026-09-14T16:05:00Z', ENV_AUTO, { orders: [order()], rows: flipBack.h.all() });
+  assert.equal(flipBackQuiet.counts.rewritten, 0); assert.equal(flipBackQuiet.h.pushes().length, 0);
+  // With the superseded row still in the read the subject holds.
+  const stillUpdated = await scanAt('2026-09-14T15:05:00Z', ENV_AUTO, { orders: [order()], rows: [updatedAlone, { ...drafted[0], id: 77, status: 'superseded', decision: 'resend', sent_at: '2026-09-10T14:00:00.000Z' }] });
+  assert.equal(stillUpdated.counts.rewritten, 0); assert.equal(stillUpdated.h.row(updatedAlone.id).subject, 'Updated details for Saturday, September 19');
   // Two orders, one customer, one day: each subject carries its venue word.
   const twins = await scanAt(MON_0805, ENV_AUTO, { orders: [order(), order({ id: ORDER_2, venue: 'Maidstone Arms', delivery_notes: 'Maidstone Arms, East Hampton, NY', invoice_fulfillment: { ...order().invoice_fulfillment, address: 'Maidstone Arms, 207 Main St, East Hampton, NY 11937' } })] });
-  assert.deepEqual(twins.h.all().map((x) => x.subject).sort(), ['Your coconuts for Saturday, September 19 at Maidstone: quick reconfirm', 'Your coconuts for Saturday, September 19 at Pridwin: quick reconfirm']);
-  pass('change detection: a ready row is rewritten with a fresh preview only when the owner-visible text moved (a balance alone is quiet), a sent or confirmed row becomes changed with a note and one push, a payment landing is quiet, Done stays quiet and keeps holding a week past a moved date (rows read from a week back), Resend drafts Updated details (a moved date too, never before the owner decides; a bounce keeps the first subject), a bounced row retires when the order moves or cancels, a ready or held row expires after the day, twins get venue subjects');
+  assert.deepEqual(twins.h.all().map((x) => x.subject).sort(), ['Your coconuts for Saturday, September 19 at Maidstone: quick check', 'Your coconuts for Saturday, September 19 at Pridwin: quick check']);
+  pass('change detection: a ready row is rewritten with a fresh preview only when the owner-visible text moved (a balance alone is quiet), a template change rewrites an old-wording ready or held row once and never again (the reply-today word flips once on minus 3), a sent or confirmed row becomes changed with a note and one push, a payment landing is quiet, Done stays quiet and keeps holding a week past a moved date (rows read from a week back), Resend drafts Updated details (a moved date too, never before the owner decides; a bounce keeps the first subject), a bounced row retires when the order moves or cancels, a ready or held row expires after the day, twins get venue subjects');
 }
 
 // ── 14. The reply step: each kind against a sent row ────────────────
 {
   const sentRow = (id, orderId, extra = {}) => ({ id, order_id: orderId, delivery_day: '2026-09-19', status: 'sent', recipients: ['jamie@example.invalid'], sent_conversation_id: 'conv-' + id, sent_at: '2026-09-15T14:06:00Z', subject: 's', body: 'b', facts: reconfirmFacts(order({ id: orderId })), ...extra });
   const quote = '\n\nOn Tue, Sep 15, 2026 at 10:00 AM Sidd Saxena <sidd@hamptonscoconuts.com> wrote:\n> Delivery: Saturday, September 19, arriving 3:30 PM';
-  const intake = (id, extra = {}) => ({ id, order_id: ORDER_ID, from_addr: 'Jamie Rivera <jamie@example.invalid>', subject: 'Re: Your coconuts for Saturday, September 19: quick reconfirm', raw_text: 'Confirmed, thanks!' + quote, created_at: '2026-09-15T15:00:00Z', ...extra });
+  const intake = (id, extra = {}) => ({ id, order_id: ORDER_ID, from_addr: 'Jamie Rivera <jamie@example.invalid>', subject: 'Re: Your coconuts for Saturday, September 19: quick check', raw_text: 'Confirmed, thanks!' + quote, created_at: '2026-09-15T15:00:00Z', ...extra });
   const NOW = '2026-09-15T15:05:00Z';
   // Confirmed: row stamped, intake dismissed, one push, no card material.
   const conf = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(10)] });
@@ -1230,9 +1414,9 @@ const FULL_BODY = [
   const chg2 = await replyScanAt('2026-09-15T15:10:00Z', ENV_PREVIEW, { orders: [order()], rows: [chg.h.row(1)], intakes: [intake(12, { raw_text: 'Please make it 120 coconuts' })] });
   assert.equal(chg2.result.counts.seen, 0); assert.deepEqual([...chg2.result.changedIntakeIds], [12]);
   // Auto reply: dismissed quietly. Bounce: status bounced, a push, dismissed (matched on the conversation id, no order link needed).
-  const auto = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(13, { subject: 'Automatic reply: Your coconuts for Saturday, September 19: quick reconfirm', raw_text: 'I am out of the office.' })] });
+  const auto = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(13, { subject: 'Automatic reply: Your coconuts for Saturday, September 19: quick check', raw_text: 'I am out of the office.' })] });
   assert.equal(auto.result.counts.autoReply, 1); assert.equal(auto.h.row(1).status, 'sent'); assert.equal(auto.h.row(1).reply_kind, 'auto_reply'); assert.equal(auto.h.intakes.get(13).status, 'dismissed'); assert.equal(auto.h.pushes().length, 0);
-  const bounce = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(14, { order_id: null, conversation_id: 'conv-1', from_addr: 'postmaster@example.invalid', subject: 'Undeliverable: Your coconuts for Saturday, September 19: quick reconfirm', raw_text: 'Delivery has failed.' })] });
+  const bounce = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(14, { order_id: null, conversation_id: 'conv-1', from_addr: 'postmaster@example.invalid', subject: 'Undeliverable: Your coconuts for Saturday, September 19: quick check', raw_text: 'Delivery has failed.' })] });
   assert.equal(bounce.result.counts.bounced, 1); assert.equal(bounce.h.row(1).status, 'bounced'); assert.equal(bounce.h.intakes.get(14).status, 'dismissed');
   assert.equal(bounce.h.pushes()[0].payload.aps.alert.body, 'Reconfirmation email bounced: Rivera / Pridwin. Check the customer email on the invoice.');
   // No match: another sender on the same order, or a reply about a past delivery day, is left alone.
@@ -1286,7 +1470,7 @@ const FULL_BODY = [
   // Rows Jarvis already filed as 'ignored' (a postmaster is on no invoice)
   // are still read for bounces and auto replies; any other ignored mail is
   // left as Jarvis filed it, never confirmed from there.
-  const ignoredBounce = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(23, { status: 'ignored', order_id: null, conversation_id: 'conv-1', from_addr: 'postmaster@example.invalid', subject: 'Undeliverable: Your coconuts for Saturday, September 19: quick reconfirm', raw_text: 'Delivery has failed.' })] });
+  const ignoredBounce = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(23, { status: 'ignored', order_id: null, conversation_id: 'conv-1', from_addr: 'postmaster@example.invalid', subject: 'Undeliverable: Your coconuts for Saturday, September 19: quick check', raw_text: 'Delivery has failed.' })] });
   assert.equal(ignoredBounce.result.counts.bounced, 1); assert.equal(ignoredBounce.h.row(1).status, 'bounced'); assert.equal(ignoredBounce.h.row(1).reply_intake_id, 23);
   assert.equal(ignoredBounce.h.intakes.get(23).status, 'ignored', 'the ignored row is left as filed');
   assert.equal(ignoredBounce.h.pushes()[0].payload.aps.alert.body, 'Reconfirmation email bounced: Rivera / Pridwin. Check the customer email on the invoice.');

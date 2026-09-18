@@ -1460,18 +1460,26 @@ export function reconfirmChangeNote(diff) {
   return notes.length ? notes.slice(0, 3).join(', ') : null;
 }
 
-// ── the template (plan section 2, byte for byte) ────────────────────
+// ── the template (the wording Sidd approved on 2026-09-18) ──────────
 // opts: ownerCell (the OWNER_CELL secret, may be blank), venueWord (same
 // customer, two orders on one day), updated (a resend after a change),
-// picture (null or the picture object; the droplet embeds it above the
-// Delivery line, the text never mentions it). The picture also decides
-// the Count line (decided 2026-09-14): a logo file on file (an approved
-// preview or a png/jpeg logo) means "custom branded coconuts"; without
-// one the line says plain "coconuts", the email carries no picture and
-// no logo sentence, and the OWNER sees "no image" on the row in the app
-// instead. logo_received is a boolean column and no value says "plain
-// coconuts", so the email never asks the customer for a logo and never
-// claims plain coconuts.
+// picture (null or the picture object), today and deliveryDay (for the
+// "reply by" flip below). Plain text: this is what the app preview shows.
+// The droplet turns it into HTML: each bullet line starts with "• " and
+// reads "Label: value", the sender bolds the label up to the first colon,
+// and it puts the picture UNDER the facts, right after the paragraph that
+// starts "We brand and box" (above the invoice line and the sign-off), so
+// that paragraph must keep its opening words and the Count bullet's
+// "(picture below)" stays true. The picture also decides the Count line
+// (decided 2026-09-14): a logo file on file (an approved preview or a
+// png/jpeg logo) means "custom branded coconuts (picture below)"; without
+// one the line says plain "coconuts", the email carries no picture and no
+// logo sentence, and the OWNER sees "no image" on the row in the app
+// instead (when the download fails at send time the droplet drops the
+// "(picture below)" note from the HTML on its own).
+// logo_received is a boolean column and no value says "plain coconuts",
+// so the email never asks the customer for a logo and never claims plain
+// coconuts. Never an amount, never an email address in the body.
 export function reconfirmTemplate(facts, opts = {}) {
   const f = facts || { source: {}, derived: {} };
   const d = f.derived, s = f.source;
@@ -1479,59 +1487,52 @@ export function reconfirmTemplate(facts, opts = {}) {
   const venueWord = factText(opts.venueWord);
   const subject = opts.updated
     ? `Updated details for ${day}`
-    : `Your coconuts for ${day}${venueWord ? ' at ' + venueWord : ''}: quick reconfirm`;
+    : `Your coconuts for ${day}${venueWord ? ' at ' + venueWord : ''}: quick check`;
   const cell = factText(opts.ownerCell);
   const askTime = !d.window_words;
   const askContact = !d.contact_words;
   // Branded means a picture goes with the email; nothing else counts.
   const branded = !!(opts.picture && typeof opts.picture === 'object');
   const gate = s.delivery_request && s.delivery_request.location ? s.delivery_request.location : null;
-  const lines = [];
-  lines.push(`Hi ${d.first_name},`);
-  lines.push('');
-  lines.push(`Your coconuts for ${day} are locked in. One quick read through before we brand them.`);
-  lines.push('');
-  if (askTime && askContact) {
-    lines.push(`Delivery: ${day}. What exact time should our driver arrive, and who should they call on arrival? A time, a name and a cell is perfect.`);
-  } else if (askTime) {
-    lines.push(`Delivery: ${day}. What exact time should our driver arrive? One line like 'please arrive at ...' with the time is perfect.`);
-  } else {
-    lines.push(`Delivery: ${day}, arriving ${d.window_words}`);
-  }
-  lines.push(`Drop off: ${d.address || ''}${gate ? ', ' + gate : ''}`);
-  // "custom branded" only when the picture goes with the email; without a
-  // logo file the line is plain and no logo sentence follows (the owner
-  // gets the missing-logo alarm on the row, the customer is never asked).
-  lines.push(`Count: ${d.count || ''} ${branded ? 'custom branded coconuts' : 'coconuts'}`);
-  lines.push(`Cracking: ${d.cracking_words || ''}`);
-  if (!askContact) lines.push(`On site contact: ${d.contact_words}`);
-  else if (!askTime) lines.push('On site contact: who should our driver call when we arrive? A name and cell is perfect.');
-  lines.push(`Your contact on our side: Sidd, ${cell ? cell + ', ' : ''}sidd@hamptonscoconuts.com`);
-  lines.push('');
   // Reply-by is delivery day minus 3. When a late draft has already passed
-  // that day, "reply today" replaces a date in the past.
+  // that day, "today" replaces a date in the past everywhere it appears.
   const replyByDay = addDays(opts.deliveryDay || '', -3);
   const replyByGap = opts.today && replyByDay ? daysBetween(opts.today, replyByDay) : null;
   const replyBy = replyByGap != null && replyByGap <= 0 ? 'today' : `by ${d.reply_by_words}`;
-  lines.push(`We brand and box everything on ${d.prep_day_words}, the day before. If anything above needs to change (count, time, address, or who meets us), reply ${replyBy} and I will update it.`);
+  const lines = [];
+  lines.push(`Hi ${d.first_name},`);
   lines.push('');
-  lines.push(askTime && askContact
-    ? 'If everything else looks right, reply with that and we are set.'
-    : 'If it all looks right, just reply "confirmed" and we are set.');
+  // Case A (everything known) asks for a "confirmed"; case B (the arrival
+  // time and/or the site contact missing) asks for the missing piece
+  // instead, and the matching bullet below says "please tell us".
+  if (askTime && askContact) lines.push('Two things we still need: what time our driver should arrive and who they should call on site. Reply with those and we are set.');
+  else if (askTime) lines.push('One thing we still need: what time our driver should arrive. Reply with that and we are set.');
+  else if (askContact) lines.push('One thing we still need: who our driver should call on site. Reply with a name and cell and we are set.');
+  else lines.push(`We are set for ${day}. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change ${replyBy}.`);
   lines.push('');
-  lines.push('If there is a run of show or vendor timeline for the day, send it over and I will make sure our arrival matches it.');
+  lines.push(`• Delivery: ${day}, ${askTime ? 'arrival time: please tell us' : 'arriving ' + d.window_words}`);
+  lines.push(`• Drop off: ${d.address || ''}${gate ? ', ' + gate : ''}`);
+  // "custom branded" only when the picture goes with the email; without a
+  // logo file the line is plain and no logo sentence follows (the owner
+  // gets the missing-logo alarm on the row, the customer is never asked).
+  lines.push(`• Count: ${d.count || ''} ${branded ? 'custom branded coconuts (picture below)' : 'coconuts'}`);
+  lines.push(`• Cracking: ${d.cracking_words || ''}`);
+  lines.push(`• On site contact: ${askContact ? 'please send a name and cell' : d.contact_words}`);
+  // The owner's cell only; never an email address in this bullet.
+  lines.push(`• Your contact: Sidd${cell ? ', ' + cell : ''}`);
+  lines.push('');
+  lines.push(`We brand and box on ${d.prep_day_words}, the day before, so changes need to reach us ${replyBy}.`);
   lines.push('');
   if (d.balance_open && s.external_invoice_url) {
     // Never an amount. The invoice number is not stored on the order as a
     // column (external_invoice_id is QuickBooks' internal id), so the line
     // names no number.
-    lines.push(`Your invoice is here if you need it: ${s.external_invoice_url}`);
+    lines.push(`Invoice, if you need it: ${s.external_invoice_url}`);
     lines.push('');
   }
   lines.push('Thanks so much,');
   lines.push('Sidd');
   lines.push('Hamptons Coconuts');
-  if (cell) lines.push(cell);
   return { subject: subject.slice(0, 200), body: lines.join('\n').slice(0, 6000) };
 }
 
@@ -2021,6 +2022,21 @@ export async function runReconfirmationScan(env) {
           const reasonsNow = ownerHeld ? ['owner_hold', ...draft.holds] : draft.holds;
           const reasonsChanged = JSON.stringify(reasonsNow) !== JSON.stringify(row.hold_reasons || []);
           const testToChanged = factText(row.test_to) !== testTo;
+          // The text the template makes now against the text on the row: a
+          // template change shipped in the worker (new wording) reaches the
+          // drafts that already exist this way. It cannot loop: for the
+          // same facts and the same day the template makes the same text
+          // every tick, so one rewrite brings the row level and the next
+          // tick compares equal. The one dated word ("reply today", on
+          // delivery day minus 3) flips once and then stays.
+          const textDiffers = draft.subject !== row.subject || draft.body !== row.body;
+          // A wording change alone never touches a row on its delivery day
+          // (Sidd, 2026-09-18, the day Alison's job was delivered: "skip it
+          // for Alison, do it for the next event"). That job is done or under
+          // way, so the words the owner saw stay as they are and no preview
+          // push follows; the day after, the row expires above. A fact that
+          // moved that day still rewrites below, as it always did.
+          const textChanged = textDiffers && daysOut >= 1;
           // A row STILL held on delivery day minus 1 (or the day) expires;
           // the digest names it. A hold that was fixed in time lifts below.
           if (wasHeld && (wantHeld || ownerHeld) && daysOut <= 1) {
@@ -2032,15 +2048,17 @@ export async function runReconfirmationScan(env) {
           // then gets a fresh preview unless the row goes out right away).
           let freshPreview = false;
           let current = row;
-          if (diff.length || reasonsChanged || testToChanged || (wantHeld !== wasHeld && !ownerHeld)) {
+          if (diff.length || textChanged || reasonsChanged || testToChanged || (wantHeld !== wasHeld && !ownerHeld)) {
             const becomesReady = !wantHeld && !ownerHeld;
             const body = {
               subject: draft.subject, body: draft.body, facts: draft.facts, recipients: draft.recipients, picture: draft.picture,
               hold_reasons: reasonsNow, status: becomesReady ? 'ready' : 'held', test_to: testTo,
             };
             // Whether what the OWNER sees (subject, body, recipients,
-            // picture) moved, judged before the PATCH replaces it.
-            const ownerSeesChange = draft.subject !== row.subject || draft.body !== row.body
+            // picture) moved, judged before the PATCH replaces it. The text
+            // counts here whichever day it is: a fact change on the delivery
+            // day rewrites the words too, and the owner must see that.
+            const ownerSeesChange = textDiffers
               || JSON.stringify(draft.recipients) !== JSON.stringify(row.recipients || [])
               || JSON.stringify(draft.picture || null) !== JSON.stringify(row.picture || null);
             // A row that just became ready is scheduled as if drafted now.
