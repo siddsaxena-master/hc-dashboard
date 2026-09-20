@@ -1505,10 +1505,10 @@ export function reconfirmTemplate(facts, opts = {}) {
   // Case A (everything known) asks for a "confirmed"; case B (the arrival
   // time and/or the site contact missing) asks for the missing piece
   // instead, and the matching bullet below says "please tell us".
-  if (askTime && askContact) lines.push('Two things we still need: what time our driver should arrive and who they should call on site. Reply with those and we are set.');
-  else if (askTime) lines.push('One thing we still need: what time our driver should arrive. Reply with that and we are set.');
-  else if (askContact) lines.push('One thing we still need: who our driver should call on site. Reply with a name and cell and we are set.');
-  else lines.push(`We are set for ${day}. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change ${replyBy}.`);
+  if (askTime && askContact) lines.push('Just sending the final details for reconfirmation. Two things we still need: what time our driver should arrive and who they should call on site. Once we have those two items, we are set.');
+  else if (askTime) lines.push('Just sending the final details for reconfirmation. One thing we still need: what time our driver should arrive. Once we have that, we are set.');
+  else if (askContact) lines.push('Just sending the final details for reconfirmation. One thing we still need: who our driver should call on site. Once we have a name and cell, we are set.');
+  else lines.push(`Just sending the final details for reconfirmation. We are set for ${day}. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change ${replyBy}.`);
   lines.push('');
   lines.push(`• Delivery: ${day}, ${askTime ? 'arrival time: please tell us' : 'arriving ' + d.window_words}`);
   lines.push(`• Drop off: ${d.address || ''}${gate ? ', ' + gate : ''}`);

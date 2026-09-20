@@ -241,7 +241,7 @@ const FULL_SUBJECT = 'Your coconuts for Saturday, September 19: quick check';
 const FULL_BODY = [
   'Hi Jamie,',
   '',
-  'We are set for Saturday, September 19. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change by Wednesday, September 16.',
+  'Just sending the final details for reconfirmation. We are set for Saturday, September 19. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change by Wednesday, September 16.',
   '',
   '• Delivery: Saturday, September 19, arriving 3:30 PM',
   '• Drop off: Pridwin Hotel, 81 Shore Rd, Shelter Island, NY 11964',
@@ -511,7 +511,7 @@ const OLD_BODY = [
 {
   const OPTS = { ownerCell: CELL, picture: reconfirmPicture(order()), today: '2026-09-14', deliveryDay: '2026-09-19' };
   // The first paragraph of case A and the two bullets case B changes.
-  const CASE_A_OPENER = 'We are set for Saturday, September 19. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change by Wednesday, September 16.';
+  const CASE_A_OPENER = 'Just sending the final details for reconfirmation. We are set for Saturday, September 19. Here is what we have on file. Reply confirmed if it all looks right, or reply with any change by Wednesday, September 16.';
   const DELIVERY_KNOWN = '• Delivery: Saturday, September 19, arriving 3:30 PM';
   const DELIVERY_ASK = '• Delivery: Saturday, September 19, arrival time: please tell us';
   const CONTACT_KNOWN = '• On site contact: Ana, (631) 555-0100';
@@ -565,20 +565,20 @@ const OLD_BODY = [
   // contact bullet stays, the second paragraph stays, no clock time anywhere.
   const noTime = reconfirmTemplate(reconfirmFacts(order({ delivery_request: { ...order().delivery_request, window: null } })), OPTS).body;
   assert.equal(noTime, FULL_BODY
-    .replace(CASE_A_OPENER, 'One thing we still need: what time our driver should arrive. Reply with that and we are set.')
+    .replace(CASE_A_OPENER, 'Just sending the final details for reconfirmation. One thing we still need: what time our driver should arrive. Once we have that, we are set.')
     .replace(DELIVERY_KNOWN, DELIVERY_ASK));
   assert.ok(!/\d{1,2}:\d{2}/.test(noTime), 'no example clock time');
   assert.ok(noTime.includes(CONTACT_KNOWN) && noTime.includes('\nWe brand and box on Friday, September 18, the day before, so changes need to reach us by Wednesday, September 16.\n'));
   // Case B, contact only.
   const noContact = reconfirmTemplate(reconfirmFacts(order({ delivery_request: { ...order().delivery_request, contact_name: null, contact_phone: null } })), OPTS).body;
   assert.equal(noContact, FULL_BODY
-    .replace(CASE_A_OPENER, 'One thing we still need: who our driver should call on site. Reply with a name and cell and we are set.')
+    .replace(CASE_A_OPENER, 'Just sending the final details for reconfirmation. One thing we still need: who our driver should call on site. Once we have a name and cell, we are set.')
     .replace(CONTACT_KNOWN, CONTACT_ASK));
   assert.ok(noContact.includes(DELIVERY_KNOWN));
   // Case B, both missing: the two-things ask and both bullets ask.
   const both = reconfirmTemplate(reconfirmFacts(order({ delivery_request: null })), OPTS).body;
   assert.equal(both, FULL_BODY
-    .replace(CASE_A_OPENER, 'Two things we still need: what time our driver should arrive and who they should call on site. Reply with those and we are set.')
+    .replace(CASE_A_OPENER, 'Just sending the final details for reconfirmation. Two things we still need: what time our driver should arrive and who they should call on site. Once we have those two items, we are set.')
     .replace(DELIVERY_KNOWN, DELIVERY_ASK)
     .replace(CONTACT_KNOWN, CONTACT_ASK));
   // Case B never asks for a "confirmed" and never names the customer's own
@@ -650,7 +650,7 @@ const OLD_BODY = [
   assert.ok(reconfirmTemplate(reconfirmFacts(order()), { ownerCell: CELL, picture: {} }).body.includes('reach us by Wednesday, September 16.'));
   // Case B late: the second paragraph flips, the ask stays as it is.
   const bothLate = reconfirmTemplate(reconfirmFacts(order({ delivery_request: null })), { ...OPTS, today: '2026-09-17' }).body;
-  assert.ok(bothLate.startsWith('Hi Jamie,\n\nTwo things we still need: what time our driver should arrive and who they should call on site. Reply with those and we are set.\n'));
+  assert.ok(bothLate.startsWith('Hi Jamie,\n\nJust sending the final details for reconfirmation. Two things we still need: what time our driver should arrive and who they should call on site. Once we have those two items, we are set.\n'));
   assert.ok(bothLate.includes('so changes need to reach us today.\n') && !bothLate.includes('September 16'));
   // Never money, never an email address, never the garage, never crew
   // names or internal notes, never a dash.
