@@ -11,7 +11,7 @@
 
 import assert from 'node:assert/strict';
 import {
-  extractDeliveryAddresses, normalizeAddressKey, addressKeyParts, addressesAgree, addressProposalVerdict,
+  extractDeliveryAddresses, normalizeAddressKey, addressKeyParts, addressesAgree, addressProposalVerdict, quotesOwnDropOffLine,
   geocodeZipFor, addressPlaceWords, OWN_ADDRESS_MARKS,
 } from './worker.js';
 
@@ -332,6 +332,26 @@ const PDF = (name, text) => `\n\n=== ATTACHMENT: ${name} (PDF text, 2 pages) ===
   const d = addressProposalVerdict(cand, order(inv('45 Main St, Southampton, NY 11968', true)), EMAIL_AT);
   assert.equal(d.dest.address, '45 Main St, Southampton, NY 11968'); assert.equal(d.dest.source, 'invoice'); assert.equal(d.structured, true);
   pass('agreement: structured agree is silent, one-line or unknown or notes agree proposes, a newer structured edit is stale, everything else conflicts, no invoice is skipped');
+}
+// ── 10b. Our own reconfirmation bullet quoted back ──────────────────
+{
+  // The plain-text shape Outlook gives our HTML bullet list, as Sidd's
+  // edited test copy for Allie Sugano arrived on 2026-09-19.
+  const quoted = 'Hi Allie,\n\nJust sending the final details for reconfirmation.\n\n  *   Delivery: Wednesday, September 23, arrival time: please tell us\n  *   Drop off: 24 Spring St., New York, NY, 10012, US\n  *   Count: 40 coconuts\n\nThanks so much,\nSidd\nHamptons Coconuts';
+  const cand = extractDeliveryAddresses(quoted, { venue: '24 Spring St.', clientName: 'Allie Sugano', clientEmails: 'allie@caliraybeauty.com' }).candidate;
+  assert.ok(cand && cand.evidence.includes('Drop off:'), 'the bullet is read as a candidate');
+  const order = (inv) => ({ id: 'o2', external_invoice_id: '3519', invoice_fulfillment: inv, delivery_notes: null, venue: '24 Spring St.' });
+  const inv = (address, structured) => ({ read_status: 'complete', address, address_structured: structured, source_updated_at: '2026-09-10T10:00:00Z' });
+  const EMAIL_AT = '2026-09-20T01:28:53Z';
+  assert.equal(quotesOwnDropOffLine(cand, '24 Spring St., New York, NY, 10012, US'), true, 'St. and St agree, US is dropped');
+  assert.equal(quotesOwnDropOffLine(cand, '30 Spring St., New York, NY, 10012, US'), false, 'a different house is not a quote');
+  assert.equal(quotesOwnDropOffLine({ evidence: 'Deliver to 24 Spring St, New York, NY 10012' }, '24 Spring St., New York, NY, 10012, US'), false, 'no Drop off label: not our bullet');
+  assert.equal(addressProposalVerdict(cand, order(inv('24 Spring St., New York, NY, 10012, US')), EMAIL_AT).verdict, 'agree', 'structure unknown but our own bullet quoted: silent');
+  assert.equal(addressProposalVerdict(cand, order(inv('24 Spring St., New York, NY, 10012, US', false)), EMAIL_AT).verdict, 'agree', 'one-line invoice, our own bullet quoted: still silent (nothing new to write)');
+  assert.equal(addressProposalVerdict(cand, order(inv('30 Spring St., New York, NY, 10012, US', true)), EMAIL_AT).verdict, 'conflict', 'a different address on file: the quote is news, proposed as before');
+  const other = extractDeliveryAddresses('Hi, please note the new spot:\n\n  *   Drop off: 30 Spring St., New York, NY, 10012, US', { venue: '24 Spring St.', clientName: 'Allie Sugano', clientEmails: 'allie@caliraybeauty.com' }).candidate;
+  assert.equal(addressProposalVerdict(other, order(inv('24 Spring St., New York, NY, 10012, US')), EMAIL_AT).verdict, 'conflict', 'a changed address after Drop off: proposes');
+  pass('own bullet: a reply quoting our Drop off line for the address on file is silent whatever the structure flag; any other address still proposes');
 }
 
 console.log(`\nPASS: ${passed} address extraction checks. No network, no database, no phone.`);

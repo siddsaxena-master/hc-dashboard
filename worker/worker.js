@@ -1057,6 +1057,14 @@ async function runDailyDigest(env) {
     reconfirmLines.forEach(l => lines.push(l));
   }
 
+  // Passed leads (2026-09-19, migration 047): one line with this month's
+  // count by reason. Nothing when none, nothing on a read error.
+  const passedLines = await buildPassedLeadsDigestLines(env);
+  if (passedLines.length) {
+    lines.push('');
+    passedLines.forEach(l => lines.push(l));
+  }
+
   // Sunday payroll section (weekday checked in EASTERN time inside the
   // helper; returns [] on any other day or on any read failure).
   const payrollLines = await buildPayrollDigestLines(env);
@@ -2443,6 +2451,82 @@ export async function buildReconfirmationDigestLines(env) {
 }
 // ════════════════════════════════════════════════════════════════════
 // end of the reconfirmation block
+// ════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════
+// PASSED LEADS (2026-09-19, migration 047). A lead (an order still at
+// stage inquiry or quoted) that went with someone else or went quiet is
+// PASSED, never any other word. The owner marks it from the Calendar
+// card in the HC Field app; the database function hc_mark_order_passed
+// sets stage 'cancelled' and orders.passed = {reason, competitor, note,
+// at, by, prior_stage}. The 8am digest names this month's total in one
+// line, for example "Passed leads this month: 4 (price 2, competitor 1:
+// Cocolux, no reply 1)", and says nothing when there are none. The
+// pure helpers are exported for worker/test-passed-leads.mjs.
+// ════════════════════════════════════════════════════════════════════
+
+// The reasons the app offers (the 047 check constraint holds the same
+// list), in the order the digest names them, with the words it uses.
+const PASSED_REASON_WORDS = [
+  ['price', 'price'],
+  ['competitor', 'competitor'],
+  ['timing', 'timing'],
+  ['no_reply', 'no reply'],
+  ['event_cancelled', 'event cancelled'],
+  ['other', 'other'],
+];
+// First day of the current month in Eastern time as 'YYYY-MM-01'. The
+// digest fires at 8am ET, so "this month" is the owner's month.
+export function passedMonthStart(nowMs) {
+  return dayInZone(nowMs, 'ny').slice(0, 7) + '-01';
+}
+// 'Cocolux', 'Cocolux and Windansea', 'Cocolux, Windansea and Other'.
+function passedNameWords(names) {
+  if (names.length <= 1) return names.join('');
+  return names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+}
+// The one digest line from the passed objects, or '' when there are
+// none. Every reason with a count is named in list order; a competitor
+// name rides behind the reason that carries it (price can carry one too:
+// "cheaper price with Cocolux"), de-duplicated and made Telegram-safe.
+// A reason outside the list still counts toward the total, so the number
+// never quietly shrinks.
+export function passedLeadsDigestLine(passedList) {
+  const list = (passedList || []).filter((p) => p && typeof p === 'object');
+  if (!list.length) return '';
+  const parts = [];
+  for (const [key, words] of PASSED_REASON_WORDS) {
+    const hits = list.filter((p) => String(p.reason || '') === key);
+    if (!hits.length) continue;
+    const names = [...new Set(hits.map((p) => collapseSpaces(tgSafe(p.competitor))).filter(Boolean))];
+    parts.push(words + ' ' + hits.length + (names.length ? ': ' + passedNameWords(names) : ''));
+  }
+  return 'Passed leads this month: ' + list.length + (parts.length ? ' (' + parts.join(', ') + ')' : '');
+}
+// The 8am digest line: one bounded read (this month's rows, newest first,
+// 500 at most), then the line above. Fails soft: fetchSb never throws and
+// answers null on any error, so the digest is simply unchanged.
+export async function buildPassedLeadsDigestLines(env) {
+  try {
+    const since = passedMonthStart(Date.now());
+    const rows = await fetchSb(env, 'orders?select=passed&passed=not.is.null&passed->>at=gte.' + since + '&order=passed->>at.desc&limit=500');
+    if (!rows || !rows.length) return [];
+    // The read compares the UTC text of passed.at with the month start,
+    // so a mark late on the last evening of the previous month (Eastern)
+    // slips through; the Eastern day is checked here as well.
+    const inMonth = rows.map((r) => r && r.passed).filter((p) => {
+      const ms = Date.parse(p && p.at);
+      return !Number.isFinite(ms) || dayInZone(ms, 'ny') >= since;
+    });
+    const line = passedLeadsDigestLine(inMonth);
+    return line ? [line] : [];
+  } catch (e) {
+    console.error('passed leads digest error:', e);
+    return [];
+  }
+}
+// ════════════════════════════════════════════════════════════════════
+// end of the passed leads block
 // ════════════════════════════════════════════════════════════════════
 
 // Hourly — find events whose delivery was 4-5 hours ago and prompt for debrief
@@ -7013,6 +7097,19 @@ export function addressPlaceWords(address) {
 // has it on one line, or the match came from the notes or the venue: the
 // NJ versus NYC tax bug, one tap), stale (the owner put a structured
 // address on the invoice AFTER this email arrived: not news), conflict.
+// The line the candidate was read from is our own reconfirmation bullet
+// ("Drop off: <the address on file>", the line reconfirmTemplate prints)
+// quoted back: a reply to our draft, a forward of it, or the owner's own
+// edited test copy (Sidd's on 2026-09-19 filed an Address? row for Allie
+// Sugano's own address and held her email). Same words after the label
+// as on file, through normalizeAddressKey, so "St." and "St" agree and a
+// changed address after "Drop off:" is still a proposal.
+export function quotesOwnDropOffLine(cand, onFileAddress) {
+  const m = /drop[ -]?off:\s*(.+)$/i.exec(String((cand && cand.evidence) || ''));
+  if (!m || !onFileAddress) return false;
+  const quoted = normalizeAddressKey(m[1]);
+  return !!quoted && quoted === normalizeAddressKey(onFileAddress);
+}
 export function addressProposalVerdict(cand, order, emailCreatedAt) {
   const o = order || {};
   const dest = departureDestination(o);
@@ -7022,9 +7119,13 @@ export function addressProposalVerdict(cand, order, emailCreatedAt) {
   const received = Date.parse(emailCreatedAt);
   const onFileNewer = finite(updated) && finite(received) && updated > received;
   const fromInvoice = dest.source === 'invoice';
+  // Our own bullet quoted back carries nothing new: silent even when the
+  // invoice's structure is unknown (an order synced before Jarvis recorded
+  // it), which would otherwise ask the owner about his own email.
+  const ownQuote = dest.address ? quotesOwnDropOffLine(cand, dest.address) : false;
   let verdict;
   if (!factText(o.external_invoice_id)) verdict = 'no_invoice';
-  else if (dest.address && addressesAgree(cand, dest.address)) verdict = structured === true && fromInvoice ? 'agree' : 'one_line';
+  else if (dest.address && addressesAgree(cand, dest.address)) verdict = (structured === true && fromInvoice) || ownQuote ? 'agree' : 'one_line';
   else if (onFileNewer && structured === true && fromInvoice) verdict = 'stale';
   else verdict = 'conflict';
   return { verdict, dest, structured, onFileNewer };

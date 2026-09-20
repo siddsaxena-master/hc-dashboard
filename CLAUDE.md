@@ -352,7 +352,7 @@ scenarios). Apply after 041 (any time). The HC Field Team screen (build 34)
 is the caller. Offboarding by hand until then: scratchpad offboard scripts
 (roster flag + tokens on the droplet, TestFlight tester on the laptop).
 
-## Address proposals from customer email (migration 045, BUILT 2026-09-16, NOT deployed)
+## Address proposals from customer email (migration 045, LIVE 2026-09-16; worker fd3befe9 + ADDRESS_PROPOSALS on since 2026-09-17)
 
 Plan: `../PHASE2-ADDRESS-PROPOSALS-PLAN-2026-09-15.md` (sections 4 and 5a are
 the worker's half). Built on `feature/address-proposals` (cut from
@@ -500,8 +500,21 @@ while the address sat in her August email the whole time.
   non-empty, or the card scan would card every replayed row within minutes.
   Replayed rows on past-day or never-invoiced jobs never enter the scan, so
   that set only empties after the one-line dismissal by stamp above.
+- Our own bullet quoted back is not news (added 2026-09-19, local until the
+  next worker deploy): `quotesOwnDropOffLine` makes the verdict `agree` when
+  the candidate's evidence line reads "Drop off: <the address on file>"
+  (same words through normalizeAddressKey, so "St." and "St" agree), whatever
+  `address_structured` says. Why: Sidd's edited test copy of Allie Sugano's
+  reconfirmation (intake 67176, from sidd@) filed an Address? row for her own
+  address and HELD her email (`pending_address_proposal`). Any other address
+  after "Drop off:" still proposes. Pinned in test-address-extract.mjs 10b.
 
-## Live Activity START and END claims (migration 046, BUILT 2026-09-17, NOT applied)
+## Live Activity START and END claims (migration 046, APPLIED 2026-09-17 ~21:05 UTC)
+
+APPLIED 2026-09-17 ~21:05 UTC on Sidd's "yes do it" (sha1
+c516ea4db279007b273927c9437388b9a4882188, verified from the droplet); the
+first server-started card reached Sidd's phone at 21:10 UTC. The text below
+was written before the apply and is kept as the design record.
 
 The lock-screen shift card on Sidd's phone the moment a crew member clocks
 in, without opening the app. The worker (fd3befe9) and the droplet drainer
@@ -580,6 +593,38 @@ fingerprints them, the postflight compares).
   clocked in within 48 h; a phone already showing a locally started card
   (build 31+) carries two until its next foreground sweep. Apply with no
   open shift when possible. Needs Sidd's exact "yes do it".
+
+## Passed leads (migration 047, BUILT 2026-09-19, NOT applied)
+
+Sidd's ask (2026-09-19): mark a lead as Passed from its Calendar card with
+a reason, so "Natali Carvalho passed due to cheaper price with Cocolux" is
+tracked. The word is PASSED, never lost (Sidd). Built on
+`feature/address-proposals` with the app half in hc-field-app (build 37).
+
+- `migrations/047_passed_leads.sql`: `orders.passed jsonb` (null, or
+  {reason, competitor, note, at, by, prior_stage}; reason in price,
+  competitor, timing, no_reply, event_cancelled, other; competitor <= 60,
+  note <= 200; `at` is ISO text so the worker's text filter sorts), a partial
+  index, `hc_mark_order_passed(p_order_id, p_reason, p_competitor, p_note)`
+  and `hc_reopen_passed_order(p_order_id)`: security definer, owner checked
+  inside, EXECUTE for authenticated only (anon and service_role revoked).
+  Mark sets stage cancelled + cancelled_at + cancelled_reason
+  'passed: price, Cocolux' and answers {applied:false, message:'Already
+  marked passed.'} the second time; Reopen restores prior_stage (kept if the
+  order was invoiced since). Rollback refuses while a passed row is still at
+  stage cancelled. Preflight and postflight in the 045/046 style.
+- Rehearse: `node rehearsal/run-047-passed-leads-pglite.mjs <pglite dir>`
+  (70 scenarios). Apply through the SQL editor recipe, needs "yes do it".
+- Worker: `buildPassedLeadsDigestLines` adds ONE line to the 8am digest when
+  a lead was marked passed this Eastern month ("Passed leads this month: 4
+  (price 2: Cocolux, competitor 1: Cocolux, no reply 1)"), one bounded
+  service-key read, silent on zero or on any read error. Pinned in
+  `worker/test-passed-leads.mjs`. Deploys with the next worker deploy.
+- Known edges (reviewer 2026-09-19, all low): the web dashboard's stage
+  editor can move a passed lead back to a live stage while `passed` stays
+  set; a passed lead inside its 2-day departure window keeps its
+  order_departures row until plan_date passes; the anon lane (pre-020) can
+  read the passed note like every other orders column.
 
 ## Departure plan, stage 0 truth checks (recorded 2026-09-13, read-only)
 
