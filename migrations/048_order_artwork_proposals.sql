@@ -285,15 +285,22 @@ begin
   from pg_catalog.pg_proc as p
   join pg_catalog.pg_language as l on l.oid = p.prolang
   where p.oid = pg_catalog.to_regprocedure('public.hc_can_read_order_logo(text)');
-  -- Every side is read without carriage returns: the installed body, this
-  -- file's constants (a CRLF paste would put them there too).
+  -- Every side is compared with ALL whitespace removed (carriage returns,
+  -- newlines, spaces, tabs): the live 035 helper was pasted on 2026-09-06
+  -- from a copy of the file with different line breaks ("select 1 from
+  -- public.orders" on one line), and an exact text match refused it on
+  -- 2026-09-21 although the logic is the same. Removing the 048 clause from
+  -- a re-run's helper then leaves nothing behind either. The two strpos
+  -- checks below still read the text with its spaces.
   v_src := pg_catalog.replace(v_src, pg_catalog.chr(13), '');
   if v_secdef is not true
      or v_lang <> 'sql'
      or pg_catalog.strpos(v_src, 'logo_file.value ->> ''preview_path'' = p_name') = 0
      or pg_catalog.strpos(v_src, 'lower(trim(order_row.market)) = lower(trim(worker.market))') = 0
-     or pg_catalog.replace(v_src, pg_catalog.replace(v_clause, pg_catalog.chr(13), ''), '')
-        <> pg_catalog.replace(v_035, pg_catalog.chr(13), '') then
+     or pg_catalog.replace(
+          pg_catalog.regexp_replace(v_src, '\s', '', 'g'),
+          pg_catalog.regexp_replace(v_clause, '\s', '', 'g'), '')
+        <> pg_catalog.regexp_replace(v_035, '\s', '', 'g') then
     raise exception using
       errcode = '55000',
       message = '048 found an unrecognized public.hc_can_read_order_logo; it must be the 035 text (or the 035 text with 048''s clause); review it before applying';

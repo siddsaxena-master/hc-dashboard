@@ -1015,11 +1015,24 @@ try {
   // ── preflight guards on an unexpected shape ──
   const guard1 = await productionShaped();
   handles.push(guard1);
-  // Somebody changed the 035 helper (one extra space): 048 stops.
-  await guard1.exec(migration035.slice(migration035.indexOf('create or replace function public.hc_can_read_order_logo('), migration035.indexOf('$function$;', migration035.indexOf('create or replace function public.hc_can_read_order_logo(')) + '$function$;'.length).replace("and p_name is not null", "and  p_name is not null"));
-  await refusesOn(guard1, '048 refuses an hc_can_read_order_logo whose text is not the 035 text', migration, '55000', /unrecognized public\.hc_can_read_order_logo/);
+  // Somebody changed the 035 helper's LOGIC (a manager could read every
+  // card): 048 stops. Layout alone never stops it (next scenario).
+  const helper035 = migration035.slice(migration035.indexOf('create or replace function public.hc_can_read_order_logo('), migration035.indexOf('$function$;', migration035.indexOf('create or replace function public.hc_can_read_order_logo(')) + '$function$;'.length);
+  await guard1.exec(helper035.replace("lower(trim(worker.role)) = 'owner'", "lower(trim(worker.role)) in ('owner', 'manager')"));
+  await refusesOn(guard1, '048 refuses an hc_can_read_order_logo whose logic is not the 035 logic', migration, '55000', /unrecognized public\.hc_can_read_order_logo/);
   assert.equal(await tableCount(guard1), 0, 'nothing was added');
   assert.equal(await columnType(guard1, 'email_meta'), undefined);
+  // The live helper as production actually holds it (pasted 2026-09-06 from
+  // a copy with different line breaks: "select 1 from public.orders" on one
+  // line, fewer indents). Same words, other layout: 048 must apply.
+  const guard1b = await productionShaped();
+  handles.push(guard1b);
+  await guard1b.exec(helper035.replace('select 1\n      from public.orders as order_row', 'select 1 from public.orders as order_row').replace(/\n {8,}/g, '\n  '));
+  await guard1b.exec(migration);
+  assert.equal(await columnType(guard1b, 'email_meta'), 'jsonb', '048 applied over the reformatted helper');
+  const reread = await guard1b.query("select p.prosrc as s from pg_catalog.pg_proc p where p.oid = 'public.hc_can_read_order_logo(text)'::regprocedure");
+  assert.ok(String(reread.rows[0].s).includes('order_artwork_proposals'), 'the helper now carries the 048 clause');
+  pass('048 accepts the 035 helper laid out the way production holds it (words compared, not whitespace) and still refuses a logic change');
   const guard2 = await productionShaped();
   handles.push(guard2);
   await guard2.exec("update storage.buckets set public = true where id = 'order-logos';");
