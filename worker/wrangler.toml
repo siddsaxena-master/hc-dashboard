@@ -135,3 +135,22 @@ crons = [
 # The replay script's rows (intake_messages.replayed_at set) are hidden from
 # every Telegram-facing read by fetchIntakeLive; a worker deployed before
 # 045 logs the missing column once and reads without the filter.
+# ARTWORK PROPOSALS (2026-09-21, PHASE3-ARTWORK-PLAN-2026-09-21.md sections
+# 5b and 7). The droplet's artwork pass (outlook poller, behind its own
+# ARTWORK_FETCH_ENABLED in the droplet .env) fetches, fingerprints and
+# previews a customer's artwork files into the private order-logos bucket
+# and writes one order_artwork_proposals row per file (migration 048 must
+# be live first). The 5-minute runProposalScan then sends one owner-only
+# "Artwork?" banner per email (never a file name) and retires rows whose
+# order was cancelled, whose delivery day passed, whose invoice moved or
+# whose card artwork changed since the scan. Only the owner's Use it in HC
+# Field (build 38 or later, hc_decide_proposed_artwork) puts a file on a
+# card; this worker never fetches bytes, never renders, never writes
+# artwork. One setting, a secret, default off, never in this file:
+# ARTWORK_PROPOSALS - 'on' enables the banners and the retirements; unset
+#   (or any other value) means off and the scan behaves exactly as before.
+#   Keep it unset until the build is on Sidd's phone (a banner saying
+#   "Open Needs you" must never point at nothing). `wrangler secret put
+#   ARTWORK_PROPOSALS`, value on; `wrangler secret delete ARTWORK_PROPOSALS`
+#   is the kill switch (rows already in the table stay visible in the app,
+#   so tell Sidd).

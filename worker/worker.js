@@ -8281,6 +8281,25 @@ export function proposalTexts(kind, order, ctx) {
       : 'No attachment; no clock time in the email. Open it in Outlook.';
     return { title: `Coordinator email: ${tag}${venue ? ' / ' + venue : ''}, ${day}`, body: why, managerBody: null };
   }
+  // The artwork banners (PHASE3-ARTWORK-PLAN-2026-09-21.md section 2): one
+  // per EMAIL, the customer, the day and a file COUNT. Never a file name,
+  // an email address, a phone, a street or a dollar. ctx: { day, count,
+  // cardFiles, own } (own: forwarded from our own mailbox).
+  if (kind === 'artwork_proposed') {
+    const n = Math.max(1, Math.round(Number(c.count) || 1));
+    const cardFiles = Math.max(0, Math.round(Number(c.cardFiles) || 0));
+    const who = c.own ? 'A file forwarded from our own mailbox' : 'A customer email';
+    const body = cardFiles > 0
+      ? `${who} carries ${n === 1 ? '1 new artwork file' : n + ' new artwork files'}. The card already has ${cardFiles === 1 ? '1 file' : cardFiles + ' files'}. Open Needs you to compare them.`
+      : n === 1
+        ? `${who} carries 1 artwork file. Nothing is on the card yet. Open Needs you to look at it and tap Use it or Not this one.`
+        : `${who} carries ${n} artwork files. Nothing is on the card yet. Open Needs you to look at them and choose.`;
+    return { title: `Artwork? ${tag}, ${day}`, body, managerBody: null };
+  }
+  if (kind === 'artwork_failed') {
+    const who = c.own ? 'A file forwarded from our own mailbox' : 'A customer email';
+    return { title: `Artwork not saved: ${tag}, ${day}`, body: `${who} carries an artwork file that could not be saved. Open Needs you for the reason.`, managerBody: null };
+  }
   // The address banners (plan section 2): city and state only, never the
   // street, never a dollar. ctx: { day, city, state, variant: 'blank' |
   // 'differs' | 'one_line', onFilePlace, docNumber, totalMoved, taxZero }.
@@ -8338,6 +8357,19 @@ const TIME_STALE_LIVE_GRACE_MS = 60 * 60 * 1000;
 const ADDRESS_TABLE = 'order_address_proposals';
 export function addressProposalsOn(env) {
   return String((env && env.ADDRESS_PROPOSALS) || '').toLowerCase() === 'on';
+}
+// ── proposals: a customer's artwork file found on the same email ─────
+// Behind the ARTWORK_PROPOSALS switch (a worker secret, 'on' to enable,
+// unset means off; wrangler.toml). The droplet's artwork pass fetches,
+// fingerprints and previews the files and writes the rows (migration 048,
+// PHASE3-ARTWORK-PLAN-2026-09-21.md); this worker only sends the owner's
+// "Artwork?" banner for each email's rows and retires rows bound to be
+// refused. It never fetches bytes, never renders, never writes artwork:
+// it has no Graph token and no Ghostscript. Only the owner's tap in the
+// app (hc_decide_proposed_artwork) puts a file on a card.
+const ARTWORK_TABLE = 'order_artwork_proposals';
+export function artworkProposalsOn(env) {
+  return String((env && env.ARTWORK_PROPOSALS) || '').toLowerCase() === 'on';
 }
 function ownAddressMarksFromEnv(env) {
   return String((env && env.OWN_ADDRESS_DENYLIST) || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -8593,6 +8625,106 @@ async function runAddressFollowUps(env, counts, nowMs, nowIso) {
     }
   }
 }
+// The artwork twin of the address follow-ups (plan section 5b). One
+// banner per EMAIL: the pending rows not yet notified, grouped by
+// intake_id, one owner-only push per group (collapse art-<intake_id>,
+// thread prop-<intake_id> so it sits with the same email's Time change?
+// or Address? banner), then notified_at stamped on the rows that were
+// pushed. The push data carries the intake id and the proposal ids only.
+// Then the retire step: pending rows whose order is cancelled, whose
+// delivery day is before today, whose invoice moved from the snapshot,
+// or whose card checked_at moved from the snapshot are superseded, so the
+// app never shows a row bound to be refused for long. Reads are bounded
+// (20 and 100 rows); every failure is a log line and a count, never a
+// throw; a table that is not there yet (048 not applied) logs and returns.
+//
+// The banner waits for the pass to finish the email. The droplet pass
+// renders ONE file per pass (a front and a back land a minute apart) and
+// stamps intake_messages.artwork_scanned_at only at the end, while this
+// tick runs every 5 minutes. A tick between the two files would push
+// "carries 1 artwork file", and because the queue row is inserted with
+// ignore-duplicates on a stable id the second file's push would be
+// swallowed while its row was still stamped notified_at. So a group whose
+// email is unstamped is deferred (counted, not pushed). The pass stamps
+// within minutes, or after its 24 h give-up on a moved email; an email
+// that stays unstamped for ARTWORK_BANNER_WAIT_MS (an upload that keeps
+// failing) gets its banner anyway with the rows in hand, and a row that
+// lands after that gets a push of its own: the queue id is derived from
+// the pushed row ids and only those rows are stamped.
+const ARTWORK_BANNER_WAIT_MS = 30 * 60 * 1000;
+export async function runArtworkFollowUps(env, counts, nowMs, nowIso) {
+  const fresh = await fetchSb(env, ARTWORK_TABLE + '?select=id,intake_id,order_id,verdict,sender_kind,card_files_at_scan,found_at,intake_messages!inner(artwork_scanned_at),orders!inner(id,client_name,market,delivery_at_utc,event_start_at,stage)' +
+    '&status=eq.pending&notified_at=is.null&order=found_at.asc&limit=20');
+  if (!fresh) { console.error('artwork follow-up: proposals table missing or unreadable (migration 048?), nothing done'); return; }
+  const groups = new Map();
+  for (const p of fresh) {
+    const key = String(p.intake_id);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(p);
+  }
+  for (const [intakeId, rows] of groups) {
+    try {
+      const o = rows[0].orders || {};
+      // A cancelled order gets no banner; the retire step below closes its rows.
+      if (o.stage === 'cancelled') continue;
+      const scanned = rows.some((p) => p.intake_messages && p.intake_messages.artwork_scanned_at);
+      const found = rows.map((p) => Date.parse(p.found_at || '')).filter(Number.isFinite);
+      const waited = !found.length || nowMs - Math.min(...found) >= ARTWORK_BANNER_WAIT_MS;
+      if (!scanned && !waited) { counts.deferred++; continue; }
+      const ids = rows.map((p) => Number(p.id)).filter(Number.isFinite).sort((a, b) => a - b);
+      const market = marketKey(o.market);
+      const day = deliveryDaySnapshot(o) || '';
+      const saved = rows.filter((p) => p.verdict === 'ready' || p.verdict === 'no_preview');
+      const own = rows.some((p) => p.sender_kind === 'own');
+      const kind = saved.length ? 'artwork_proposed' : 'artwork_failed';
+      const cardFiles = Math.max(0, ...rows.map((p) => Number(p.card_files_at_scan) || 0));
+      const texts = proposalTexts(kind, o, { day, count: saved.length, cardFiles, own });
+      const queueId = await derivedQueueId('hc-artprop-v1\0' + intakeId + '\0' + ids.join(','), 'owner');
+      const sent = await sendPushToMarket(env, market, texts.title, texts.body, {
+        recipients: 'manage', ownersOnly: true, queueId, collapseId: 'art-' + intakeId, threadId: 'prop-' + intakeId,
+        kind, orderId: o.id, day, data: { intake_id: Number(intakeId), proposal_ids: ids },
+      });
+      if (!sent.queued) { counts.failed++; continue; }
+      await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + ARTWORK_TABLE + '?id=in.(' + ids.join(',') + ')&notified_at=is.null', {
+        method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ notified_at: nowIso, updated_at: nowIso }),
+      }, 15000);
+      counts.notified++;
+    } catch (e) {
+      counts.failed++;
+      console.error('artwork follow-up failed on intake #' + intakeId + ':', e);
+    }
+  }
+  const pending = await fetchSb(env, ARTWORK_TABLE + '?select=id,intake_id,order_id,invoice_id_snapshot,card_checked_at_snapshot,orders!inner(id,stage,market,delivery_at_utc,event_start_at,external_invoice_id,logo_asset)&status=eq.pending&limit=100');
+  for (const p of pending || []) {
+    try {
+      const o = p.orders;
+      const day = o ? deliveryDaySnapshot(o) : null;
+      // Today in New York, the day the 048 decision function compares against.
+      const today = dayInZone(nowMs, 'ny');
+      const asset = o && o.logo_asset && typeof o.logo_asset === 'object' ? o.logo_asset : null;
+      const checkedNow = asset && asset.checked_at != null ? String(asset.checked_at) : '';
+      const checkedThen = p.card_checked_at_snapshot != null ? String(p.card_checked_at_snapshot) : '';
+      const invoiceNow = o && o.external_invoice_id != null ? String(o.external_invoice_id) : null;
+      const invoiceThen = p.invoice_id_snapshot != null ? String(p.invoice_id_snapshot) : null;
+      const retire = !o || o.stage === 'cancelled' ? 'cancelled'
+        : day && day < today ? 'date_passed'
+        : invoiceNow !== invoiceThen ? 'invoice_changed'
+        : checkedNow !== checkedThen ? 'artwork_changed'
+        : null;
+      if (!retire) continue;
+      await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + ARTWORK_TABLE + '?id=eq.' + encodeURIComponent(p.id) + '&status=eq.pending', {
+        method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ status: 'superseded', decided_via: retire, decided_at: nowIso, updated_at: nowIso }),
+      }, 15000);
+      console.log('artwork follow-up: proposal #' + p.id + ' retired (' + retire + ')');
+      counts.retired++;
+    } catch (e) {
+      counts.failed++;
+      console.error('artwork retire failed on proposal #' + (p && p.id) + ':', e);
+    }
+  }
+}
 // The scan's intake read: the 50 newest linked, classified, undecided
 // emails about upcoming jobs, with the two 045 columns. A worker running
 // ahead of 045 (or after its rollback) gets a 400 naming a missing column;
@@ -8625,11 +8757,13 @@ async function fetchProposalIntakes(env, since) {
   }
 }
 export async function runProposalScan(env) {
-  const counts = { seen: 0, proposed: 0, noTime: 0, agree: 0, stale: 0, skipped: 0, failed: 0, replayed: 0, address: null };
+  const counts = { seen: 0, proposed: 0, noTime: 0, agree: 0, stale: 0, skipped: 0, failed: 0, replayed: 0, address: null, artwork: null };
   const addressOn = addressProposalsOn(env);
+  const artworkOn = artworkProposalsOn(env);
   // geocoded counts Apple calls this tick: more than one per email across
   // ticks would show a repeat in the log.
   if (addressOn) counts.address = { proposed: 0, agree: 0, stale: 0, none: 0, rejected: 0, noInvoice: 0, notified: 0, retired: 0, resnapshotted: 0, failed: 0, geocoded: 0 };
+  if (artworkOn) counts.artwork = { notified: 0, deferred: 0, retired: 0, failed: 0 };
   try {
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -8779,6 +8913,7 @@ export async function runProposalScan(env) {
       }
     }
     if (addressOn) await runAddressFollowUps(env, counts.address, nowMs, nowIso);
+    if (artworkOn) await runArtworkFollowUps(env, counts.artwork, nowMs, nowIso);
   } catch (e) {
     console.error('runProposalScan error:', e);
   }

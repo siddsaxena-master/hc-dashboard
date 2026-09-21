@@ -628,6 +628,123 @@ tracked. The word is PASSED, never lost (Sidd). Built on
   order_departures row until plan_date passes; the anon lane (pre-020) can
   read the passed note like every other orders column.
 
+## Customer artwork from email (migration 048, BUILT LOCALLY 2026-09-21, NOT applied, NOT deployed)
+
+Plan: `../PHASE3-ARTWORK-PLAN-2026-09-21.md` (sections 3, 5b and 7 are this
+repo's half; the standing artwork rules live in
+`../hc-field-app/calendar-delivery-logo-release.md`). Built on
+`feature/address-proposals` on top of the quoted-answers commit 0c55333,
+NEVER main. The why: the crew brand the coconuts from the file the customer
+emailed, and until now that file reached the card only by a hand import
+(Alison's .ps, Allie's SVG) or not at all.
+
+- The artwork record is `orders.logo_asset` (migration 035): `{status:
+  received|approved|needs_review, checked_at, source_received_at,
+  source_ref, files:[{file_name, mime_type, original_path, preview_path,
+  usage, sha256, ...}]}`. Paths are object names inside the PRIVATE
+  `order-logos` bucket; `hc_can_read_order_logo(name)` (035) is the only
+  thing that lets a signed-in phone sign a URL for one, and the three 035
+  storage policies call it by name. Migration 036 fingerprints status,
+  checked_at and the five file keys: ANY write to logo_asset resets the
+  crew's stamp check on purpose. The crew projection (035) strips every
+  other key, so owner-only keys (approved_at, approved_by, source_ref, the
+  hashes) never reach a manager or crew phone.
+- `migrations/048_order_artwork_proposals.sql` adds `intake_messages.
+  email_meta` (jsonb object: sender name, To/Cc, internetMessageId, the
+  attachment listing; written by the poller and the replay script) and
+  `intake_messages.artwork_scanned_at` (stamped by the droplet pass); the
+  owner-only table `order_artwork_proposals` (one row per FILE, unique on
+  (order_id, sha256) and (intake_id, attachment_id), verdict ready |
+  no_preview | too_large | fetch_failed, status pending | used | declined |
+  superseded, decided_via app | cancelled | date_passed | invoice_changed |
+  artwork_changed | already_on_card, snapshots of the invoice, the delivery
+  day and the card's checked_at); `hc_decide_proposed_artwork(p_order_id,
+  p_proposal_id, p_decision use|skip|dismiss)` (owner only; use appends
+  the ONE file to logo_asset with usage 'Coconut', approved_at and
+  approved_by, sets logo_received true, and the record reads approved only
+  when every file carries approved_at; skip and dismiss decline; every
+  refusal is `{applied:false, message}` with the plan's section 2
+  sentence, never a raise). Two deliberate deviations from the plan's
+  words, both in the 048 header: (1) a Use it RE-TAKES the card snapshot
+  (card_checked_at_snapshot, card_files_at_scan) of every other pending
+  row for that order in the same transaction, because the owner's own tap
+  is not a change under him; read literally, plan 3D/5b would refuse the
+  second file of a front-and-back email as artwork_changed for good
+  (unique on order and sha256). (2) The intake row is dismissed only once
+  the worker has read the email (`address_scanned_at` not null): the
+  pass makes rows about 3 minutes after the email, the worker ticks every
+  5, and a tap in between must not hide a reply that also carries a time
+  or an address from the reply scan and the proposal scan; an unread row
+  stays pending_review for the next tick. A preview_path is always a
+  ...-preview.png (the pass never writes a raster original as its own
+  preview; the app draws a raster original by itself); `hc_approve_order_artwork(p_order_id,
+  p_checked_at)` (owner only, compare-and-set on checked_at, refuses
+  needs_review and any file whose usage is not one of the 035 words);
+  `hc_can_read_order_logo` re-created with the 035 text verbatim plus one
+  clause (an active OWNER phone may sign a proposal's paths while the row is
+  pending or was decided in the last 30 days; managers and crew never); and
+  a 25 MB `file_size_limit` on the bucket. Both functions execute for
+  authenticated only (anon and service_role revoked explicitly). Preflight
+  refuses unless the installed helper is byte for byte the 035 text (or
+  048's own re-run of it), the bucket is private, and the 045 columns
+  exist. The rollback refuses while any row is pending or while a used
+  row's file is still on a card (take it off by hand first, decision 11);
+  it puts the 035 helper text back byte for byte and never touches
+  logo_asset.
+- Rehearse: `node rehearsal/run-048-order-artwork-proposals-pglite.mjs <pglite dir>`
+  (105 scenarios: apply twice, every refusal sentence, the 035 behaviour of
+  the helper kept, the crew projection, the check constraints, both unique
+  keys, use then use on one email with the sibling re-snapshot, the
+  dismissal window on an email the worker has not read, Approve artwork,
+  the 30-day window, both rollback refusals, rollback twice and re-apply,
+  five preflight guards).
+- Worker (`runArtworkFollowUps`, inside the 5-minute `runProposalScan`,
+  behind the `ARTWORK_PROPOSALS` secret, unset means off; documented in
+  `worker/wrangler.toml`): one owner-only "Artwork? <surname>, <day>" banner
+  per EMAIL (a file COUNT, never a file name; collapse `art-<intake_id>`,
+  thread `prop-<intake_id>`, kind `artwork_proposed`, or "Artwork not
+  saved" / `artwork_failed` when nothing on the email was saved; data =
+  intake_id and proposal_ids), then `notified_at` stamped on exactly the
+  rows that were pushed (`id=in.(...)`); then the retire step (cancelled,
+  delivery day before today in New York, invoice moved from the snapshot,
+  card checked_at moved from the snapshot: superseded with decided_via).
+  THE BANNER WAITS FOR THE PASS: the fresh read embeds
+  `intake_messages!inner(artwork_scanned_at)` and a group whose email the
+  pass has not stamped yet is deferred (`deferred` in the counts). The
+  pass renders one file per pass and stamps at the end, so a front and a
+  back land a minute apart; a tick between them would push "carries 1
+  artwork file" and, because push_queue inserts with ignore-duplicates on
+  a stable id, swallow the second file's push while stamping its row. An
+  email unstamped for 30 minutes (ARTWORK_BANNER_WAIT_MS, an upload that
+  keeps failing) gets its banner with the rows in hand, and a row landing
+  after that gets its own push: the queue id is derived from the pushed
+  row ids. The worker never fetches bytes, never renders, never writes
+  artwork; the droplet pass (hc-invoice-bot, `ARTWORK_FETCH_ENABLED`)
+  writes the rows. A pending Artwork? row never holds a reconfirmation
+  (decision 10, pinned in `worker/test-reconfirmation.mjs`). Tests:
+  `node worker/test-artwork-proposals.mjs` (12 scenarios), plus the
+  switch-off pin in `worker/test-proposal-scan.mjs`.
+- Committing this work: add the Phase 3 files BY NAME (migrations/048*,
+  rehearsal/run-048*, worker/worker.js, worker/wrangler.toml,
+  worker/test-artwork-proposals.mjs, worker/test-proposal-scan.mjs,
+  worker/test-reconfirmation.mjs, CLAUDE.md), never `git add -A`: the
+  tracked `droplet/__pycache__/pushdrain.cpython-314.pyc` sits modified in
+  the working tree (Python 3.14 recompiled it before this job) and would
+  ride along. Retire that tracked .pyc in its own housekeeping commit
+  (`git rm --cached`; `__pycache__/` and `*.pyc` are already in
+  .gitignore).
+- Deploy order (plan section 8, each its own "yes do it"): the
+  quoted-answers worker fix alone (G2), then 048 through the SQL editor
+  recipe (G3; probe `rpc/hc_decide_proposed_artwork` and
+  `rpc/hc_approve_order_artwork` answer 401 with no bearer, the table
+  answers 200 `[]` with the service key), then the Jarvis PR (rows exist
+  before banners), then `npx wrangler deploy` from feature/address-proposals
+  with ARTWORK_PROPOSALS unset (G5), then the droplet switch (G6), then
+  the app build (G7), and the worker secret LAST (G8: a banner saying "Open
+  Needs you" must never point at nothing). Kill: `wrangler secret delete
+  ARTWORK_PROPOSALS` (rows already made stay visible in the app, so tell
+  Sidd); the 048 rollback only with zero pending rows.
+
 ## Departure plan, stage 0 truth checks (recorded 2026-09-13, read-only)
 
 Plan: `../DEPARTURE-PLAN-2026-09-12.md` (original + the app-only revision).

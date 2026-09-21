@@ -227,6 +227,10 @@ async function at(iso, fn) { Date.now = () => T(iso); try { return await fn(); }
     }
     const again = await at('2026-09-10T17:25:00Z', () => runProposalScan(ENV));
     assert.equal(again.skipped, 1); assert.equal(h.queuePosts().length, 2);
+    // ARTWORK_PROPOSALS unset (migration 048, worker/test-artwork-proposals.mjs
+    // has the rest): the artwork table is never read and counts.artwork is null.
+    assert.equal(again.artwork, null);
+    assert.equal(h.calls.filter((c) => c.url.includes('order_artwork_proposals')).length, 0, 'zero artwork reads with the switch unset');
   } finally { h.restore(); }
   pass('Thursday 1:20 PM: the 2:00 PM is read out of the PDF, stored as a proposal, and the owner and manager get their banners once; crew never');
 }

@@ -187,6 +187,9 @@ function harness(opts = {}) {
       if (!opts.addressProposals) return reply(404, { code: 'PGRST205' });
       return reply(200, query(opts.addressProposals, path));
     }
+    // Artwork? rows (migration 048): answered here only so case 11 can
+    // prove the scan never asks (no hold, plan decision 10).
+    if (table === 'order_artwork_proposals' && method === 'GET') return reply(200, query(opts.artworkProposals || [], path));
     if (table === 'intake_messages') {
       if (method === 'GET') {
         // The hourly nag scan's own read: nothing waiting, so no Telegram.
@@ -936,6 +939,12 @@ const OLD_BODY = [
   // Before 045 the table answers 404 and nothing is held.
   const no045 = await scanAt(MON_0805, ENV_AUTO, { orders: [order()] });
   assert.deepEqual(no045.h.all()[0].hold_reasons, []);
+  // A pending Artwork? row (migration 048) does NOT hold the email (plan
+  // PHASE3-ARTWORK-PLAN-2026-09-21.md decision 10): the draft is ready and
+  // the scan never even reads the artwork table.
+  const art = await scanAt(MON_0805, ENV_AUTO, { orders: [order()], artworkProposals: [{ order_id: ORDER_ID, status: 'pending', verdict: 'ready' }] });
+  assert.equal(art.h.all()[0].status, 'ready'); assert.deepEqual(art.h.all()[0].hold_reasons, []);
+  assert.equal(art.h.reads('order_artwork_proposals').length, 0, 'the reconfirmation scan never reads order_artwork_proposals');
   // Same reasons next hour: no second push. New reason set: one more push.
   const same = await scanAt('2026-09-14T13:05:00Z', ENV_AUTO, { orders: [order({ coconuts_qty: null, client_email: 'ar@example.invalid' })], rows: held.h.all() });
   assert.equal(same.h.pushes().length, 0); assert.equal(same.counts.rewritten, 0);
