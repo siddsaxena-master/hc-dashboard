@@ -594,7 +594,9 @@ fingerprints them, the postflight compares).
   (build 31+) carries two until its next foreground sweep. Apply with no
   open shift when possible. Needs Sidd's exact "yes do it".
 
-## Passed leads (migration 047, BUILT 2026-09-19, NOT applied)
+## Passed leads (migration 047, APPLIED 2026-09-20 ~19:40 UTC)
+
+APPLIED 2026-09-20 on Sidd's "yes do it" (sha1 9419edc2ecc78f2323f6e6d2e9441e0c96361c93, 18,943 bytes, "Success. No rows returned", no keyword dialog this time). Verified from the droplet (scratchpad verify047.py): orders.passed 200 (null on every row), both RPCs 403 42501 with the service key and 401 with no bearer (present and locked to signed-in owners), 045 and 046 intact. Rollback 047_passed_leads_rollback.sql refuses while any passed lead sits at stage cancelled.
 
 Sidd's ask (2026-09-19): mark a lead as Passed from its Calendar card with
 a reason, so "Natali Carvalho passed due to cheaper price with Cocolux" is
