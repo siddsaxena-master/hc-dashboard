@@ -1638,6 +1638,175 @@ export function stripQuotedText(rawText) {
   return out.join('\n');
 }
 
+// ── answers typed inside our quoted bullets ─────────────────────────
+// Outlook, 2026-09-21 (Allie Sugano, intake 68785, the first real
+// reconfirmation): the reply's own words were "Added the details below!
+// Thank you" and the answers sat INSIDE the quoted copy of our email,
+// typed over the asks: "arrival time: please tell us" became "arrival
+// time: 1:15pm - 1:30pm" and "On site contact: please send a name and
+// cell" became "On site contact: Allie, <cell>". stripQuotedText drops
+// the whole quote (rightly: our own 3:30 PM quoted back is never an
+// answer), so the classifier saw one sentence and the time scan found no
+// time; nothing reached the card. This reads the quoted copy against the
+// body we SENT (order_reconfirmations.body) and returns the bullets whose
+// value moved, in the order we printed them: [{ label, value,
+// placeholder }], placeholder true when our value was an ask (it carried
+// "please"), false when the customer rewrote a line we filled in
+// ourselves (a count, an address), which the caller treats as a change
+// request. An untouched quote answers nothing, and so does a reply with
+// no quote at all, so every other reply reads exactly as before. Pure:
+// no network, no clock.
+//
+// The quoted copy is everything from our own quote header down (Outlook's
+// "From: <us>" block or "On <date> ... wrote:", reconfirmIsQuoteHeader)
+// plus any '>' line, never an attachment section. Outlook's plain text
+// prints our HTML bullets as "  *   Label: value", or as "  *" alone with
+// "Label: value" on the next line once the customer has edited that item;
+// Gmail keeps "• Label: value" behind '>'; a phone may print "- ". The
+// labels come from the sent body itself (its "• Label: value" lines), so
+// a bullet the template gains later is read the same way. A value the
+// mail client wrapped continues on the next line until a blank line, a
+// bare bullet, the next label, a bullet that is not one of ours or a line
+// we printed ourselves (the "We brand and box" paragraph when a client
+// drops the blank line after the list). Values compare as lowercase
+// letters and digits only, with the "(picture below)" note (the droplet
+// drops it when the download failed) and a mail client's "<tel:...>" or
+// "<x-apple-data-detectors:...>" link shapes dropped: a reflow, a "St"
+// for "St." or a dropped note is never a change, while an answer typed
+// in parentheses after our ask ("please tell us (1:15pm)") still is one.
+// Labels are at most 40 characters, so a sentence with a colon in it
+// ("Two things we still need: what time ...") is never one.
+//
+// A SECOND reply on the thread quotes the customer's FIRST reply, edited
+// bullets and all, under another sender's header (Outlook's "From: <the
+// customer>" block, Gmail's "On <date> ... <the customer> wrote:"). Those
+// bullets were read from the first reply already; reading them again
+// would turn "Perfect, thank you!" into a change and propose the old time
+// over a fresh "2pm instead?". So a header that is not ours ABOVE our own
+// answers nothing at all, and the callers read the reply's own words as
+// they always did.
+function reconfirmSentBullet(line) {
+  const m = /^\s*•\s*([^:]{1,40}?)\s*:\s*(.*)$/.exec(String(line || ''));
+  return m ? { label: collapseSpaces(m[1]), value: m[2] } : null;
+}
+function reconfirmValueKey(value) {
+  return String(value || '').toLowerCase()
+    .replace(/<[a-z][a-z0-9+.-]*:[^>]*>/g, ' ')
+    .replace(/\(picture below\)/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+// Another sender's reply header: a "From: <address>" block (Sent: or
+// Date: within three lines) whose address is not on one of our domains
+// (or has no address at all), or an "On <date> ... wrote:" line, wrapped
+// or not, that names none of our domains. Pass the lines with their '>'
+// marks already off.
+function reconfirmIsForeignQuoteHeader(lines, i) {
+  const at = (j) => String(lines[j] || '').trim();
+  const lower = at(i).toLowerCase();
+  const own = reconfirmOwnDomains();
+  if (lower.startsWith('from:')) {
+    const addr = (/[^\s<>,;"']+@[^\s<>,;"']+/.exec(lower) || [''])[0];
+    if (addr && own.some((d) => addr.endsWith(d))) return false;
+    for (let j = 1; j <= 3; j++) {
+      if (/^(sent|date):/i.test(at(i + j))) return true;
+    }
+    return false;
+  }
+  if (!reconfirmIsQuoteHeader(lines, i)) return false;
+  // "On <date> ... wrote:", the address sometimes on the wrapped line.
+  let text = lower;
+  for (let j = 1; j <= 2 && !/\bwrote:\s*$/.test(text); j++) text += ' ' + at(i + j).toLowerCase();
+  return !own.some((d) => text.includes(d));
+}
+export function quotedBulletAnswers(rawText, sentBody) {
+  const sent = [];
+  // The lines we printed around the list (greeting, the "We brand and
+  // box" paragraph, the sign-off) as value keys: never a bullet's tail.
+  const sentLines = [];
+  for (const line of String(sentBody || '').split(/\r?\n/)) {
+    const b = reconfirmSentBullet(line);
+    if (b) {
+      if (!sent.some((s) => s.label.toLowerCase() === b.label.toLowerCase())) sent.push(b);
+      continue;
+    }
+    const key = reconfirmValueKey(line);
+    if (key) sentLines.push(key);
+  }
+  if (!sent.length) return [];
+  const labels = new Map(sent.map((s) => [s.label.toLowerCase(), s.label]));
+  // One of our own lines, or the head of one a mail client wrapped (two
+  // words at least, so a lone name never matches).
+  const isSentLine = (body) => {
+    const key = reconfirmValueKey(body);
+    return key.split(' ').length >= 2 && sentLines.some((s) => s === key || s.startsWith(key + ' '));
+  };
+  const lines = String(rawText || '').split(/\r?\n/);
+  // The same lines with their '>' marks off, for the header checks (Apple
+  // Mail nests the header itself behind '>').
+  const bare = lines.map((l) => l.replace(/^(\s*>)+/, ''));
+  // label -> the first quoted value seen for it (the top quote is our
+  // latest email; anything deeper is an older copy).
+  const quoted = new Map();
+  let quoting = false;
+  let open = null;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    // The poller appends attachment sections after the mail body, so
+    // nothing under the first marker is quoted mail.
+    if (/^=== ATTACHMENT: .+? \(/.test(raw)) break;
+    if (!quoting) {
+      // Another sender's header above ours: a reply to a reply. Nothing
+      // under it is this reply's news (see the note above).
+      if (reconfirmIsForeignQuoteHeader(bare, i)) return [];
+      if (reconfirmIsQuoteHeader(bare, i)) { quoting = true; open = null; continue; }
+      if (!/^\s*>/.test(raw)) { open = null; continue; }
+    }
+    const text = bare[i];
+    // A bare bullet ("  *", "•", "--") ends the value above it.
+    if (/^\s*[•*·-]+\s*$/.test(text) || !text.trim()) { open = null; continue; }
+    const bulleted = /^\s*[•*·-]\s/.test(text);
+    const body = collapseSpaces(text.replace(/^\s*[•*·-]\s*/, ''));
+    // "Label: value", with a bold marker a text rendering may leave
+    // around the label ("*Delivery*: ...").
+    const m = /^[*_]?([^:*_]{1,40}?)[*_]?\s*:\s*(.*)$/.exec(body);
+    const label = m ? labels.get(collapseSpaces(m[1]).toLowerCase()) : null;
+    if (label) {
+      const first = !quoted.has(label);
+      if (first) quoted.set(label, m[2]);
+      open = first ? label : null;
+      continue;
+    }
+    // A new bullet that is not one of our labels, or a line we printed
+    // ourselves under the list, ends the value above it; only an
+    // unbulleted wrapped tail continues it.
+    if (bulleted || isSentLine(body)) { open = null; continue; }
+    if (open) quoted.set(open, quoted.get(open) + ' ' + body);
+  }
+  const out = [];
+  for (const s of sent) {
+    if (!quoted.has(s.label)) continue;
+    const value = collapseSpaces(quoted.get(s.label));
+    const key = reconfirmValueKey(value);
+    // An emptied line is not an answer.
+    if (!key || key === reconfirmValueKey(s.value)) continue;
+    out.push({ label: s.label, value, placeholder: /\bplease\b/i.test(s.value) });
+  }
+  return out;
+}
+// The answers as "Label: value" lines: what the classifier puts ahead of
+// the reply's own words and what the time scan reads ahead of the email.
+export function reconfirmQuotedAnswerLines(rawText, sentBody) {
+  return quotedBulletAnswers(rawText, sentBody).map((a) => a.label + ': ' + a.value);
+}
+// The email as the time scan should read it: the answer lines first,
+// then the email as it came (extractArrivalTimes strips the quote itself
+// and keeps the lines above it). No answers: the email unchanged.
+export function reconfirmAnswerFirstText(rawText, sentBody) {
+  const lines = reconfirmQuotedAnswerLines(rawText, sentBody);
+  return lines.length ? lines.join('\n') + '\n' + String(rawText || '') : String(rawText || '');
+}
+
 // ── the reply classifier (plan section 5, contract section 2) ───────
 const RECONFIRM_CONFIRM_PHRASES = ['confirmed', 'confirm', 'looks good', 'all good', 'all set', 'sounds good', 'perfect', 'yes', 'correct', 'great', 'thanks', 'thank you', 'we are set', 'good to go'];
 const RECONFIRM_GREETING_RE = /^(hi|hello|hey|dear|good morning|good afternoon|good evening)( [a-z']+)?$/;
@@ -1767,8 +1936,10 @@ function reconfirmOpeningIsAutoReply(opening) {
 // kind: auto_reply | bounced | confirmed | time | changed. Nothing here
 // changes an order; a time goes to the proposal scan (Accept/Keep in the
 // app) and anything else goes to the owner as a card. client_name is the
-// order's customer name: the only words a signature may carry.
-export function classifyReconfirmationReply({ subject, from_addr, raw_text, client_name } = {}) {
+// order's customer name: the only words a signature may carry. sent_body
+// is the body we sent (order_reconfirmations.body) so answers typed
+// inside the quoted bullets are read; without it the quote is dropped.
+export function classifyReconfirmationReply({ subject, from_addr, raw_text, client_name, sent_body } = {}) {
   const subj = String(subject || '').trim();
   const from = String(from_addr || '').trim().toLowerCase();
   const stripped = stripQuotedText(raw_text);
@@ -1779,6 +1950,16 @@ export function classifyReconfirmationReply({ subject, from_addr, raw_text, clie
   }
   const local = (/([^<\s@]+)@/.exec(from) || [])[1] || '';
   if (/^(postmaster|mailer-daemon)$/.test(local) || /^undeliverable/i.test(subj)) return { kind: 'bounced', stripped };
+  // Answers typed inside our quoted bullets (Outlook, 2026-09-21) are the
+  // customer's words too. They go FIRST in the text the excerpt reads, so
+  // they survive the note's cap, and they make the reply a change whatever
+  // the top says: a plain "Confirmed" over a rewritten count is a change,
+  // and a time typed over "please tell us" reaches the owner as the change
+  // note here AND as a Time change? proposal (the proposal scan reads the
+  // same answers ahead of the email). With the quote untouched, or no
+  // quote at all, nothing below changes.
+  const answers = reconfirmQuotedAnswerLines(raw_text, sent_body);
+  if (answers.length) return { kind: 'changed', stripped: answers.join('\n') + '\n' + stripped, answers };
   // An attachment (a logo, a run of show) is content: never a plain confirmation.
   if (!stripped.includes('=== ATTACHMENT: ') && isPlainConfirmation(bodyOnly, client_name)) return { kind: 'confirmed', stripped };
   const times = extractArrivalTimes(stripped);
@@ -2230,7 +2411,9 @@ export async function runReconfirmationReplyScan(env) {
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
     const lo = addDays(dayInZone(nowMs, 'ny'), -1);
-    const sentRows = await fetchSb(env, RECONFIRM_TABLE + '?select=id,order_id,delivery_day,status,recipients,sent_conversation_id,sent_at,reply_kind,reply_intake_id' +
+    // body rides along (2026-09-21): the classifier reads the answers a
+    // customer types inside the quoted copy of it (quotedBulletAnswers).
+    const sentRows = await fetchSb(env, RECONFIRM_TABLE + '?select=id,order_id,delivery_day,status,recipients,sent_conversation_id,sent_at,reply_kind,reply_intake_id,body' +
       '&status=in.(sent,confirmed,changed)&delivery_day=gte.' + lo + '&order=id.asc&limit=500');
     if (!sentRows || !sentRows.length) return { counts, changedIntakeIds };
     // Rows Jarvis already filed as 'ignored' are read too: a bounce
@@ -2311,7 +2494,7 @@ export async function runReconfirmationReplyScan(env) {
         const market = marketKey(order && order.market);
         // The sender rule needs a delivery day today or later in the market.
         if (!byConversation && daysBetween(dayInZone(nowMs, market), row.delivery_day) < 0) continue;
-        const verdict = classifyReconfirmationReply({ ...intake, client_name: order && order.client_name });
+        const verdict = classifyReconfirmationReply({ ...intake, client_name: order && order.client_name, sent_body: row.body });
         const stamp = { reply_kind: verdict.kind, replied_at: nowIso, reply_intake_id: intake.id };
         // A plain confirmation closes the intake row from pending_review,
         // and from 'ignored' too when the thread match re-read it (the
@@ -2400,6 +2583,32 @@ export async function runReconfirmationReplyScan(env) {
     console.error('runReconfirmationReplyScan error:', e);
   }
   return { counts, changedIntakeIds };
+}
+// The sent reconfirmation bodies the proposal scan reads answers against
+// (2026-09-21), keyed by thread (sent_conversation_id, the id Microsoft
+// gave our sent email, stamped on every reply's intake row) and by the
+// reply link (reply_intake_id, the reply scan's own stamp, which runs
+// earlier in the same 5-minute pass). One bounded read over the orders in
+// hand. Mode off or a failed read answers empty maps, and the scan reads
+// every email as before.
+async function reconfirmSentBodies(env, orderIds) {
+  const out = { byConversation: new Map(), byIntake: new Map() };
+  const ids = [...new Set((orderIds || []).filter(Boolean))];
+  if (!ids.length || reconfirmMode(env) === 'off') return out;
+  const rows = await fetchSb(env, RECONFIRM_TABLE + '?select=order_id,sent_conversation_id,reply_intake_id,body&status=in.(sent,confirmed,changed)' +
+    '&order_id=in.(' + ids.map(encodeURIComponent).join(',') + ')&order=id.asc&limit=200');
+  for (const r of rows || []) {
+    if (!factText(r.body)) continue;
+    if (r.sent_conversation_id) out.byConversation.set(String(r.sent_conversation_id), r.body);
+    if (r.reply_intake_id != null) out.byIntake.set(Number(r.reply_intake_id), r.body);
+  }
+  return out;
+}
+// The body we sent on this intake's thread, or null when the email is
+// not a reply to a reconfirmation (then the time scan reads it as before).
+function reconfirmSentBodyFor(sentBodies, intake) {
+  const conv = factText(intake && intake.conversation_id);
+  return (conv && sentBodies.byConversation.get(conv)) || sentBodies.byIntake.get(Number(intake && intake.id)) || null;
 }
 
 // ── the 8am digest lines ────────────────────────────────────────────
@@ -8392,7 +8601,7 @@ async function runAddressFollowUps(env, counts, nowMs, nowIso) {
 // 400 retries once WITHOUT the two columns (read as null) with a logged
 // error, the fetchIntakeLive shape. Any other failure answers null.
 async function fetchProposalIntakes(env, since) {
-  const select = (withReplayColumns) => 'intake_messages?select=id,subject,raw_text,order_id,created_at,error_detail' +
+  const select = (withReplayColumns) => 'intake_messages?select=id,subject,raw_text,order_id,conversation_id,created_at,error_detail' +
     (withReplayColumns ? ',replayed_at,address_scanned_at' : '') + ',' +
     'orders!inner(id,client_name,client_email,market,venue,delivery_notes,delivery_at_utc,delivery_request,stage,invoice_fulfillment,external_invoice_id,event_start_at)' +
     '&status=eq.pending_review&order_id=not.is.null&classified_at=not.is.null' +
@@ -8433,6 +8642,13 @@ export async function runProposalScan(env) {
       const existing = await fetchSb(env, 'order_time_proposals?select=intake_id,status&intake_id=in.(' + ids + ')&limit=100');
       if (!existing) { console.error('proposal scan: proposals table missing or unreadable (migration 042?), nothing done'); return counts; }
       const have = new Set(existing.map((p) => Number(p.intake_id)));
+      // A reply to our reconfirmation email is read with the answers typed
+      // inside its quoted bullets first (2026-09-21): "arrival time:
+      // 1:15pm - 1:30pm" typed over "please tell us" proposes 1:15 PM
+      // exactly as a top-of-email "1:15pm" would. Only an email whose
+      // thread or reply link names a sent row; every other email is read
+      // as before.
+      const sentBodies = await reconfirmSentBodies(env, rows.map((r) => r.order_id));
       for (const row of rows.slice().reverse()) {
         counts.seen++;
         try {
@@ -8466,7 +8682,13 @@ export async function runProposalScan(env) {
             const dr = o.delivery_request && typeof o.delivery_request === 'object' ? o.delivery_request : null;
             const onFileText = dr && dr.status === 'confirmed' ? String(dr.window || '').trim() : '';
             const onFileParsed = onFileText ? parseArrivalTime(onFileText, day, marketZone(market)) : null;
-            const times = extractArrivalTimes(row.raw_text);
+            const sentBody = reconfirmSentBodyFor(sentBodies, row);
+            // The reply's own words first: a fresh "2pm instead?" at the top
+            // beats an answer inside the quoted bullets, so a second reply
+            // on the thread never proposes the first reply's time again.
+            // Only an email with no time of its own reads the answers.
+            let times = extractArrivalTimes(row.raw_text);
+            if (!times.length && sentBody) times = extractArrivalTimes(reconfirmAnswerFirstText(row.raw_text, sentBody));
             if (!times.length) {
               // Linked but no readable time: tell the owner once, mark the row.
               // A replayed row gets no such banner (old mail is not news).

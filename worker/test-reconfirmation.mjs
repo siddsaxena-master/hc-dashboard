@@ -1567,7 +1567,50 @@ const OLD_BODY = [
   const replayedReply = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID)], intakes: [intake(70, { raw_text: 'Confirmed' + quote, replayed_at: '2026-09-15T13:00:00Z' })] });
   assert.equal(replayedReply.result.counts.seen, 0); assert.equal(replayedReply.h.row(1).status, 'sent'); assert.equal(replayedReply.h.pushes().length, 0);
   assert.equal(replayedReply.h.intakes.get(70).status, 'pending_review', 'never stamped or dismissed');
-  pass('reply step: confirmed (stamp, dismiss, one push), time (left to the proposal scan), changed (safe excerpt, card line), auto reply, bounce via conversation id (from an ignored row too, two days back), sender rule needs arrival after the send, the customer name gates the signature (a title or a buried answer under it is a change), a worker-flagged changed row only takes the stamp, no match, second thanks quiet, newest-first read walked oldest first (the last reply wins), the belt re-opens an ignored thread reply for its card, a replayed row is never read');
+  // Answers typed INSIDE the quoted copy of our email (Outlook, Allie
+  // Sugano, 2026-09-21): the row's own body (case B, both asks) is what
+  // the answers are read against, so the read carries it. The reply's top
+  // says only "Added the details below!"; the arrival time and the site
+  // contact sit in the quote, Outlook's "  *" then the line under it. The
+  // row becomes changed and the note carries the answers FIRST (the phone
+  // blanked), then the customer's own words, inside the excerpt's cap.
+  const askBody = reconfirmTemplate(reconfirmFacts(order({ delivery_request: null }), { deliveryDay: '2026-09-19' }), { ownerCell: CELL, picture: null, today: '2026-09-15', deliveryDay: '2026-09-19' }).body;
+  assert.ok(askBody.includes('• Delivery: Saturday, September 19, arrival time: please tell us') && askBody.includes('• On site contact: please send a name and cell'), askBody);
+  const outlook = (top, edits) => [top, '', 'From: Sidd Saxena <sidd@hamptonscoconuts.com>', 'Date: Tuesday, September 15, 2026 at 10:06 AM', 'To: Jamie Rivera <jamie@example.invalid>', 'Subject: Your coconuts for Saturday, September 19: quick check', '']
+    .concat(askBody.split('\n').map((l) => { const m = /^• ([^:]+): (.*)$/.exec(l); return !m ? l : m[1] in edits ? '  *\r\n' + m[1] + ': ' + edits[m[1]] : '  *   ' + m[1] + ': ' + m[2]; })).join('\r\n');
+  const answered = outlook('Hi Sidd!\r\n\r\nAdded the details below! Thank you', { Delivery: 'Saturday, September 19, arrival time: 1:15pm - 1:30pm', 'On site contact': 'Jamie, 6315550177' });
+  const quotedAnswers = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID, { body: askBody })], intakes: [intake(80, { raw_text: answered })] });
+  assert.equal(quotedAnswers.result.counts.changed, 1); assert.deepEqual([...quotedAnswers.result.changedIntakeIds], [80]);
+  assert.equal(quotedAnswers.h.row(1).status, 'changed'); assert.equal(quotedAnswers.h.row(1).reply_kind, 'changed'); assert.equal(quotedAnswers.h.row(1).reply_intake_id, 80);
+  assert.equal(quotedAnswers.h.row(1).change_note, 'reply: ' + 'Delivery: Saturday, September 19, arrival time: 1:15pm - 1:30pm On site contact: Jamie, [phone] Hi Sidd! Added the details below! Thank you'.slice(0, 120));
+  assert.ok(quotedAnswers.h.row(1).change_note.startsWith('reply: Delivery: Saturday, September 19, arrival time: 1:15pm - 1:30pm On site contact: Jamie, [phone]'));
+  assert.equal(quotedAnswers.h.intakes.get(80).status, 'pending_review', 'left for its card and the proposal scan'); assert.equal(quotedAnswers.h.pushes().length, 0);
+  assert.ok(quotedAnswers.h.reads('order_reconfirmations')[0].url.includes(',reply_intake_id,body&'), 'the read carries the sent body');
+  // The same reply against a row with no usable body reads as it did
+  // before the fix: the one sentence, and nothing from the quote.
+  const noBody = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID, { body: null })], intakes: [intake(81, { raw_text: answered })] });
+  assert.equal(noBody.h.row(1).status, 'changed'); assert.equal(noBody.h.row(1).change_note, 'reply: Hi Sidd! Added the details below! Thank you');
+  // "Confirmed" over the untouched Outlook quote is still a confirmation
+  // with the body on the row; over a rewritten Count it is a change.
+  const untouched = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID, { body: askBody })], intakes: [intake(82, { raw_text: outlook('Confirmed, thanks!', {}) })] });
+  assert.equal(untouched.result.counts.confirmed, 1); assert.equal(untouched.h.row(1).status, 'confirmed'); assert.equal(untouched.h.intakes.get(82).status, 'dismissed');
+  const countMoved = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID, { body: askBody })], intakes: [intake(83, { raw_text: outlook('Confirmed, thanks!', { Count: '120 coconuts' }) })] });
+  assert.equal(countMoved.result.counts.changed, 1); assert.equal(countMoved.h.row(1).status, 'changed'); assert.equal(countMoved.h.row(1).change_note, 'reply: Count: 120 coconuts Confirmed, thanks!');
+  assert.equal(countMoved.h.intakes.get(83).status, 'pending_review'); assert.equal(countMoved.h.pushes().length, 0);
+  // The customer's SECOND reply quotes her first one, edited bullets and
+  // all, under her own header (review finding, 2026-09-21): those answers
+  // are never read again. "Perfect, thank you!" through Gmail confirms
+  // the row (it read as a change and re-proposed the old time before);
+  // "2pm instead?" through Outlook is a time for the proposal scan.
+  const gmailSecond = 'Perfect, thank you!\r\n\r\nOn Tue, Sep 15, 2026 at 11:00 AM Jamie Rivera <jamie@example.invalid> wrote:\r\n' + answered.split('\r\n').map((l) => '> ' + l).join('\r\n');
+  const secondThanks = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID, { body: askBody })], intakes: [intake(84, { raw_text: gmailSecond })] });
+  assert.equal(secondThanks.result.counts.confirmed, 1); assert.equal(secondThanks.h.row(1).status, 'confirmed'); assert.equal(secondThanks.h.row(1).reply_kind, 'confirmed');
+  assert.equal(secondThanks.h.intakes.get(84).status, 'dismissed'); assert.equal(secondThanks.h.pushes().length, 1);
+  const outlookSecond = ['Sorry, can the delivery be 2pm instead?', '', 'From: Jamie Rivera <jamie@example.invalid>', 'Sent: Tuesday, September 15, 2026 11:00 AM', 'To: Sidd Saxena <sidd@hamptonscoconuts.com>', 'Subject: Re: Your coconuts for Saturday, September 19: quick check', '', answered].join('\r\n');
+  const secondTime = await replyScanAt(NOW, ENV_PREVIEW, { orders: [order()], rows: [sentRow(1, ORDER_ID, { body: askBody })], intakes: [intake(85, { raw_text: outlookSecond })] });
+  assert.equal(secondTime.result.counts.time, 1); assert.equal(secondTime.h.row(1).status, 'sent'); assert.equal(secondTime.h.row(1).reply_kind, 'time');
+  assert.equal(secondTime.h.intakes.get(85).status, 'pending_review', 'left for the proposal scan'); assert.equal(secondTime.h.pushes().length, 0);
+  pass('reply step: confirmed (stamp, dismiss, one push), time (left to the proposal scan), changed (safe excerpt, card line), auto reply, bounce via conversation id (from an ignored row too, two days back), sender rule needs arrival after the send, the customer name gates the signature (a title or a buried answer under it is a change), a worker-flagged changed row only takes the stamp, no match, second thanks quiet, newest-first read walked oldest first (the last reply wins), the belt re-opens an ignored thread reply for its card, a replayed row is never read, answers typed inside the quoted bullets (Outlook) make the row changed with the answers first in the note (a row with no body reads as before; Confirmed over an untouched quote stays confirmed, over a rewritten count is a change), a second reply quoting the first one under the customer\'s own header re-reads nothing (Gmail thanks confirms, an Outlook 2pm is a time)');
 }
 
 // ── 15. The digest line ─────────────────────────────────────────────

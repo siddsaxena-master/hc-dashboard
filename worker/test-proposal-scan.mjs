@@ -9,7 +9,7 @@
 // only inside the PDF, the order on file saying 3:30/4 PM.
 
 import assert from 'node:assert/strict';
-import { runProposalScan, runStillWaitingScan, runDeparturePlanScan, proposalTexts, linkedNoTimeReason, addressProposalsOn, addressPlaceWords } from './worker.js';
+import { runProposalScan, runStillWaitingScan, runDeparturePlanScan, proposalTexts, linkedNoTimeReason, addressProposalsOn, addressPlaceWords, extractArrivalTimes, reconfirmAnswerFirstText } from './worker.js';
 
 let passed = 0;
 const pass = (m) => { passed++; console.log('PASS: ' + m); };
@@ -182,6 +182,9 @@ function harness(opts = {}) {
     }
     if (method === 'POST' && path === 'push_queue') return reply(201, null);
     if (method === 'GET' && path.startsWith('push_queue?id=eq.')) return reply(200, []);
+    // The sent reconfirmation rows the scan reads quoted answers against
+    // (case 25, 2026-09-21): read only with RECONFIRM_MODE on.
+    if (method === 'GET' && path.startsWith('order_reconfirmations?')) return reply(200, opts.reconfirmations || []);
     throw new Error('unexpected offline fetch: ' + method + ' ' + url);
   };
   return {
@@ -1083,6 +1086,147 @@ const addressPosts = (h) => h.queuePosts().filter((q) => q.payload.body.kind ===
     assert.equal(h.queuePosts()[0].payload.aps.alert.body, 'A customer email gives a drop off address in Englewood, NJ; the invoice says Englewood, NJ. Open Needs you to Accept or Keep.');
   } finally { h.restore(); }
   pass('repeat by the AGREE test: the address re-quoted without its ZIP or direction word is a repeat against a pending, kept or accepted row (the Accept-able row stands, no Dismiss-only row beside it); only a pending row with no ZIP is superseded by an email that brings the ZIP; a direction correction (N for S) is another house, proposed and never a silent agree');
+}
+
+// ── 25. A time typed inside the quoted reconfirmation bullets ────────
+// 2026-09-21: Allie Sugano answered our reconfirmation email by typing
+// "1:15pm - 1:30pm" over "please tell us" INSIDE the quoted copy (Outlook,
+// intake 68785). The extractor strips the quote, so the scan sent the
+// "Coordinator email" banner instead of a Time change? proposal. Now an
+// email on a sent reconfirmation's thread (sent_conversation_id, or the
+// reply scan's reply_intake_id stamp) is read with the answers first.
+// Phones and emails are 555 numbers and example.invalid; the shape is
+// the poller's, byte for byte. The full helper is pinned in
+// test-quoted-answers.mjs.
+{
+  const SUGANO_ID = '99999999-9999-4999-8999-999999999999';
+  const sugano = { id: SUGANO_ID, client_name: 'Allie Sugano', client_email: 'allie@example.invalid', market: 'ny', venue: null, delivery_notes: null, delivery_at_utc: '2026-09-23T00:00:00+00:00', stage: 'paid_full', delivery_request: null, invoice_fulfillment: null, external_invoice_id: null, event_start_at: null };
+  const sentBody = ['Hi Allie,', '', 'Just sending the final details for reconfirmation. Two things we still need: what time our driver should arrive and who they should call on site. Once we have those two items, we are set.', '',
+    '• Delivery: Wednesday, September 23, arrival time: please tell us', '• Drop off: 24 Spring St., New York, NY, 10012, US', '• Count: 40 coconuts', '• Cracking: straw hole pre-cracked, ready for straws', '• On site contact: please send a name and cell', '• Your contact: Sidd, 732.555.0199', '',
+    'We brand and box on Tuesday, September 22, the day before, so changes need to reach us today.', '', 'Thanks so much,', 'Sidd', 'Hamptons Coconuts'].join('\n');
+  const raw = 'Hi Sidd!\r\n\r\nAdded the details below! Thank you \r\n\r\n[photo]<https://example.invalid/>\r\nAllie Sugano\r\nDirector, Retail & Brand Activation\r\n[icon] + 1 (949) 555-0123<tel:714.555.0167>\r\n\r\nFrom: Sidd Saxena <sidd@hamptonscoconuts.com>\r\nDate: Sunday, September 20, 2026 at 12:02 PM\r\nTo: Allie Sugano <allie@example.invalid>\r\nSubject: Your coconuts for Wednesday, September 23: quick check\r\n\r\n\r\nHi Allie,\r\n\r\n\r\n\r\nJust sending the final details for reconfirmation. Two things we still need: what time our driver should arrive and who they should call on site. Once we have those two items, we are set.\r\n\r\n\r\n\r\n  *\r\nDelivery: Wednesday, September 23, arrival time: 1:15pm - 1:30pm\r\n  *   Drop off: 24 Spring St., New York, NY, 10012, US\r\n  *   Count: 40 coconuts\r\n  *   Cracking: straw hole pre-cracked, ready for straws\r\n  *\r\nOn site contact: Allie, 9495550123\r\n  *   Your contact: Sidd, 732.555.0199\r\n\r\n\r\n\r\nWe brand and box on Tuesday, September 22, the day before, so changes need to reach us today.\r\n\r\n\r\n\r\nThanks so much,\r\n\r\nSidd\r\n\r\nHamptons Coconuts';
+  const suganoIntake = (extra = {}) => ({ id: 68785, subject: 'Re: Your coconuts for Wednesday, September 23: quick check', raw_text: raw, order_id: SUGANO_ID, conversation_id: 'conv-sugano', created_at: '2026-09-21T13:31:00+00:00', error_detail: null, orders: sugano, ...extra });
+  const sentRow = (extra = {}) => ({ id: 2, order_id: SUGANO_ID, status: 'changed', sent_conversation_id: 'conv-sugano', reply_intake_id: null, body: sentBody, ...extra });
+  const ENV_RECONFIRM = { ...ENV, RECONFIRM_MODE: 'auto' };
+  const NOW = '2026-09-21T13:35:00Z';
+  // The thread match: one proposal, 1:15 PM, the answered line as evidence, one owner and one manager banner.
+  let h = harness({ intakes: [suganoIntake()], reconfirmations: [sentRow()] });
+  try {
+    const counts = await at(NOW, () => runProposalScan(ENV_RECONFIRM));
+    assert.equal(counts.proposed, 1); assert.equal(counts.noTime, 0);
+    const p = h.proposals.get(68785);
+    assert.equal(p.order_id, SUGANO_ID); assert.equal(p.proposed_label, '1:15 PM');
+    assert.equal(p.proposed_arrive_at, '2026-09-23T17:15:00.000Z');
+    assert.equal(p.evidence_line, 'Delivery: Wednesday, September 23, arrival time: 1:15pm - 1:30pm'); assert.equal(p.evidence_where, 'body');
+    assert.equal(p.on_file_window, null);
+    const posts = h.queuePosts();
+    assert.equal(posts.length, 2);
+    const owner = posts.find((q) => q.payload.tokens.includes('owner-token'));
+    assert.equal(owner.payload.aps.alert.title, 'Time change? Sugano, Wed Sep 23');
+    assert.equal(owner.payload.aps.alert.body, 'A coordinator email says arrive 1:15 PM (email: "Delivery: Wednesday, September 23, arrival time: 1:15pm - 1:30pm"). On file: no clock time. Open Needs you to Accept or Keep. Until you decide, the alarm uses 1:15 PM.');
+    for (const q of posts) { assert.ok(!q.payload.aps.alert.body.includes('555'), 'no phone in a banner'); assert.equal(q.payload.body.kind, 'time_change'); }
+    assert.equal(h.intakes.get(68785).error_detail, null, 'never marked linked_no_time');
+    // One bounded read of the sent rows, by the orders in hand, with the body.
+    const read = h.calls.find((c) => c.url.includes('/order_reconfirmations?'));
+    assert.ok(read.url.includes('select=order_id,sent_conversation_id,reply_intake_id,body&status=in.(sent,confirmed,changed)&order_id=in.(' + SUGANO_ID + ')'), read.url);
+    assert.equal(h.calls.filter((c) => c.url.includes('/order_reconfirmations?')).length, 1);
+  } finally { h.restore(); }
+  // The reply scan's own link (reply_intake_id) matches too when the
+  // intake carries no conversation id.
+  h = harness({ intakes: [suganoIntake({ conversation_id: null })], reconfirmations: [sentRow({ reply_intake_id: 68785 })] });
+  try {
+    const counts = await at(NOW, () => runProposalScan(ENV_RECONFIRM));
+    assert.equal(counts.proposed, 1); assert.equal(h.proposals.get(68785).proposed_label, '1:15 PM');
+  } finally { h.restore(); }
+  // The bug as it stood, and the narrow rule: the same email with no sent
+  // row on its thread (another conversation, or none at all) is read as
+  // before, "Coordinator email", no proposal; with the mode off the sent
+  // rows are never read at all.
+  h = harness({ intakes: [suganoIntake()], reconfirmations: [sentRow({ sent_conversation_id: 'conv-other' })] });
+  try {
+    const counts = await at(NOW, () => runProposalScan(ENV_RECONFIRM));
+    assert.equal(counts.proposed, 0); assert.equal(counts.noTime, 1); assert.ok(!h.proposals.has(68785));
+    assert.equal(h.queuePosts().length, 1); assert.equal(h.queuePosts()[0].payload.aps.alert.title, 'Coordinator email: Sugano, Wed Sep 23');
+    assert.ok(String(h.intakes.get(68785).error_detail).startsWith('linked_no_time notified '));
+  } finally { h.restore(); }
+  h = harness({ intakes: [suganoIntake()], reconfirmations: [] });
+  try {
+    const counts = await at(NOW, () => runProposalScan(ENV_RECONFIRM));
+    assert.equal(counts.proposed, 0); assert.equal(counts.noTime, 1);
+  } finally { h.restore(); }
+  h = harness({ intakes: [suganoIntake()], reconfirmations: [sentRow()] });
+  try {
+    const counts = await at(NOW, () => runProposalScan(ENV));
+    assert.equal(counts.proposed, 0); assert.equal(counts.noTime, 1);
+    assert.equal(h.calls.filter((c) => c.url.includes('/order_reconfirmations?')).length, 0, 'mode off: the sent rows are never read');
+  } finally { h.restore(); }
+  // An untouched quote on the thread proposes nothing: our own "please
+  // tell us" and a 3:30 PM we printed ourselves are never the answer.
+  const untouched = raw.replace('  *\r\nDelivery: Wednesday, September 23, arrival time: 1:15pm - 1:30pm', '  *   Delivery: Wednesday, September 23, arrival time: please tell us').replace('  *\r\nOn site contact: Allie, 9495550123', '  *   On site contact: please send a name and cell');
+  h = harness({ intakes: [suganoIntake({ raw_text: untouched })], reconfirmations: [sentRow()] });
+  try {
+    const counts = await at(NOW, () => runProposalScan(ENV_RECONFIRM));
+    assert.equal(counts.proposed, 0); assert.equal(counts.noTime, 1); assert.ok(!h.proposals.has(68785));
+  } finally { h.restore(); }
+  pass('Allie (2026-09-21): a time typed over "please tell us" inside the quoted bullets makes the 1:15 PM Time change? proposal with the answered line as evidence (thread match, or the reply link), one read of the sent rows; no sent row on the thread, mode off, or an untouched quote reads as before (Coordinator email, no proposal)');
+
+  // ── 26. The reply's own words beat the quoted answers ──────────────
+  // Review finding (2026-09-21): the answered lines went ahead of the
+  // email for every reconfirmation thread, so a second reply, which
+  // quotes the first one with its edited bullets under the customer's
+  // own header, proposed the OLD 1:15 PM again: over a fresh "2pm
+  // instead?" (both rank 2, the earlier clock wins) and even under
+  // "Perfect, thank you!" (retiring the pending 1:15 PM row and pushing
+  // the banner twice). Now the email is read on its own first and the
+  // answers only when it has no time of its own; and a header that is
+  // not ours above ours answers nothing (test-quoted-answers.mjs 11).
+  // A fresh time at the top of the FIRST reply, beside an answer typed in
+  // the bullet, both lines at the same rank ("delivery" alone, no
+  // "coconut"): the top wins (before, 1:15 PM did on the earliest tie:
+  // the answer-first text reads [1:15 PM, 2:00 PM]).
+  const topAndBullet = raw.replace('Added the details below! Thank you ', 'Actually, can we do 2pm for the delivery? Details below too.');
+  assert.deepEqual(extractArrivalTimes(reconfirmAnswerFirstText(topAndBullet, sentBody)).map((t) => t.label), ['1:15 PM', '2:00 PM'], 'the tie the guard exists for');
+  h = harness({ intakes: [suganoIntake({ raw_text: topAndBullet })], reconfirmations: [sentRow()] });
+  try {
+    const counts = await at(NOW, () => runProposalScan(ENV_RECONFIRM));
+    assert.equal(counts.proposed, 1); assert.equal(h.proposals.get(68785).proposed_label, '2:00 PM');
+    assert.equal(h.proposals.get(68785).evidence_line, 'Actually, can we do 2pm for the delivery? Details below too.');
+  } finally { h.restore(); }
+  // The second reply, Outlook: her From: block over the first reply. The
+  // first reply's proposal (1:15 PM) is pending and its intake decided.
+  const pending115 = () => ({ intake_id: 68785, order_id: SUGANO_ID, proposed_arrive_at: '2026-09-23T17:15:00+00:00', proposed_label: '1:15 PM', status: 'pending' });
+  const second = (top, viaGmail) => viaGmail
+    ? top + '\r\n\r\nOn Mon, Sep 21, 2026 at 9:31 AM Allie Sugano <allie@example.invalid> wrote:\r\n' + raw.split('\r\n').map((l) => '> ' + l).join('\r\n')
+    : [top, '', 'From: Allie Sugano <allie@example.invalid>', 'Sent: Monday, September 21, 2026 9:31 AM', 'To: Sidd Saxena <sidd@hamptonscoconuts.com>', 'Subject: Re: Your coconuts for Wednesday, September 23: quick check', '', raw].join('\r\n');
+  const LATER = '2026-09-21T13:45:00Z';
+  h = harness({
+    intakes: [{ ...suganoIntake(), status: 'dismissed' }, suganoIntake({ id: 68786, raw_text: second('Sorry, can the delivery be 2pm instead?', false), created_at: '2026-09-21T13:41:00+00:00' })],
+    proposals: [pending115()], reconfirmations: [sentRow()],
+  });
+  try {
+    const counts = await at(LATER, () => runProposalScan(ENV_RECONFIRM));
+    assert.equal(counts.proposed, 1); assert.equal(counts.noTime, 0);
+    assert.equal(h.proposals.get(68786).proposed_label, '2:00 PM', 'the fresh 2pm, never the quoted 1:15');
+    assert.equal(h.proposals.get(68786).evidence_line, 'Sorry, can the delivery be 2pm instead?');
+    assert.equal(h.proposals.get(68785).status, 'superseded'); assert.equal(h.proposals.get(68785).decided_via, 'newer_email');
+    const owner = h.queuePosts().find((q) => q.payload.tokens.includes('owner-token'));
+    assert.ok(owner.payload.aps.alert.body.startsWith('A coordinator email says arrive 2:00 PM'), owner.payload.aps.alert.body);
+  } finally { h.restore(); }
+  // The second reply, Gmail: "Perfect, thank you!" over the first reply
+  // (in the live chain the reply scan confirms and dismisses it first;
+  // here it reaches the scan as a linked email). Nothing is re-proposed,
+  // the pending 1:15 PM row stands, and no Time change? banner goes out.
+  h = harness({
+    intakes: [{ ...suganoIntake(), status: 'dismissed' }, suganoIntake({ id: 68786, raw_text: second('Perfect, thank you!', true), created_at: '2026-09-21T13:41:00+00:00' })],
+    proposals: [pending115()], reconfirmations: [sentRow()],
+  });
+  try {
+    const counts = await at(LATER, () => runProposalScan(ENV_RECONFIRM));
+    assert.equal(counts.proposed, 0); assert.ok(!h.proposals.has(68786), 'nothing re-proposed');
+    assert.equal(h.proposals.get(68785).status, 'pending', 'the first reply\'s proposal stands');
+    assert.ok(h.queuePosts().every((q) => q.payload.body.kind !== 'time_change'), 'no second Time change? banner');
+  } finally { h.restore(); }
+  pass('the reply\'s own words first: a 2pm at the top beats a 1:15 typed in the bullet; a second reply on the thread (Outlook From: block, Gmail wrote: line) never re-proposes the first reply\'s 1:15 PM: "2pm instead" proposes 2:00 PM and retires the 1:15 row as newer_email, "Perfect, thank you!" proposes nothing and leaves it pending');
 }
 
 console.log(`\nPASS: ${passed} proposal checks. No network, no database, no phone.`);
