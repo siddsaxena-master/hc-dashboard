@@ -628,7 +628,9 @@ tracked. The word is PASSED, never lost (Sidd). Built on
   order_departures row until plan_date passes; the anon lane (pre-020) can
   read the passed note like every other orders column.
 
-## Customer artwork from email (migration 048, BUILT LOCALLY 2026-09-21, NOT applied, NOT deployed)
+## Customer artwork from email (migration 048, APPLIED 2026-09-21 ~22:45 UTC; worker and Jarvis NOT yet deployed)
+
+APPLIED 2026-09-21 on Sidd's "yes do it" for step 1 (sha1 f9d43961076f0e0a53c57afb9db4bc39888d8bbc, 61,123 bytes, commit bb195a6, six base64 pieces into localStorage hc048, sha1 checked in page and again after monaco setValue, Run clicked by coordinate, "Potential issue detected" dialog confirmed via javascript, "Success. No rows returned"). The first attempt (sha1 9faada18) was REFUSED by its own preflight because the live hc_can_read_order_logo was pasted on 2026-09-06 with different line breaks than the 035 file; bb195a6 compares the helper with all whitespace removed (rehearsal 106 scenarios). Verified from the droplet (scratchpad verify048.py): order_artwork_proposals 200 [] with the service key and 401 with no bearer, intake_messages.email_meta + artwork_scanned_at 200, hc_decide_proposed_artwork and hc_approve_order_artwork 403/42501 service + 401 no-bearer (present, locked to signed-in owners), 047 passed column 200, 045 proposals 200, 035 helper present. Droplet check before it: Pillow 12.2.0 installed, Ghostscript 10.02.1, both hand-imported logo records present. STILL TO DO after this header: PATCH usage to 'Coconut' on files[0] of Alison's and Allie's logo_asset (Approve refuses free text), worker deploy from bb195a6, the Jarvis PR, the two switches.
 
 Plan: `../PHASE3-ARTWORK-PLAN-2026-09-21.md` (sections 3, 5b and 7 are this
 repo's half; the standing artwork rules live in
