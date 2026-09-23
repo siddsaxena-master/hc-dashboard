@@ -35,6 +35,10 @@ crons = [
 #   this version. pushdrain must have the same current key before Worker rollout.
 # WEBHOOK_OUTBOX_ENCRYPTION_KEY_PREVIOUS - Optional pushdrain-only value in the
 #   same format. Keep it during rotation until every old queue row is finished.
+# The WEBHOOK_OUTBOX_* keys serve Formspree and Quo alerts only. Since
+#   2026-09-22 (Sidd: no Telegram alerts for forwarded email) the ms-graph path
+#   writes lead rows and notes only and never reads them
+#   (MS_GRAPH_TELEGRAM_ALERTS in worker.js).
 # TG_WEBHOOK_SECRET - REQUIRED (2026-07-25 security review). Any long
 #   random string. The root webhook now returns 503 before parsing when this
 #   secret is missing. Once set, the worker requires

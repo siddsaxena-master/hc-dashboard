@@ -4399,7 +4399,7 @@ Extract structured booking info. Respond with ONLY valid JSON, no markdown:
   "event_date": "YYYY-MM-DD if mentioned, else null",
   "headcount": "number if mentioned, else null",
   "venue": "venue name if mentioned, else null",
-  "market": "ny | miami | other",
+  "market": "ny | miami | vegas | other",
   "notes": "any other useful context the operator should see",
   "summary": "one-sentence summary for Telegram alert"
 }`;
@@ -4457,7 +4457,7 @@ async function handleFormspreeWebhook(request, env) {
           event_tz: 'America/New_York',
           headcount: parseInt(extracted.headcount) || null,
           venue: extracted.venue || null,
-          market: ['ny','miami','other'].includes(extracted.market) ? extracted.market : 'ny',
+          market: ['ny','miami','vegas','other'].includes(extracted.market) ? extracted.market : 'ny',
           stage: 'inquiry',
           source: 'website',
           notes: extracted.notes || null,
@@ -4682,7 +4682,8 @@ function _scrubOperatorEmail(email) {
 //     possible duplicate. Forwards (FW:/FWD:) and first-contact replies are
 //     never suppressed: the owner forwards leads to himself on purpose, and
 //     prospects answer his outreach with "RE:".
-// Suppression never silences the Telegram alert; it only stops ghost rows.
+// Suppression only stops ghost rows (the ms-graph path sends no Telegram
+// alert at all since 2026-09-22, see MS_GRAPH_TELEGRAM_ALERTS).
 // Exported for worker/test-lead-dedupe.mjs.
 const OPEN_LEAD_STAGES = new Set(['inquiry', 'quoted']);
 const INVOICED_STAGES = new Set(['invoiced', 'deposit_paid', 'paid_full', 'fulfilled']);
@@ -4843,8 +4844,8 @@ export function rowDomainMatches(row, domain) {
 
 // Best-effort, idempotent note append on an existing lead (dedupe rule 2).
 // The receipt id is embedded so a re-claimed delivery never appends twice.
-// A failure here must never fail the webhook delivery: the alert still
-// goes out.
+// A failure here must never fail the webhook delivery: it is logged and
+// the delivery completes.
 async function appendLeadNote(env, row, text, receiptId) {
   try {
     const notes = ((row && row.notes) || '').trim();
@@ -4936,6 +4937,16 @@ async function handleMsGraphWebhook(request, env, url) {
     return webhookFailureResponse('Microsoft Graph', e);
   }
 }
+
+// Owner decision 2026-09-22 (Sidd): NO Telegram alerts for forwarded email.
+// His Claudia intake cards (Invoice it / Skip) already cover every lead, so
+// the ms-graph path writes lead rows and notes only and never queues an
+// alert, whatever the classifier category, should_alert, suppression or
+// sibling outcome. It therefore never needs the WEBHOOK_OUTBOX_* keys.
+// Formspree and Quo still alert through enqueueWebhookTelegramAlerts.
+// Pinned in worker/test-webhook-security.mjs; turn on only on Sidd's say-so
+// (and only once the outbox keys are set, or every delivery 503s).
+const MS_GRAPH_TELEGRAM_ALERTS = false;
 
 async function processMsGraphNotification(env, eventKey, notification) {
   return processWebhookDelivery(
@@ -5068,7 +5079,7 @@ async function processMsGraphNotification(env, eventKey, notification) {
           event_tz: 'America/New_York',
           headcount: parseInt(lead.headcount) || null,
           venue: lead.venue || null,
-          market: ['ny','miami','other'].includes(lead.market) ? lead.market : 'ny',
+          market: ['ny','miami','vegas','other'].includes(lead.market) ? lead.market : 'ny',
           stage: 'inquiry',
           source: 'website',
           notes: 'Email lead via MS Graph: ' +
@@ -5082,9 +5093,11 @@ async function processMsGraphNotification(env, eventKey, notification) {
         }, 'Microsoft Graph');
       }
 
-      // A suppressed lead is ALWAYS surfaced, even when the classifier said
-      // should_alert:false: the row used to be the backstop for that case.
-      if (cls.should_alert || suppressedReason || siblingLeadId) {
+      // Off since 2026-09-22 (MS_GRAPH_TELEGRAM_ALERTS): the delivery ends
+      // here with the lead row or note written and nothing queued.
+      // When on, a suppressed lead is ALWAYS surfaced, even when the classifier
+      // said should_alert:false: the row used to be the backstop for that case.
+      if (MS_GRAPH_TELEGRAM_ALERTS && (cls.should_alert || suppressedReason || siblingLeadId)) {
         const safeFromEmail = _scrubOperatorEmail(cls.from_email);
         const emoji = {
           lead_inquiry: '🌱',

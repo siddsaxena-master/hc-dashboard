@@ -223,6 +223,29 @@ PostgreSQL 17.6 as of 2026-09-10. Run `select version()` before any future run.
   in the cold-email repo; the `invoice / show / skip` commands in
   hc-invoice-bot.
 
+## MS Graph webhook: lead rows only, no Telegram (Sidd, 2026-09-22)
+
+- Sidd decided 2026-09-22: NO Telegram alerts for forwarded mail. His
+  Claudia intake cards (Invoice it / Skip) already cover every lead. The
+  ms-graph path (`/webhooks/ms-graph`, queued in `webhook_intake_queue`,
+  drained by `runWebhookIntakeScan` on the */5 cron) keeps the Emma mute,
+  the Haiku classifier and the lead dedupe guard, and writes lead rows
+  (stage inquiry, source website) and follow-up notes ONLY. It never queues
+  an alert, whatever the category, should_alert, suppression or sibling
+  outcome (`MS_GRAPH_TELEGRAM_ALERTS = false` in worker.js).
+- So ms-graph does NOT need `WEBHOOK_OUTBOX_ID_KEY` or
+  `WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT` (neither is set; before this change
+  an accepted forward would 503 after writing its row and retry for ever
+  with a fresh Haiku call each time). Formspree and Quo still alert through
+  `enqueueWebhookTelegramAlerts` and still need both keys.
+- Webhook lead rows accept market `vegas` (ms-graph and Formspree); ny,
+  miami and other are unchanged, anything else still becomes ny.
+- Same day, poller side (hc-invoice-bot outlook_poller.py): leave Sidd's
+  inbox alone, never mark a forwarded email read.
+- Pinned in `node worker/test-webhook-security.mjs` (every ms-graph case
+  runs with both outbox keys absent). Ships with the next worker deploy,
+  its own "yes do it".
+
 ## Current uncommitted state (as of 2026-07-07)
 
 index.html has the one-line pending-payment fix described above staged

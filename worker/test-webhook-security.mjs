@@ -146,6 +146,7 @@ function installFetchHarness(config = {}) {
     receipts: new Map(),
     orders: new Map(),
     orderAttempts: [],
+    orderPatches: [],
     pushQueue: new Map(),
     pushAttempts: [],
     aiMessages: [],
@@ -354,6 +355,24 @@ function installFetchHarness(config = {}) {
         throw new Error('simulated lost order insert response after commit');
       }
       return new Response(null, { status: 201 });
+    }
+
+    // The ms-graph lead dedupe guard reads rows by client_email (or by
+    // company domain) and appends follow-up notes with a PATCH. Serve both
+    // from config.existingOrders so the suppressed and sibling cases run end
+    // to end; the worker post-filters on exact address equality itself.
+    if (url.startsWith('https://sandbox.supabase.test/rest/v1/orders?select=')) {
+      const needle = String(new URL(url).searchParams.get('client_email') || '')
+        .replace(/^ilike\./, '').replace(/\*/g, '').replace(/\\(.)/g, '$1')
+        .toLowerCase();
+      return jsonReply(200, (config.existingOrders || []).filter((row) =>
+        String(row.client_email || '').toLowerCase().includes(needle)));
+    }
+
+    if (url.startsWith('https://sandbox.supabase.test/rest/v1/orders?id=eq.') &&
+        String(fetchOptions.method || 'GET').toUpperCase() === 'PATCH') {
+      state.orderPatches.push({ url, body: parsedBody });
+      return new Response(null, { status: config.notePatchStatus || 204 });
     }
 
     if (url === 'https://sandbox.supabase.test/rest/v1/push_queue' &&
@@ -707,8 +726,9 @@ await check('Microsoft Graph accepts every valid clientState and allowlisted ide
 // our OWN outbound mail arrive on this webhook. Those must be dropped
 // before the classifier, the lead row, and the Telegram alert - Sidd
 // asked (2026-08-31) to stop being pinged about his own cold emails.
-// A real prospect email in the same batch must still flow end to end.
-await check('own cold-email CC copies are dropped; prospect mail still alerts', async () => {
+// A real prospect email in the same batch must still flow end to end
+// (lead row only: no ms-graph email alerts at all since 2026-09-22).
+await check('own cold-email CC copies are dropped; prospect mail still makes its lead row', async () => {
   const harness = installFetchHarness({
     aiResponses: [JSON.stringify({
       category: 'lead_inquiry',
@@ -731,7 +751,7 @@ await check('own cold-email CC copies are dropped; prospect mail still alerts', 
     })],
   });
   // Alerts fan out to ALLOWED_CHAT_IDS; the base env leaves it empty,
-  // so give this check two chats to prove the prospect alert enqueues.
+  // so give this check two chats: even then the prospect email queues none.
   const alertEnv = { ...baseEnv, ALLOWED_CHAT_IDS: '111,222' };
   try {
     const response = await worker.fetch(
@@ -780,15 +800,15 @@ await check('own cold-email CC copies are dropped; prospect mail still alerts', 
     assert.ok(harness.state.aiMessages[0].includes('buyer@prospectcompany.com'));
     assert.ok(!harness.state.aiMessages[0].toLowerCase()
       .includes('freshhamptonscoconuts'));
-    // Only the prospect email produced a lead row and alert rows.
+    // Only the prospect email produced a lead row.
     assert.equal(harness.state.orders.size, 1);
     assert.equal(
       [...harness.state.orders.values()][0].client_email,
       'buyer@prospectcompany.com',
     );
-    // One encrypted outbox row per chat, both for the prospect email
-    // (Emma's copy returned before the alert step, so it added none).
-    assert.equal(harness.state.pushQueue.size, 2);
+    // Neither email queued an alert row (owner decision 2026-09-22).
+    assert.equal(harness.state.pushAttempts.length, 0);
+    assert.equal(harness.state.pushQueue.size, 0);
   } finally { harness.restore(); }
 });
 
@@ -811,6 +831,252 @@ await check('own cold-email sender matching is exact-domain and case-insensitive
   // notifications may not carry a from field at all).
   assert.equal(isOwnColdEmailNotification({ resourceData: { id: 'x' } }), false);
   assert.equal(isOwnColdEmailNotification(fromAddr('')), false);
+});
+
+// Owner decision 2026-09-22 (Sidd): NO Telegram alerts for forwarded email.
+// His Claudia intake cards already cover every lead, so the ms-graph path
+// writes lead rows and notes only. Every case below runs with BOTH outbox
+// keys absent and two chats configured (a stray alert WOULD try to queue and
+// 503 without the keys), and records every read of a WEBHOOK_OUTBOX_* name.
+function graphEnvWithoutOutboxKeys(outboxReads) {
+  const env = { ...baseEnv, ALLOWED_CHAT_IDS: '111,222' };
+  delete env.WEBHOOK_OUTBOX_ID_KEY;
+  delete env.WEBHOOK_OUTBOX_ENCRYPTION_KEY_CURRENT;
+  return new Proxy(env, {
+    get(target, key) {
+      if (String(key).startsWith('WEBHOOK_OUTBOX_')) outboxReads.push(String(key));
+      return target[key];
+    },
+  });
+}
+
+// One notification accepted through the real webhook, then drained by the
+// */5 intake scan, exactly as production runs it.
+async function runGraphCase({ classification, resourceData, existingOrders, notePatchStatus }) {
+  const harness = installFetchHarness({
+    aiResponses: [JSON.stringify(classification)],
+    existingOrders,
+    notePatchStatus,
+  });
+  const outboxReads = [];
+  const env = graphEnvWithoutOutboxKeys(outboxReads);
+  try {
+    const response = await worker.fetch(
+      request('/webhooks/ms-graph', JSON.stringify({ value: [{
+        clientState: GRAPH_CLIENT_STATE,
+        subscriptionId: 'subscription-one',
+        tenantId: 'tenant-one',
+        resourceData,
+      }] })),
+      env,
+    );
+    assert.equal(response.status, 202);
+    const drained = await runWebhookIntakeScan(env);
+    return { harness, drained, outboxReads };
+  } finally { harness.restore(); }
+}
+
+function assertGraphCompletedWithoutAlerts({ harness, drained, outboxReads }) {
+  assert.deepEqual(drained, { claimed: 1, completed: 1, released: 0 });
+  assert.equal(harness.state.aiMessages.length, 1);
+  assert.equal(harness.state.receipts.size, 1);
+  assert.ok([...harness.state.receipts.values()].every(
+    (receipt) => receipt.deliveryState === 'completed',
+  ));
+  assert.ok([...harness.state.intake.values()].every(
+    (item) => item.deliveryState === 'completed',
+  ));
+  assert.equal(harness.state.pushAttempts.length, 0);
+  assert.equal(harness.state.pushQueue.size, 0);
+  assert.equal(harness.state.telegramAttempts.size, 0);
+  assert.ok(harness.calls.every((call) => !call.url.includes('/push_queue')));
+  assert.deepEqual(outboxReads, []);
+}
+
+function graphLeadClassification(leadFields = {}, fields = {}) {
+  return {
+    category: 'lead_inquiry',
+    from_email: 'planner@eventco-example.com',
+    from_name: 'Event Planner',
+    subject: 'Coconuts for our conference',
+    summary: 'New inquiry about coconuts',
+    should_alert: true,
+    extracted_lead: {
+      client_name: 'Event Planner',
+      client_email: 'planner@eventco-example.com',
+      client_phone: null,
+      event_type: 'corporate',
+      event_date: '2026-12-12',
+      headcount: 300,
+      venue: null,
+      market: 'ny',
+      notes: 'wants pricing',
+      ...leadFields,
+    },
+    ...fields,
+  };
+}
+
+function graphResource(id, subject) {
+  return {
+    id,
+    subject,
+    from: { emailAddress: {
+      name: 'Event Planner',
+      address: 'planner@eventco-example.com',
+    } },
+  };
+}
+
+await check('Graph lead_inquiry writes its lead row and queues no alert, outbox keys absent', async () => {
+  const result = await runGraphCase({
+    classification: graphLeadClassification(),
+    resourceData: graphResource('graph-new-lead', 'Coconuts for our conference'),
+  });
+  assertGraphCompletedWithoutAlerts(result);
+  const orders = [...result.harness.state.orders.values()];
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0].stage, 'inquiry');
+  assert.equal(orders[0].source, 'website');
+  assert.equal(orders[0].client_email, 'planner@eventco-example.com');
+  assert.match(orders[0].notes, /^Email lead via MS Graph: /);
+});
+
+await check('Graph customer_reply, vendor and noise queue no alert even with should_alert true', async () => {
+  for (const category of ['customer_reply', 'vendor', 'noise']) {
+    const result = await runGraphCase({
+      classification: graphLeadClassification({}, {
+        category,
+        should_alert: true,
+        extracted_lead: null,
+      }),
+      resourceData: graphResource('graph-' + category, 'Re: delivery on Friday'),
+    });
+    assertGraphCompletedWithoutAlerts(result);
+    assert.equal(result.harness.state.orderAttempts.length, 0, category);
+    assert.equal(result.harness.state.orderPatches.length, 0, category);
+  }
+});
+
+const graphInvoicedRow = {
+  id: 'row-inv',
+  stage: 'invoiced',
+  external_invoice_id: '3475',
+  total_cents: 200000,
+  deposit_cents: 0,
+  client_email: 'planner@eventco-example.com',
+  notes: 'x',
+  event_start_at: '2026-09-05T12:00:00+00:00',
+  created_at: '2026-09-01T00:00:00Z',
+};
+
+await check('Graph suppressed lead appends its note and queues no alert (the old always-surface case)', async () => {
+  const result = await runGraphCase({
+    classification: graphLeadClassification({}, {
+      subject: 'RE: Labor Day Event',
+      should_alert: false,
+    }),
+    resourceData: graphResource('graph-suppressed', 'RE: Labor Day Event'),
+    existingOrders: [graphInvoicedRow],
+  });
+  assertGraphCompletedWithoutAlerts(result);
+  assert.equal(result.harness.state.orderAttempts.length, 0);
+  assert.equal(result.harness.state.orderPatches.length, 1);
+  assert.match(result.harness.state.orderPatches[0].url, /\/orders\?id=eq\.row-inv$/);
+  assert.match(
+    result.harness.state.orderPatches[0].body.notes,
+    /Follow-up email via MS Graph: RE: Labor Day Event/,
+  );
+});
+
+await check('Graph suppressed lead whose note append fails still completes with no alert', async () => {
+  const result = await runGraphCase({
+    classification: graphLeadClassification({}, { subject: 'RE: Labor Day Event' }),
+    resourceData: graphResource('graph-suppressed-note-fails', 'RE: Labor Day Event'),
+    existingOrders: [graphInvoicedRow],
+    notePatchStatus: 500,
+  });
+  assertGraphCompletedWithoutAlerts(result);
+  assert.equal(result.harness.state.orderAttempts.length, 0);
+  assert.equal(result.harness.state.orderPatches.length, 1);
+});
+
+await check('Graph sibling lead gets its own row and queues no alert', async () => {
+  const result = await runGraphCase({
+    classification: graphLeadClassification({ event_date: '2026-12-12' }, {
+      subject: 'Coconuts for our holiday party',
+      should_alert: false,
+    }),
+    resourceData: graphResource('graph-sibling', 'Coconuts for our holiday party'),
+    existingOrders: [{
+      id: 'row-lead',
+      stage: 'inquiry',
+      external_invoice_id: null,
+      total_cents: null,
+      deposit_cents: 0,
+      client_email: 'planner@eventco-example.com',
+      notes: 'Email lead via MS Graph: hi',
+      event_start_at: '2026-10-05T12:00:00+00:00',
+      created_at: '2026-09-10T00:00:00Z',
+    }],
+  });
+  assertGraphCompletedWithoutAlerts(result);
+  assert.equal(result.harness.state.orderPatches.length, 0);
+  const orders = [...result.harness.state.orders.values()];
+  assert.equal(orders.length, 1);
+  assert.notEqual(orders[0].id, 'row-lead');
+});
+
+// market is the crew app's access control, and vegas has been a real market
+// since 2026-09-10. A Vegas lead must keep vegas; anything unknown stays ny.
+await check('Graph lead rows keep vegas, ny, miami and other; an unknown market becomes ny', async () => {
+  const cases = [
+    ['vegas', 'vegas'],
+    ['ny', 'ny'],
+    ['miami', 'miami'],
+    ['other', 'other'],
+    ['boston', 'ny'],
+    [undefined, 'ny'],
+  ];
+  for (const [given, expected] of cases) {
+    const result = await runGraphCase({
+      classification: graphLeadClassification({ market: given }),
+      resourceData: graphResource('graph-market-' + String(given), 'Coconuts for our conference'),
+    });
+    assertGraphCompletedWithoutAlerts(result);
+    const orders = [...result.harness.state.orders.values()];
+    assert.equal(orders.length, 1, String(given));
+    assert.equal(orders[0].market, expected, String(given));
+    // The classifier is told it may answer vegas.
+    const aiCall = result.harness.calls.find((call) =>
+      call.url === 'https://api.anthropic.com/v1/messages');
+    assert.match(aiCall.body.system, /"market": "ny\|miami\|vegas\|other"/);
+  }
+});
+
+await check('Formspree lead rows keep vegas and still default an unknown market to ny', async () => {
+  for (const [given, expected] of [['vegas', 'vegas'], ['miami', 'miami'], ['boston', 'ny']]) {
+    const harness = installFetchHarness({
+      aiResponses: [JSON.stringify({ client_name: 'Market Lead', market: given })],
+    });
+    try {
+      const rawBody = JSON.stringify({ id: 'formspree-market-' + given, name: 'Market Lead' });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const response = await worker.fetch(
+        request('/webhooks/formspree', rawBody, {
+          'Formspree-Signature': await formspreeSignature(rawBody, timestamp),
+        }),
+        baseEnv,
+      );
+      assert.equal(response.status, 200);
+      const orders = [...harness.state.orders.values()];
+      assert.equal(orders.length, 1, given);
+      assert.equal(orders[0].market, expected, given);
+      const aiCall = harness.calls.find((call) =>
+        call.url === 'https://api.anthropic.com/v1/messages');
+      assert.match(aiCall.body.system, /"market": "ny \| miami \| vegas \| other"/);
+    } finally { harness.restore(); }
+  }
 });
 
 await check('completed provider receipts skip every downstream side effect on retry', async () => {
