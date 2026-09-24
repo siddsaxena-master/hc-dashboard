@@ -63,7 +63,8 @@
 // Clean up the OLD dashboard on this device.
 // The old version saved a copy of itself on phones (a "service worker" plus
 // saved files in "Cache Storage"). This removes both so the device stops
-// showing the old app. Safe to run any number of times: a second run just
+// showing the old app, plus the old app's saved data (see the end). Safe to
+// run any number of times: a second run just
 // finds nothing left to remove. Every step is wrapped so an older browser
 // without these features simply skips it.
 (function () {
@@ -84,6 +85,16 @@
         })
         .catch(function () {});
     }
+  } catch (e) {}
+  // Also remove the old app's saved data on this device (order list, sign-in
+  // details, Telegram settings), which any page on this shared address could
+  // read. The offline delivery queue (hc_pending_deliveries) is left alone so
+  // nothing unsent is lost.
+  try {
+    ['hc_events', 'hc_auth_email', 'hc_role', 'hc_market', 'hc_gmail_processed',
+      'hc_stamp_check_date', 'hc_tg_bot_token', 'hc_tg_chat_id'].forEach(function (key) {
+      localStorage.removeItem(key);
+    });
   } catch (e) {}
 })();
 </script>

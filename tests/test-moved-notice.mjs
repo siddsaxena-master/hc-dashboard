@@ -7,9 +7,11 @@
 // What it proves:
 //  - index.html only points people to app.hamptonscoconuts.com and carries no
 //    database address, no key, no email address and makes no network calls.
-//  - index.html's small script removes old service workers and saved caches,
-//    and is safe to run twice or on a browser without those features.
-//  - sw.js never answers requests itself, deletes every cache and unregisters.
+//  - index.html's small script removes old service workers, saved caches and
+//    the old app's saved data (keeping the unsent delivery queue), and is safe
+//    to run twice or on a browser without those features.
+//  - sw.js never answers requests itself, deletes every cache, unregisters,
+//    then reloads any open old-app tab once to ?moved=1 (never twice).
 
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
@@ -176,6 +178,54 @@ check('page script does not crash on a browser without these features', async ()
     caches: { keys: () => Promise.reject(new Error('blocked')), delete: () => Promise.resolve(false) },
   });
   await settle();
+});
+
+// ---------- index.html: the old app's saved data (localStorage) ----------
+
+// Every key the old app (main at 96c45fa) saved on the device, except the
+// offline delivery queue, which may still hold unsent signatures.
+const OLD_KEYS = ['hc_events', 'hc_auth_email', 'hc_role', 'hc_market', 'hc_gmail_processed',
+  'hc_stamp_check_date', 'hc_tg_bot_token', 'hc_tg_chat_id'];
+
+// A pretend localStorage holding the old keys, the queue and an unrelated key.
+function fakeStorage() {
+  const data = new Map([...OLD_KEYS, 'hc_pending_deliveries', 'some_other_site_key'].map((k) => [k, 'x']));
+  return {
+    data,
+    storage: {
+      getItem: (k) => (data.has(k) ? data.get(k) : null),
+      setItem: (k, v) => { data.set(k, String(v)); },
+      removeItem: (k) => { data.delete(k); },
+    },
+  };
+}
+
+check('page script removes the old app\'s saved data but keeps the offline queue', async () => {
+  const body = inlineScripts(html)[0].body;
+  const b = fakeBrowser();
+  const s = fakeStorage();
+  const context = vm.createContext({ navigator: b.navigator, caches: b.caches, localStorage: s.storage });
+  vm.runInContext(body, context);
+  vm.runInContext(body, context);   // a second run must be harmless too
+  await settle();
+  for (const key of OLD_KEYS) assert.ok(!s.data.has(key), `${key} removed`);
+  assert.ok(s.data.has('hc_pending_deliveries'), 'unsent delivery queue kept');
+  assert.ok(s.data.has('some_other_site_key'), 'unrelated keys kept');
+  // The cleanup of workers and caches still happens alongside it.
+  assert.equal(b.state.regs.length, 0);
+  assert.equal(b.state.caches.size, 0);
+});
+
+check('page script does not crash when the browser blocks saved data', async () => {
+  const body = inlineScripts(html)[0].body;
+  const b = fakeBrowser();
+  const sandbox = { navigator: b.navigator, caches: b.caches };
+  // Some private-browsing modes throw as soon as localStorage is touched.
+  Object.defineProperty(sandbox, 'localStorage', { get() { throw new Error('SecurityError'); } });
+  vm.runInNewContext(body, sandbox);
+  await settle();
+  assert.equal(b.state.regs.length, 0, 'workers still removed');
+  assert.equal(b.state.caches.size, 0, 'caches still removed');
 });
 
 // ---------- sw.js: the self-destructing service worker ----------
