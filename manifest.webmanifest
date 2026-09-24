@@ -1,7 +1,7 @@
 {
   "name": "HC Dashboard (moved)",
-  "short_name": "HC Deliveries",
-  "description": "Hamptons Coconuts field deliveries and customer signing.",
+  "short_name": "HC (moved)",
+  "description": "Moved to app.hamptonscoconuts.com.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

@@ -358,6 +358,12 @@ check('manifest name says the dashboard moved', () => {
   assert.equal(manifest.name, 'HC Dashboard (moved)');
 });
 
+// Phones label a home-screen icon with short_name, not name.
+check('manifest home-screen label and description say it moved', () => {
+  assert.equal(manifest.short_name, 'HC (moved)');
+  assert.equal(manifest.description, 'Moved to app.hamptonscoconuts.com.');
+});
+
 // ---------- run ----------
 
 let failed = 0;
