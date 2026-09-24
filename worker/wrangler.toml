@@ -158,3 +158,17 @@ crons = [
 #   ARTWORK_PROPOSALS`, value on; `wrangler secret delete ARTWORK_PROPOSALS`
 #   is the kill switch (rows already in the table stay visible in the app,
 #   so tell Sidd).
+# CLAUDIA CHAT ORDER WRITES (M3 of the 2026-09-23 unified app audit). The
+# Telegram chat can create, update and delete orders with the service key,
+# which skips HC App and its payment guards. One setting, a secret, never in
+# this file:
+# CLAUDIA_CHAT_ORDER_WRITES - unset, blank or 'on' keeps today's chat exactly
+#   (writes allowed). Any other value (use 'off') makes the chat answers-only:
+#   questions are still answered from the order list, but every create,
+#   update or delete intent writes NOTHING and gets one plain reply: "Chat
+#   edits are off, so nothing was changed. Please make this change in HC App:
+#   https://app.hamptonscoconuts.com". A mistyped value also counts as off.
+#   Turn off: `wrangler secret put CLAUDIA_CHAT_ORDER_WRITES`, value off.
+#   Undo: `wrangler secret delete CLAUDIA_CHAT_ORDER_WRITES` (back to writes
+#   allowed). Intake card buttons (Invoice it / Skip) are not affected.
+#   Tests: node worker/test-chat-order-writes.mjs

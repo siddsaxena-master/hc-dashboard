@@ -89,6 +89,33 @@ const UI_SOURCE_TO_SB = {'Google Search':'website','Cold Email Outreach':'sales_
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// ── CHAT ORDER WRITES SWITCH (M3, 2026-09-24; documented in wrangler.toml) ──
+// CLAUDIA_CHAT_ORDER_WRITES is a worker secret. Unset, blank or 'on' keeps
+// today's behavior: a chat message can create, update or delete an order
+// with the service key. Any other value (use 'off') makes the chat
+// answers-only: questions are still answered from the order list, but a
+// create, update or delete intent writes NOTHING and gets one plain reply
+// pointing to HC App, where the owner's editor and the payment guards live.
+// Anything other than 'on' counts as off, so a mistyped value fails closed.
+export const CHAT_ORDER_WRITES_OFF_REPLY =
+  'Chat edits are off, so nothing was changed. Please make this change in HC App: https://app.hamptonscoconuts.com';
+const CHAT_WRITE_ACTIONS = new Set(['create', 'update', 'delete']);
+export function chatOrderWritesOn(env) {
+  const value = String((env && env.CLAUDIA_CHAT_ORDER_WRITES) || '').trim().toLowerCase();
+  return value === '' || value === 'on';
+}
+// Added to Claude's instructions ONLY while chat writes are off, so a change
+// request comes back as its action (which the worker then refuses) instead of
+// a delete confirmation question the chat can no longer act on, and so the
+// model never claims a change was made. With the switch on, the prompt is
+// exactly SYSTEM_PROMPT, as before.
+const CHAT_WRITES_OFF_PROMPT = `
+
+CHAT EDITS ARE OFF:
+- This chat answers questions only. Events are added and changed in HC App.
+- When the user asks to add, change, mark or delete an event, return that action ("create", "update" or "delete") right away, with no confirmation question. Nothing will be saved; the system tells the user where to make the change.
+- Never say that anything was added, changed, marked or deleted.`;
+
 export default {
   // ── SCHEDULED (Cloudflare Cron Triggers) ──
   async scheduled(event, env, ctx) {
@@ -192,7 +219,20 @@ export default {
       }
 
       const userText = message.text.trim();
+      // CLAUDIA_CHAT_ORDER_WRITES (see chatOrderWritesOn): read once per message.
+      const chatWritesOn = chatOrderWritesOn(env);
 
+      if (userText === '/start' && !chatWritesOn) {
+        await sendTelegram(env.TG_BOT_TOKEN, chatId,
+          '🥥 *Hey! I\'m Claudia, your Hamptons Coconuts assistant.*\n\n' +
+          'I can answer questions about your orders. Try:\n' +
+          '• "What events are coming up?"\n' +
+          '• "Who needs stamps ordered?"\n' +
+          '• "Give me a summary"\n\n' +
+          'To add or change an order, use HC App: https://app.hamptonscoconuts.com'
+        );
+        return ok();
+      }
       if (userText === '/start') {
         await sendTelegram(env.TG_BOT_TOKEN, chatId,
           '🥥 *Hey! I\'m Claudia, your Hamptons Coconuts assistant.*\n\n' +
@@ -238,10 +278,22 @@ export default {
       }));
 
       // Call Claude
-      const claudeResp = await callClaude(env.ANTHROPIC_API_KEY, userText, evContext, today);
+      const claudeResp = await callClaude(env.ANTHROPIC_API_KEY, userText, evContext, today,
+        chatWritesOn ? SYSTEM_PROMPT : SYSTEM_PROMPT + CHAT_WRITES_OFF_PROMPT);
       if (!claudeResp || claudeResp.error) {
         const errMsg = claudeResp?.error || 'Unknown error';
         await sendTelegram(env.TG_BOT_TOKEN, chatId, '❌ AI error: ' + errMsg);
+        return ok();
+      }
+
+      // Chat edits switched off: a create, update or delete intent writes
+      // nothing (no insertEvent, updateEvent or deleteEvent call below), and
+      // Claude's own reply is NOT sent, since it may say the change was made.
+      // Plain text, no Markdown. Questions ("none", "list") fall through.
+      if (!chatWritesOn && CHAT_WRITE_ACTIONS.has(claudeResp.action)) {
+        console.log('chat order write refused: CLAUDIA_CHAT_ORDER_WRITES is off (action ' +
+          claudeResp.action + ')');
+        await sendTelegramPlain(env.TG_BOT_TOKEN, chatId, CHAT_ORDER_WRITES_OFF_REPLY);
         return ok();
       }
 
@@ -519,7 +571,7 @@ async function sendTelegramPlain(token, chatId, text) {
   }
 }
 
-async function callClaude(apiKey, userMessage, eventsContext, today) {
+async function callClaude(apiKey, userMessage, eventsContext, today, systemPrompt = SYSTEM_PROMPT) {
   try {
     const resp = await fetch(CLAUDE_API, {
       method: 'POST',
@@ -531,7 +583,7 @@ async function callClaude(apiKey, userMessage, eventsContext, today) {
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 1200,
-        system: SYSTEM_PROMPT,
+        system: systemPrompt,
         messages: [{
           role: 'user',
           content: `Today: ${today}\n\nCurrent events (${eventsContext.length} total):\n${JSON.stringify(eventsContext)}\n\nUser message: ${userMessage}`

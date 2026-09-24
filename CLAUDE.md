@@ -246,6 +246,67 @@ PostgreSQL 17.6 as of 2026-09-10. Run `select version()` before any future run.
   runs with both outbox keys absent). Ships with the next worker deploy,
   its own "yes do it".
 
+## Claudia chat order writes switch (M3, built 2026-09-24, LOCAL ONLY)
+
+Branch `fix/claudia-chat-order-writes-switch`, cut from feature/address-proposals
+d62abcd (worker code identical to e335316, the code of live 657f45c0 ->
+17daf095 -> 156087cf; verified with `npx wrangler deployments list`). Nothing
+deployed.
+
+- The why (2026-09-23 unified app audit, M3 "stop the money truth leaks"):
+  Claudia's chat turns a message into create, update or delete on `orders`
+  with the service key, outside HC App and its guards. The update path PATCHes
+  the WHOLE row rebuilt from the lossy chat view: 'quoted' goes back as
+  'inquiry' (030 allows that on an unpaid order), 'invoiced' goes back as
+  'deposit_paid' (030 refuses it), a null deposit goes back as 0 (030 refuses
+  it), and event and delivery times are reset to noon. The worker ignores the
+  write result, so Claudia says "Done" even when 030 refused the write.
+- Switch: worker secret `CLAUDIA_CHAT_ORDER_WRITES` (documented in
+  `worker/wrangler.toml`). Unset, blank or 'on' = today's chat exactly. Any
+  other value (use 'off') = answers only: questions and lists still work, and
+  every create, update or delete intent writes NOTHING and gets one plain reply
+  ("Chat edits are off, so nothing was changed. Please make this change in HC
+  App: https://app.hamptonscoconuts.com"). Claude's own reply is not sent then.
+  While off, Claude's prompt gets one extra block (return the action at once,
+  no delete confirmation question, never claim a change) and /start shows an
+  answers-only help. A mistyped value counts as off. Intake card buttons are
+  not affected.
+- Tests: `node worker/test-chat-order-writes.mjs` (25 checks, fake network:
+  both switch states, writes happen when on, none when off, answers still
+  work, the prompt is byte-identical when on, source pin that every chat write
+  call sits after the gate). 6 of 6 deliberate code breaks caught.
+- Windows note: with core.autocrlf=true, test-auth-rollback,
+  test-live-activity-end, test-live-activity-start and
+  test-notification-security fail 11 text checks on the CRLF checkout (they
+  search migration files for multi-line text). On an LF export
+  (`git -c core.autocrlf=false archive <commit> | tar -x -C <dir>`) they pass.
+  Pre-existing, not a code problem.
+- DASHBOARD_ORIGIN unchanged on purpose: HC App (hc-app main df03a58) calls
+  Claudia only through `/parse-file`, which is switched off there
+  (`upload_parse` is not in HC_APP_ENABLED_WRITES). If that is ever switched
+  on, add https://app.hamptonscoconuts.com to the origin check first, or the
+  browser call gets 403 "Origin not allowed".
+- e61fe6c (fix/live-worker-payment-integrity, 2026-09-01) is NOT in this
+  branch. It was cut from the 2026-08-07 line and no longer applies (its stage
+  map hunk collides with the 2026-09-06 passed fix). With the switch off it is
+  not needed. If chat writes are ever wanted on again, port it first (diff-only
+  PATCH, write confirmation, no payment stages or amounts) and review it again.
+- Deploy (each step its own "yes do it", claim the OPERATOR BOARD line first):
+  1. Check `npx wrangler deployments list` still ends on 156087cf. If the
+     coconut guard (feature/coconut-guard, also on d62abcd) shipped first,
+     merge this branch onto what is live before deploying.
+  2. `cd worker && npx wrangler deploy` from this branch with the secret
+     unset. No behavior change. Check the new version is 100%, one */5 tick
+     is Ok in `npx wrangler tail`, and /start still shows the old help.
+  3. `npx wrangler secret put CLAUDIA_CHAT_ORDER_WRITES`, value off. Check:
+     /start shows the answers-only help, a question is answered, "mark the
+     stamp received for <order>" gets the HC App reply and the order is
+     unchanged in HC App.
+  Undo step 3: `npx wrangler secret delete CLAUDIA_CHAT_ORDER_WRITES`.
+  Undo step 2: `npx wrangler rollback 156087cf-dc37-410f-92dd-59df8ac1b53a`
+  (that code ignores the new secret; 156087cf is above 657f45c0, so the
+  MS_GRAPH_CLIENT_STATE rollback trap does not apply).
+
 ## Current uncommitted state (as of 2026-07-07)
 
 index.html has the one-line pending-payment fix described above staged
