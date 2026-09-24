@@ -1,3 +1,5 @@
+2026-09-24: the GitHub Pages page is now a moved notice; the live owner app is app.hamptonscoconuts.com (repo hc-app).
+
 # CLAUDE.md — HC Dashboard (maintainer playbook)
 
 > This dashboard is FINISHED and LIVE (redesigned 2026-07-06 by Claude

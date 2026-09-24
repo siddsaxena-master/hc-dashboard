@@ -1,0 +1,1 @@
+Archived 2026-09-24: these tests checked the old single-file dashboard (index.html and its offline sw.js), which is now a "moved" notice pointing to app.hamptonscoconuts.com, so they no longer apply and are kept here only for history (they are not run). The live checks for this repo are tests/test-moved-notice.mjs.

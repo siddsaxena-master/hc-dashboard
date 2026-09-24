@@ -1,51 +1,33 @@
-// Hamptons Coconuts dashboard — offline service worker.
-// Lets the app OPEN and run with no signal (field deliveries in dead zones).
-// It caches the app itself, but never interferes with live data:
-//  - Only same-origin GET requests are cached (the app shell, icons).
-//  - Cross-origin calls (Supabase, Google sign-in, fonts) always go to the network.
-//  - Writes (POST/PATCH) are never touched, so signing/saving works normally.
+// Hamptons Coconuts dashboard: RETIRED service worker (2026-09-24).
+// Cache version marker: 'hc-deliveries-v6-retired'. Changing this file's
+// bytes is what makes browsers notice a new service worker and install it.
+//
+// Why this file still exists: the dashboard moved to
+// https://app.hamptonscoconuts.com/ and this GitHub Pages site is now only a
+// "moved" notice. The OLD version of this file saved the whole old app on each
+// phone and served that saved copy first, so a phone that had not opened the
+// site in a while would keep showing the old app. This version removes itself:
+//  - install: take over right away instead of waiting for old tabs to close.
+//  - activate: delete EVERY saved copy (all caches), take control of any open
+//    page, then unregister so this worker never runs again.
+//  - There is deliberately NO fetch listener, so this worker never answers a
+//    request itself. Every request goes straight to the network and gets the
+//    new notice page.
+//  - It also does NOT force open pages to reload. GitHub Pages lets browsers
+//    reuse a saved index.html for a few minutes, and a forced reload could
+//    bounce between the old page and this worker. The next normal open shows
+//    the notice.
 
-const CACHE = 'hc-deliveries-v5';  // v5: exact stage mapping and amount-based payment safety
-const SHELL = [
-  './',
-  './index.html',
-  './manifest.webmanifest',
-  './icon-180.png',
-  './icon-192.png',
-  './icon-512.png'
-];
-
-self.addEventListener('install', (e) => {
-  e.waitUntil(
-    caches.open(CACHE)
-      .then((c) => c.addAll(SHELL).catch(() => {}))   // tolerate a missing optional file
-      .then(() => self.skipWaiting())
-  );
+self.addEventListener('install', () => {
+  self.skipWaiting();
 });
 
 self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.map((key) => caches.delete(key))))
       .then(() => self.clients.claim())
-  );
-});
-
-self.addEventListener('fetch', (e) => {
-  const req = e.request;
-  if (req.method !== 'GET') return;                 // leave writes alone
-  const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;  // let Supabase/Google/fonts hit the network
-  e.respondWith(
-    caches.match(req).then((cached) => {
-      const fromNet = fetch(req).then((resp) => {
-        if (resp && resp.status === 200) {
-          const copy = resp.clone();
-          caches.open(CACHE).then((c) => c.put(req, copy));
-        }
-        return resp;
-      }).catch(() => cached);
-      return cached || fromNet;                      // cached first (instant + offline), refresh in background
-    })
+      .then(() => self.registration.unregister())
+      .catch(() => self.registration.unregister())   // even if a cleanup step fails, still remove this worker
   );
 });
