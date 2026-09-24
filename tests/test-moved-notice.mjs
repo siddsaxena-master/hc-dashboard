@@ -205,21 +205,31 @@ check('sw.js has no Supabase reference or key', () => {
 });
 
 // Run sw.js against a pretend service worker environment.
-function fakeWorker({ cacheNames = ['hc-deliveries-v5', 'other'], keysFails = false } = {}) {
+// windows = addresses of open tabs this worker controls after it claims them.
+// noNavigate = pretend an older browser that cannot reload a tab from a worker.
+function fakeWorker({
+  cacheNames = ['hc-deliveries-v5', 'other'], keysFails = false, windows = [], noNavigate = false,
+} = {}) {
   const log = [];
   const listeners = {};
   const store = new Set(cacheNames);
   const self = {
     addEventListener: (type, fn) => { listeners[type] = fn; },
     skipWaiting: () => { log.push('skipWaiting'); return Promise.resolve(); },
-    clients: { claim: () => { log.push('claim'); return Promise.resolve(); } },
+    clients: {
+      claim: () => { log.push('claim'); return Promise.resolve(); },
+      matchAll: () => Promise.resolve(windows.map((u) => (noNavigate ? { url: u } : {
+        url: u,
+        navigate: (h) => { log.push(`navigate:${h}`); return Promise.resolve(); },
+      }))),
+    },
     registration: { unregister: () => { log.push('unregister'); return Promise.resolve(true); } },
   };
   const caches = {
     keys: () => (keysFails ? Promise.reject(new Error('blocked')) : Promise.resolve([...store])),
     delete: (name) => { log.push(`delete:${name}`); return Promise.resolve(store.delete(name)); },
   };
-  vm.runInNewContext(sw, { self, caches });
+  vm.runInNewContext(sw, { self, caches, URL });
   return { log, listeners, store };
 }
 
@@ -252,6 +262,42 @@ check('sw.js activate deletes ALL caches, then claims, then unregisters', async 
 
 check('sw.js still unregisters when cache cleanup fails', async () => {
   const w = fakeWorker({ keysFails: true });
+  await fire(w.listeners, 'activate');
+  assert.ok(w.log.includes('unregister'));
+});
+
+// The old app keeps running in an open tab after this worker takes over, so
+// activate must reload it once, to an address the old app never used.
+check('sw.js reloads an open old-app tab once, to ?moved=1, after unregistering', async () => {
+  const w = fakeWorker({ windows: ['https://example.test/hc-dashboard/'] });
+  await fire(w.listeners, 'activate');
+  const navs = w.log.filter((l) => l.startsWith('navigate:'));
+  assert.deepEqual(navs, ['navigate:https://example.test/hc-dashboard/?moved=1']);
+  assert.ok(w.log.indexOf('unregister') < w.log.indexOf(navs[0]), `order was ${w.log.join(', ')}`);
+});
+
+check('sw.js keeps other address parts when it adds ?moved=1', async () => {
+  const w = fakeWorker({ windows: ['https://example.test/hc-dashboard/index.html?x=2#top'] });
+  await fire(w.listeners, 'activate');
+  assert.ok(w.log.includes('navigate:https://example.test/hc-dashboard/index.html?x=2&moved=1#top'),
+    `log was ${w.log.join(', ')}`);
+});
+
+check('sw.js never reloads a tab already on ?moved=1 (no loop)', async () => {
+  const w = fakeWorker({ windows: ['https://example.test/hc-dashboard/?moved=1'] });
+  await fire(w.listeners, 'activate');
+  assert.ok(!w.log.some((l) => l.startsWith('navigate:')), `log was ${w.log.join(', ')}`);
+  assert.ok(w.log.includes('unregister'));
+});
+
+check('sw.js still claims, unregisters and reloads when cache cleanup fails', async () => {
+  const w = fakeWorker({ keysFails: true, windows: ['https://example.test/hc-dashboard/'] });
+  await fire(w.listeners, 'activate');
+  assert.deepEqual(w.log, ['claim', 'unregister', 'navigate:https://example.test/hc-dashboard/?moved=1']);
+});
+
+check('sw.js does not crash on a browser that cannot reload tabs from a worker', async () => {
+  const w = fakeWorker({ noNavigate: true, windows: ['https://example.test/hc-dashboard/'] });
   await fire(w.listeners, 'activate');
   assert.ok(w.log.includes('unregister'));
 });
