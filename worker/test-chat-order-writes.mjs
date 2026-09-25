@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import worker, { chatOrderWritesOn, CHAT_ORDER_WRITES_OFF_REPLY } from './worker.js';
+import worker, { chatOrderWritesOn, CHAT_ORDER_WRITES_OFF_REPLY, answersOnlyEventContext } from './worker.js';
 
 const WORKER_URL = 'https://worker.example.test';
 const SB = 'https://sandbox.supabase.test';
@@ -32,7 +32,28 @@ const ROWS = [
   { id: ORDER_B, client_name: 'Test Client B', stage: 'invoiced', market: 'ny',
     event_start_at: '2026-10-12T12:00:00Z', coconuts_qty: 50, total_cents: 90000,
     deposit_cents: 0, balance_cents: 0, stamp_status: 'ordered' },
+  // One row per other stored stage, for the answers-only context checks.
+  { id: '33333333-3333-4333-8333-333333333333', client_name: 'Test Client D', stage: 'deposit_paid',
+    market: 'ny', total_cents: 80000, deposit_cents: 0, balance_cents: null },
+  { id: '44444444-4444-4444-8444-444444444444', client_name: 'Test Client E', stage: 'paid_full',
+    market: 'ny', total_cents: 70000, deposit_cents: 35000, balance_cents: 35000 },
+  { id: '55555555-5555-4555-8555-555555555555', client_name: 'Test Client F', stage: 'fulfilled',
+    market: 'ny', total_cents: 60000, deposit_cents: 0, balance_cents: 0 },
+  { id: '66666666-6666-4666-8666-666666666666', client_name: 'Test Client G', stage: 'cancelled',
+    market: 'ny', total_cents: null, deposit_cents: 0, balance_cents: null },
+  { id: '77777777-7777-4777-8777-777777777777', client_name: 'Test Client H', stage: 'complete',
+    market: 'ny', total_cents: 50000, deposit_cents: 50000, balance_cents: 0 },
+  { id: '88888888-8888-4888-8888-888888888888', client_name: 'Test Client I', stage: 'some_new_stage',
+    market: 'ny', total_cents: 40000, deposit_cents: 0, balance_cents: 0 },
 ];
+// What Claude is told for each row, by client name.
+function sentContext(calls) {
+  const content = calls.ai[0].messages[0].content;
+  const start = content.indexOf('total):\n') + 'total):\n'.length;
+  const end = content.indexOf('\n\nUser message:');
+  const list = JSON.parse(content.slice(start, end));
+  return Object.fromEntries(list.map(entry => [entry.name, entry]));
+}
 
 let failed = 0;
 let total = 0;
@@ -182,6 +203,7 @@ for (const [label, envExtra] of [['unset', {}], ['on', { CLAUDIA_CHAT_ORDER_WRIT
     assert.equal(calls.writes.length, 1);
     assert.equal(calls.writes[0].url, SB + '/rest/v1/orders?id=eq.' + ORDER_A);
     assert.equal(calls.writes[0].body.stamp_status, 'received');
+    assert.ok(!('sb_stage' in calls.writes[0].body), 'the read-only stored stage is never written');
     assert.equal(calls.telegram.length, 1);
     assert.equal(calls.telegram[0].text, UPDATE_A.reply);
     assert.equal(calls.telegram[0].parse_mode, 'Markdown');
@@ -308,10 +330,92 @@ await check('a chat from a chat id that is not allowed is still refused before a
   assert.ok(calls.telegram[0].text.includes('Access denied'));
 }));
 
+// ── answers only: no payment facts from the dashboard (review F1) ───
+await check('on: Claude still gets today\'s context (lossy stage names, received amounts)', quietWorker(async () => {
+  const ctx = sentContext(await runChat('what is coming up?', QUESTION, {}));
+  assert.equal(ctx['Test Client A'].stage, 'lead');          // quoted
+  assert.equal(ctx['Test Client B'].stage, 'deposit_paid');  // invoiced
+  assert.equal(ctx['Test Client E'].stage, 'payment_full');
+  assert.equal(ctx['Test Client F'].stage, 'completed');     // fulfilled
+  assert.equal(ctx['Test Client I'].stage, 'lead');          // unknown word
+  assert.equal(ctx['Test Client B'].deposit_amount, '0');
+  assert.equal(ctx['Test Client E'].balance_amount, '350');
+  assert.ok(!('sb_stage' in ctx['Test Client A']));
+}));
+
+await check('off: Claude gets truthful stage words and no payment stage', quietWorker(async () => {
+  const ctx = sentContext(await runChat('who still owes a deposit?', QUESTION, OFF));
+  assert.equal(ctx['Test Client A'].stage, 'quoted');
+  assert.equal(ctx['Test Client B'].stage, 'invoiced');
+  assert.equal(ctx['Test Client D'].stage, 'invoiced');      // deposit_paid
+  assert.equal(ctx['Test Client E'].stage, 'invoiced');      // paid_full
+  assert.equal(ctx['Test Client F'].stage, 'fulfilled');
+  assert.equal(ctx['Test Client G'].stage, 'passed');        // cancelled
+  assert.equal(ctx['Test Client H'].stage, 'completed');     // complete
+  assert.equal(ctx['Test Client I'].stage, 'some_new_stage');// passed through, no throw
+  for (const entry of Object.values(ctx)) {
+    assert.ok(!['deposit_paid', 'payment_full', 'paid_full'].includes(entry.stage), entry.name);
+    assert.ok(!('deposit_amount' in entry) && !('balance_amount' in entry), entry.name);
+    assert.ok(!('sb_stage' in entry), entry.name);
+  }
+  assert.equal(ctx['Test Client E'].total_amount, '700');    // the invoice total stays
+  assert.equal(ctx['Test Client A'].name, 'Test Client A');
+}));
+
+await check('off: Claude is told payments come from QuickBooks through Jarvis', quietWorker(async () => {
+  const off = await runChat('who paid?', QUESTION, OFF);
+  const on = await runChat('who paid?', QUESTION, {});
+  const extra = off.ai[0].system.slice(on.ai[0].system.length);
+  assert.ok(extra.includes('Never say who has paid'));
+  assert.ok(extra.includes('QuickBooks') && extra.includes('Jarvis'));
+  assert.ok(extra.includes('"invoiced" means an invoice exists'));
+  assert.doesNotMatch(extra, /[–—]/);
+}));
+
+await check('answersOnlyEventContext: odd stored words never throw or leak a prototype', async () => {
+  const base = { id: 'x', name: 'n', stage: 'lead', deposit_amount: '5', balance_amount: '6', total_amount: '9' };
+  assert.equal(answersOnlyEventContext(base, 'constructor').stage, 'constructor');
+  assert.equal(answersOnlyEventContext(base, '__proto__').stage, '__proto__');
+  assert.equal(answersOnlyEventContext(base, '').stage, 'lead');
+  assert.equal(answersOnlyEventContext(base, null).stage, 'lead');
+  assert.equal(answersOnlyEventContext(base, undefined).stage, 'lead');
+  const out = answersOnlyEventContext(base, 'paid_full');
+  assert.deepEqual(out, { id: 'x', name: 'n', stage: 'invoiced', total_amount: '9' });
+  assert.equal(base.deposit_amount, '5', 'the input entry is not changed');
+});
+
+// ── answers only: odd actions never carry the model's reply (review F3) ──
+const ODD_ACTIONS = [
+  { action: 'Update', eventId: ORDER_A, params: { stage: 'payment_full' }, reply: 'Done! Marked paid' },
+  { action: 'mark', eventId: ORDER_A, params: null, reply: 'Done! Marked paid' },
+  { eventId: ORDER_A, params: null, reply: 'Done! Marked paid' },                 // no action
+  { action: ['update'], eventId: ORDER_A, params: null, reply: 'Done! Marked paid' },
+  { action: 'update Test Client A', eventId: null, params: null, reply: 'Done! Marked paid' },
+];
+await check('off: an odd or missing action gets the off reply, writes nothing, logs only "other"', quietWorker(async () => {
+  for (const claude of ODD_ACTIONS) {
+    logged.length = 0;
+    const calls = await runChat('mark test client a paid', claude, OFF);
+    assert.equal(calls.writes.length, 0, JSON.stringify(claude.action));
+    assert.deepEqual(calls.telegram.map(m => m.text), [CHAT_ORDER_WRITES_OFF_REPLY], JSON.stringify(claude.action));
+    const line = logged.find(l => l.includes('chat order write refused'));
+    assert.ok(line && line.includes('(action other)'), JSON.stringify(claude.action));
+    assert.ok(!line.includes('Test Client'));
+  }
+}));
+
+await check('on: an odd action behaves exactly as before (no write, the model reply is sent)', quietWorker(async () => {
+  for (const claude of ODD_ACTIONS) {
+    const calls = await runChat('mark test client a paid', claude, {});
+    assert.equal(calls.writes.length, 0, JSON.stringify(claude.action));
+    assert.deepEqual(calls.telegram.map(m => m.text), ['Done! Marked paid']);
+  }
+}));
+
 // ── source pins: the gate sits in front of every chat write ─────────
 await check('source: the three chat write calls exist once each, all after the off gate', async () => {
   const source = readFileSync(new URL('./worker.js', import.meta.url), 'utf8');
-  const gate = source.indexOf('if (!chatWritesOn && CHAT_WRITE_ACTIONS.has(claudeResp.action))');
+  const gate = source.indexOf('if (!chatWritesOn && !CHAT_ANSWER_ACTIONS.has(claudeResp.action))');
   assert.ok(gate > 0, 'gate present');
   for (const call of ['await updateEvent(', 'await insertEvent(', 'await deleteEvent(']) {
     const first = source.indexOf(call);
@@ -319,6 +423,7 @@ await check('source: the three chat write calls exist once each, all after the o
     assert.equal(source.indexOf(call, first + 1), -1, call + ' has one call site');
   }
   assert.match(source, /const CHAT_WRITE_ACTIONS = new Set\(\['create', 'update', 'delete'\]\);/);
+  assert.match(source, /const CHAT_ANSWER_ACTIONS = new Set\(\['none', 'list'\]\);/);
 });
 
 console.log('');

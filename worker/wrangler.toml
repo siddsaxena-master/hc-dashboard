@@ -58,6 +58,9 @@ crons = [
 #   update or delete intent writes NOTHING and gets one plain reply: "Chat
 #   edits are off, so nothing was changed. Please make this change in HC App:
 #   https://app.hamptonscoconuts.com". A mistyped value also counts as off.
+#   While off, the chat also never reports who paid: the order list it reads
+#   shows no payment stages and no received amounts (QuickBooks through
+#   Jarvis is the payment truth).
 #   Turn off: `wrangler secret put CLAUDIA_CHAT_ORDER_WRITES`, value off.
 #   Undo: `wrangler secret delete CLAUDIA_CHAT_ORDER_WRITES` (back to writes
 #   allowed). Intake card buttons (Invoice it / Skip) are not affected.

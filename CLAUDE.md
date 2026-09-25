@@ -267,14 +267,32 @@ deployed.
   every create, update or delete intent writes NOTHING and gets one plain reply
   ("Chat edits are off, so nothing was changed. Please make this change in HC
   App: https://app.hamptonscoconuts.com"). Claude's own reply is not sent then.
-  While off, Claude's prompt gets one extra block (return the action at once,
-  no delete confirmation question, never claim a change) and /start shows an
-  answers-only help. A mistyped value counts as off. Intake card buttons are
-  not affected.
-- Tests: `node worker/test-chat-order-writes.mjs` (25 checks, fake network:
+  While off, only the answer actions ('none', 'list') let Claude's reply
+  through; any other action, including a missing or odd one ('Update',
+  'mark'), gets the off reply and the log says `(action other)`. Claude's
+  prompt gets one extra block (return the action at once, no delete
+  confirmation question, never claim a change, never say who has paid or
+  owes: payment status comes from QuickBooks through Jarvis) and /start shows
+  an answers-only help. A mistyped value counts as off. Intake card buttons
+  are not affected.
+- Answers-only context (review fix 2026-09-24): while off, the order list
+  Claude sees uses the STORED stage word (quoted stays quoted, invoiced stays
+  invoiced, fulfilled stays fulfilled), deposit_paid and paid_full both read
+  'invoiced', and deposit_amount and balance_amount are left out. Why: the
+  stored stage and the received amounts disagree with QuickBooks on about
+  1,000 orders until the payment repair runs (payment-stage-truth), so the
+  answers-only chat must not report who paid. `answersOnlyEventContext` does
+  this from `sb_stage`, a read-only copy of orders.stage that
+  `supabaseRowToEvent` now carries (eventToSupabaseRow never writes it). On
+  mode still sends exactly today's context: a side-by-side run of d62abcd
+  against this branch (20 chat scenarios times unset, 'on', ' On ' and '')
+  gave 80 of 80 identical requests, bodies, logs and responses.
+- Tests: `node worker/test-chat-order-writes.mjs` (31 checks, fake network:
   both switch states, writes happen when on, none when off, answers still
-  work, the prompt is byte-identical when on, source pin that every chat write
-  call sits after the gate). 6 of 6 deliberate code breaks caught.
+  work, the prompt is byte-identical when on, today's context when on and the
+  answers-only context when off, odd actions refused when off and unchanged
+  when on, source pin that every chat write call sits after the gate). 6 of 6
+  deliberate code breaks caught at build, 10 of 10 after the review fixes.
 - Windows note: with core.autocrlf=true, test-auth-rollback,
   test-live-activity-end, test-live-activity-start and
   test-notification-security fail 11 text checks on the CRLF checkout (they
@@ -288,24 +306,44 @@ deployed.
   browser call gets 403 "Origin not allowed".
 - e61fe6c (fix/live-worker-payment-integrity, 2026-09-01) is NOT in this
   branch. It was cut from the 2026-08-07 line and no longer applies (its stage
-  map hunk collides with the 2026-09-06 passed fix). With the switch off it is
-  not needed. If chat writes are ever wanted on again, port it first (diff-only
-  PATCH, write confirmation, no payment stages or amounts) and review it again.
+  map hunk collides with the 2026-09-06 passed fix). Its read-side half (no
+  lossy payment stages in what Claude sees) is covered for the off state by
+  the answers-only context above, without its throw on an unknown stage. Its
+  write-side half is not needed while the switch is off. If chat writes are
+  ever wanted on again, port it first (diff-only PATCH, write confirmation,
+  no payment stages or amounts) and review it again.
 - Deploy (each step its own "yes do it", claim the OPERATOR BOARD line first):
-  1. Check `npx wrangler deployments list` still ends on 156087cf. If the
-     coconut guard (feature/coconut-guard, also on d62abcd) shipped first,
-     merge this branch onto what is live before deploying.
-  2. `cd worker && npx wrangler deploy` from this branch with the secret
-     unset. No behavior change. Check the new version is 100%, one */5 tick
-     is Ok in `npx wrangler tail`, and /start still shows the old help.
-  3. `npx wrangler secret put CLAUDIA_CHAT_ORDER_WRITES`, value off. Check:
-     /start shows the answers-only help, a question is answered, "mark the
-     stamp received for <order>" gets the HC App reply and the order is
-     unchanged in HC App.
-  Undo step 3: `npx wrangler secret delete CLAUDIA_CHAT_ORDER_WRITES`.
-  Undo step 2: `npx wrangler rollback 156087cf-dc37-410f-92dd-59df8ac1b53a`
-  (that code ignores the new secret; 156087cf is above 657f45c0, so the
-  MS_GRAPH_CLIENT_STATE rollback trap does not apply).
+  1. Run `npx --no-install wrangler deployments list` and WRITE DOWN the
+     version id that is live right now (156087cf on 2026-09-24; it changes if
+     anything else ships first, for example the coconut guard). That id is
+     the rollback target for step 2. If the coconut guard
+     (feature/coconut-guard, also on d62abcd) shipped first, merge this
+     branch onto what is live before deploying.
+  2. `cd worker && npx --no-install wrangler deploy` from this branch with
+     the secret unset. No behavior change. Check the new version is 100%,
+     one */5 tick is Ok in `npx wrangler tail`, and /start still shows the
+     old help.
+  3. `npx --no-install wrangler secret put CLAUDIA_CHAT_ORDER_WRITES`, value
+     off. FIRST prove the secret landed on the live worker, before any
+     write-shaped chat message: `npx --no-install wrangler deployments list`
+     shows a new Secret Change at 100%, and
+     `npx --no-install wrangler versions view <that id>` lists
+     CLAUDIA_CHAT_ORDER_WRITES among the secret names (run both from
+     `worker/`, never with `--config wrangler.end-drain-017.toml`). If the
+     name is missing, stop: a write test would run today's whole-row PATCH.
+     Then check from Sidd's chat: /start shows the answers-only help, a
+     question is answered, and the write probe is a CREATE of an obviously
+     fake lead, never a change to a real order: "add new event: TEST switch
+     check, Dec 31, 1 coconut". Expect the HC App reply and NO "TEST switch
+     check" row in HC App, plus `chat order write refused ... (action
+     create)` in `npx wrangler tail`. (If the switch had failed, the damage is
+     one junk inquiry row that can be marked Passed, not a rewritten order.)
+  Undo step 3: `npx --no-install wrangler secret delete CLAUDIA_CHAT_ORDER_WRITES`.
+  Undo step 2: `npx --no-install wrangler rollback <the id written down in
+  step 1>` (156087cf-dc37-410f-92dd-59df8ac1b53a if nothing else shipped
+  first; rolling back to 156087cf after another deploy would also remove
+  that deploy). That code ignores the new secret; 156087cf is above
+  657f45c0, so the MS_GRAPH_CLIENT_STATE rollback trap does not apply.
 
 ## Current uncommitted state (as of 2026-07-07)
 

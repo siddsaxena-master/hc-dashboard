@@ -100,6 +100,27 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const CHAT_ORDER_WRITES_OFF_REPLY =
   'Chat edits are off, so nothing was changed. Please make this change in HC App: https://app.hamptonscoconuts.com';
 const CHAT_WRITE_ACTIONS = new Set(['create', 'update', 'delete']);
+// While off, Claude's own reply goes out ONLY for these two answer actions.
+// Anything else (a write, 'Update', 'mark', a missing action) gets the off
+// reply, so an odd action can never carry a "Done!" to Sidd.
+const CHAT_ANSWER_ACTIONS = new Set(['none', 'list']);
+// While off, the stage word Claude sees for each order. Unlike SB_STAGE_TO_UI
+// (the lossy names the chat writes back with), quoted, invoiced and fulfilled
+// keep their own names, and the two stages that claim money (deposit_paid,
+// paid_full) read 'invoiced': the stored stage and the received amounts can
+// disagree with QuickBooks until the payment repair runs, and QuickBooks
+// (through Jarvis) is the only payment truth. An unknown stored word passes
+// through as it is, never a throw: one odd row must not break every answer.
+const ANSWERS_ONLY_STAGE = {'inquiry':'lead','quoted':'quoted','invoiced':'invoiced','deposit_paid':'invoiced','paid_full':'invoiced','fulfilled':'fulfilled','complete':'completed','cancelled':'passed'};
+export function answersOnlyEventContext(entry, storedStage) {
+  // deposit_amount and balance_amount are money RECEIVED per the dashboard,
+  // which is not payment truth yet, so they are left out while off.
+  const { deposit_amount, balance_amount, ...rest } = entry;
+  const stored = String(storedStage || '');
+  const stage = Object.prototype.hasOwnProperty.call(ANSWERS_ONLY_STAGE, stored)
+    ? ANSWERS_ONLY_STAGE[stored] : (stored || 'lead');
+  return { ...rest, stage };
+}
 export function chatOrderWritesOn(env) {
   const value = String((env && env.CLAUDIA_CHAT_ORDER_WRITES) || '').trim().toLowerCase();
   return value === '' || value === 'on';
@@ -114,7 +135,9 @@ const CHAT_WRITES_OFF_PROMPT = `
 CHAT EDITS ARE OFF:
 - This chat answers questions only. Events are added and changed in HC App.
 - When the user asks to add, change, mark or delete an event, return that action ("create", "update" or "delete") right away, with no confirmation question. Nothing will be saved; the system tells the user where to make the change.
-- Never say that anything was added, changed, marked or deleted.`;
+- Never say that anything was added, changed, marked or deleted.
+- In the events list, stage is one of: lead, quoted, invoiced, fulfilled, completed, passed. "invoiced" means an invoice exists. It says nothing about payment. Received amounts are left out on purpose.
+- Never say who has paid, who owes money, or how much was collected, and never guess it from the stage, the total or the notes. For a payment question, say payment status comes from QuickBooks and Jarvis can answer it.`;
 
 export default {
   // ── SCHEDULED (Cloudflare Cron Triggers) ──
@@ -277,8 +300,13 @@ export default {
         source: e.source || '',
       }));
 
+      // Chat edits off (answers only): truthful stage words and no received
+      // amounts (see answersOnlyEventContext). On: exactly evContext, as before.
+      const chatContext = chatWritesOn ? evContext
+        : evContext.map((entry, i) => answersOnlyEventContext(entry, events[i].sb_stage));
+
       // Call Claude
-      const claudeResp = await callClaude(env.ANTHROPIC_API_KEY, userText, evContext, today,
+      const claudeResp = await callClaude(env.ANTHROPIC_API_KEY, userText, chatContext, today,
         chatWritesOn ? SYSTEM_PROMPT : SYSTEM_PROMPT + CHAT_WRITES_OFF_PROMPT);
       if (!claudeResp || claudeResp.error) {
         const errMsg = claudeResp?.error || 'Unknown error';
@@ -286,13 +314,14 @@ export default {
         return ok();
       }
 
-      // Chat edits switched off: a create, update or delete intent writes
-      // nothing (no insertEvent, updateEvent or deleteEvent call below), and
-      // Claude's own reply is NOT sent, since it may say the change was made.
-      // Plain text, no Markdown. Questions ("none", "list") fall through.
-      if (!chatWritesOn && CHAT_WRITE_ACTIONS.has(claudeResp.action)) {
+      // Chat edits switched off: anything but an answer ("none", "list")
+      // writes nothing (no insertEvent, updateEvent or deleteEvent call
+      // below), and Claude's own reply is NOT sent, since it may say the
+      // change was made. Plain text, no Markdown. The log names a known write
+      // action or 'other', never the model's own words.
+      if (!chatWritesOn && !CHAT_ANSWER_ACTIONS.has(claudeResp.action)) {
         console.log('chat order write refused: CLAUDIA_CHAT_ORDER_WRITES is off (action ' +
-          claudeResp.action + ')');
+          (CHAT_WRITE_ACTIONS.has(claudeResp.action) ? claudeResp.action : 'other') + ')');
         await sendTelegramPlain(env.TG_BOT_TOKEN, chatId, CHAT_ORDER_WRITES_OFF_REPLY);
         return ok();
       }
@@ -380,6 +409,9 @@ function supabaseRowToEvent(o) {
     stamp_status: SB_STAMP_TO_UI[o.stamp_status] || '',
     logo_received: o.logo_received ? 'Yes' : '',
     stage: SB_STAGE_TO_UI[o.stage] || 'lead',
+    // The stored stage word, read only by the answers-only chat context.
+    // Never written back: eventToSupabaseRow picks its fields by name.
+    sb_stage: o.stage || '',
     pre_tax_amount: dollars(o.pre_tax_cents),
     tax_amount: dollars(o.tax_cents),
     total_amount: dollars(o.total_cents),
