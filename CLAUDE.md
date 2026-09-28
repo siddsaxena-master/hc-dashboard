@@ -345,6 +345,39 @@ deployed.
   that deploy). That code ignores the new secret; 156087cf is above
   657f45c0, so the MS_GRAPH_CLIENT_STATE rollback trap does not apply.
 
+## CRM Step C: mail reader alarm and Google Voice guards (built 2026-09-28, LOCAL ONLY)
+
+Branch `feature/crm-step-c-claudia`, cut from the live lineage a5b47f3. Plan:
+STEP-C-PLAN.md section 5 (item 1 plus the guards) and INTERFACES.md section 5.
+Nothing deployed. Ships at P5b as one Claudia deploy, its own "yes do it".
+
+- Alarm (`runCrmRobotAlarmScan`, */5 chain right after the intake cards):
+  reads `rpc/hc_crm_robot_health` (migration 052). Stale = the older of
+  graph_ok_at and poller_ok_at over 30 minutes (judged 7:00 AM to 10:59 PM
+  Eastern), or fail_streak 3, or a rate_limited line in the last hour. One
+  plain Telegram "Mail reader stopped at 9:12 PM. The CRM is not updating
+  from email." and later one "Mail reader is back." to the ALLOWED_CHAT_IDS
+  chats. Memory lives in the database: `rpc/hc_crm_robot_alarm` is written
+  FIRST, then the message; a message nobody got is recorded as send_failed
+  and the stopped message is retried next tick. Armed only while the CRM
+  master switch is On. Before 052 exists the health read is a 404 and the
+  scan does nothing (log line only). At night an old heartbeat alone never
+  alarms, and a still-old reader is never reported as back.
+- Google Voice guards (rows with channel sms_forward are sorted in HC App
+  only): the card scan and the hourly nag add `&channel=neq.sms_forward`,
+  the 8am "awaiting review" read adds `&channel=eq.email`, and the digest
+  gets "N texts or voicemails in HC App New to sort" (only when N > 0).
+  `isVoiceRelayAddress` (@txt.voice.google.com, voice-noreply@google.com)
+  makes leadLookupEmail return null, reconfirmRecipientHolds return
+  no_email, and the webhook lead row and Formspree row never store one.
+- Not built now: migration 053, the 8am Sales line, Open in HC App buttons,
+  the thread check (plan 5 items 2 to 4, P11). CLAUDIA_CHAT_ORDER_WRITES
+  stays off.
+- Tests: `node worker/test-crm-robot-alarm.mjs` (21 checks) and
+  `node worker/test-google-voice-guards.mjs` (10 checks), fake network.
+- Deploy: from this branch (live lineage, NEVER main), write down the live
+  version id first as the rollback target (08e36b45 on 2026-09-28).
+
 ## Current uncommitted state (as of 2026-07-07)
 
 index.html has the one-line pending-payment fix described above staged

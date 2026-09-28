@@ -1019,6 +1019,11 @@ async function runScheduled(event, env, alsoNotify = true) {
       if (hourlyErr) throw hourlyErr;
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
+      // CRM mail reader alarm (Step C, needs migration 052): one Telegram
+      // when the droplet's mail reader stops, one when it is back. Fully
+      // wrapped inside and silent until 052 exists, so it never breaks
+      // anything below.
+      await runCrmRobotAlarmScan(env);
       // Owner-confirmed delivery times (migration 034 delivery_request)
       // go out as banners right after the intake cards. Fully wrapped
       // inside, so it can never break the Live Activity or field-ops
@@ -1328,6 +1333,9 @@ export function reconfirmRecipientHolds(recipients) {
   if (list.length > 4) return ['too_many_emails'];
   const own = reconfirmOwnDomains();
   if (list.some((a) => own.some((d) => a.endsWith(d)))) return ['no_email'];
+  // A Google Voice relay address is not a customer email either: a reply
+  // to a txt.voice address would TEXT the customer (CRM Step C, plan 1.4).
+  if (list.some(isVoiceRelayAddress)) return ['no_email'];
   if (list.every((a) => RECONFIRM_BILLING_LOCAL_PARTS.has(a.split('@')[0]))) return ['billing_email_only'];
   return [];
 }
@@ -2949,8 +2957,11 @@ export async function buildIntakeDigestLines(env) {
   // on Jarvis). Approved rows MUST be reported too - if Jarvis is down
   // or its auto-draft flag is off, a tapped lead would otherwise sit
   // there forever with nobody watching it.
+  // Email rows only (CRM Step C): Google Voice rows (channel sms_forward)
+  // are sorted in the HC App, never in the Jarvis chat, so they get their
+  // own line below instead of an "invoice <id>" hint.
   const waiting = await fetchIntakeLive(env,
-    'select=id,created_at,reviewed_at,status&status=in.(pending_review,approved)&order=created_at.asc');
+    'select=id,created_at,reviewed_at,status&status=in.(pending_review,approved)&channel=eq.email&order=created_at.asc');
   // NOTE: no early return on a failed read (2026-07-25 review). Each
   // section below stands on its own, so one flaky query only drops its
   // own line instead of silently swallowing the skipped/not-order audit
@@ -2972,6 +2983,16 @@ export async function buildIntakeDigestLines(env) {
     )[0];
     lines.push('Intake: ' + approved.length + ' approved and still waiting on Jarvis (oldest ' +
       hoursSince(intakeWaitingSince(oldestApproved)) + 'h) - if this does not clear, check the jarvis-bot service.');
+  }
+
+  // Google Voice texts, voicemails and missed calls waiting in the HC App
+  // (CRM Step C). A count only: never a number, a name or the words. No
+  // line when there are none or the read failed.
+  const texts = await fetchIntakeLive(env,
+    'select=id&status=eq.pending_review&channel=eq.sms_forward&order=id.asc&limit=1000');
+  if (texts && texts.length > 0) {
+    lines.push((texts.length >= 1000 ? '1000 or more' : String(texts.length)) +
+      ' texts or voicemails in HC App New to sort');
   }
 
   // Classifier visibility: emails set aside as not-orders. A wrong
@@ -3050,9 +3071,11 @@ export async function runIntakeNagScan(env) {
     // exists precisely to catch "the tap went nowhere". PostgREST
     // cannot filter on "whichever column is later", so fetch the
     // in-flight rows and window them here - this queue is small.
+    // Never Google Voice rows (CRM Step C): they wait in the HC App, and
+    // their from address is a Google relay, not a customer.
     const inFlight = await fetchIntakeLive(env,
       'select=id,from_addr,status,created_at,reviewed_at' +
-      '&status=in.(pending_review,approved)&order=created_at.asc&limit=500');
+      '&status=in.(pending_review,approved)&channel=neq.sms_forward&order=created_at.asc&limit=500');
     if (!inFlight || !inFlight.length) continue;
     const rows = inFlight.filter(r => {
       const since = new Date(intakeWaitingSince(r)).getTime();
@@ -3275,10 +3298,12 @@ export async function runIntakeCardScan(env) {
   // mail re-read by the replay script) never get a card: this scan runs
   // BEFORE the proposal scan on the same tick, so without the
   // fetchIntakeLive filter a replayed row would be carded before it is
-  // scanned.
+  // scanned. Google Voice rows (channel sms_forward) never get a card
+  // (CRM Step C, decision D8): they are sorted in the HC App only.
   const rows = await fetchIntakeLive(env,
     'select=id,from_addr,subject,raw_text,classification,created_at,external_invoice_id,order_id' +
     '&status=eq.pending_review' +
+    '&channel=neq.sms_forward' +
     '&telegram_message_id=is.null' +
     '&classified_at=not.is.null' +
     '&classification=in.(order,maybe_order)' +
@@ -3378,7 +3403,154 @@ export async function runIntakeCardScan(env) {
   }
 }
 
-// ── INTAKE CARD BUTTON TAPS (callback queries) ──
+// ── CRM MAIL READER ALARM (CRM Step C, plan 5 item 1; needs migration 052) ──
+// The droplet's mail reader writes a heartbeat line after every pass. Every
+// 5 minutes this asks the database for the summary (hc_crm_robot_health)
+// and tells Sidd ONCE on Telegram when the reader stops, and ONCE when it
+// is back. The database remembers what was sent (hc_crm_robot_alarm writes
+// one line; health hands it back as last_alarm), so a new tick or a new
+// worker version never repeats a message. Before 052 exists the health
+// read fails (404) and this does nothing at all. Counts and times only:
+// never an address, a name or any mail text.
+const CRM_ALARM_STALE_MS = 30 * 60 * 1000;   // heartbeat older than 30 minutes
+const CRM_ALARM_FAIL_STREAK = 3;             // 3 failed passes in a row
+const CRM_ALARM_FIRST_HOUR = 7;              // the age is judged 7:00 AM ...
+const CRM_ALARM_LAST_HOUR = 22;              // ... to 10:59 PM Eastern
+export const CRM_ALARM_BACK_TEXT = 'Mail reader is back.';
+
+// A timestamp string as milliseconds, or null when missing or unreadable.
+function crmAlarmMs(value) {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+// The stamp the age is measured from: the OLDER of graph_ok_at (last good
+// Graph read) and poller_ok_at (last good inbox poll), the same rule as the
+// HC App header. A stamp the heartbeat left empty (a fresh restart) falls
+// back to last_pass_at. null = nothing to measure, which counts as stale.
+export function crmAlarmStampMs(health) {
+  const h = health || {};
+  const pass = crmAlarmMs(h.last_pass_at);
+  const graph = crmAlarmMs(h.graph_ok_at) ?? pass;
+  const poller = crmAlarmMs(h.poller_ok_at) ?? pass;
+  if (graph === null || poller === null) return null;
+  return Math.min(graph, poller);
+}
+
+// True from 7:00 AM to 10:59 PM Eastern (daylight saving handled by Intl).
+export function crmAlarmInWindow(nowMs) {
+  const hh = new Date(wallClockUtcMs(nowMs, ET_ZONE)).getUTCHours();
+  return hh >= CRM_ALARM_FIRST_HOUR && hh <= CRM_ALARM_LAST_HOUR;
+}
+
+// "Mail reader stopped at 9:12 PM. ..." with the time built by hand in
+// Eastern time (plan decision C22). No time when there is no stamp at all.
+export function crmAlarmStaleText(stampMs) {
+  if (stampMs === null || stampMs === undefined) {
+    return 'Mail reader stopped. The CRM is not updating from email.';
+  }
+  const wall = new Date(wallClockUtcMs(stampMs, ET_ZONE));
+  return 'Mail reader stopped at ' + clockLabel(wall.getUTCHours(), wall.getUTCMinutes()) +
+    '. The CRM is not updating from email.';
+}
+
+// Pure decision (no network), so the tests can pin every rule. Returns
+// { action: 'none' | 'stale' | 'back', reason, text }.
+//   STALE = the heartbeat age is over 30 minutes (judged only 7:00 AM to
+//   10:59 PM Eastern), or 3 failed passes in a row, or a rate_limited line
+//   in the last hour (health only reports one from the last hour).
+//   stale and the last message was not "stopped"  -> send "stopped".
+//   not stale and the last message was "stopped"   -> send "back".
+// "Back" also needs a fresh heartbeat age, even at night: outside the
+// window the age is not JUDGED (no new night alarm for a quiet reader),
+// but a reader that is still old must never be reported as back.
+export function crmAlarmDecision(health, nowMs) {
+  const h = health && typeof health === 'object' ? health : {};
+  // Armed only while the CRM robots' master switch is On (decision C9).
+  if (h.master !== 'on') return { action: 'none', reason: 'master_off' };
+  const lastCode = h.last_alarm && typeof h.last_alarm === 'object' ? h.last_alarm.code : null;
+  const stampMs = crmAlarmStampMs(h);
+  const ageStale = stampMs === null || nowMs - stampMs > CRM_ALARM_STALE_MS;
+  const failing = Number(h.fail_streak) >= CRM_ALARM_FAIL_STREAK;
+  const limited = !!h.rate_limited_at;
+  const stale = failing || limited || (ageStale && crmAlarmInWindow(nowMs));
+  if (stale) {
+    if (lastCode === 'alarm_stale') return { action: 'none', reason: 'already_sent' };
+    return { action: 'stale', reason: failing ? 'fail_streak' : limited ? 'rate_limited' : 'old_heartbeat',
+      text: crmAlarmStaleText(stampMs) };
+  }
+  if (lastCode === 'alarm_stale' && !ageStale) {
+    return { action: 'back', reason: 'recovered', text: CRM_ALARM_BACK_TEXT };
+  }
+  return { action: 'none', reason: ageStale ? 'night_hold' : 'healthy' };
+}
+
+// One robot RPC with a 10 second limit. The parsed JSON object, or null on
+// any failure (a 404 before 052 exists, a timeout, a bad body). Logs the
+// status only, never the body.
+async function crmRobotRpc(env, name, body) {
+  try {
+    const resp = await webhookFetch(env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/rpc/' + name, {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    }, 10000);
+    if (!resp || !resp.ok) {
+      console.log('crm alarm: ' + name + ' answered ' + (resp ? resp.status : 'nothing'));
+      return null;
+    }
+    const data = await resp.json();
+    return data && typeof data === 'object' && !Array.isArray(data) ? data : null;
+  } catch (e) {
+    console.log('crm alarm: ' + name + ' failed: ' + ((e && e.name) || 'error'));
+    return null;
+  }
+}
+
+// Writes Claudia's memory line: state 'stale', 'back' or 'send_failed'.
+async function crmAlarmRemember(env, state) {
+  const out = await crmRobotRpc(env, 'hc_crm_robot_alarm', { p: { v: 1, state } });
+  return !!(out && out.code === 'ok');
+}
+
+// The 5-minute scan. Never throws. Order matters: the memory line is
+// written FIRST, then the message goes out, so a crash or timeout after
+// the send can never make the next tick send it a second time. A message
+// nobody received is recorded as send_failed, so the next tick tries the
+// "stopped" message again. A lost "back" message is not retried (the
+// reader is fine by then, and a late "back" is noise).
+export async function runCrmRobotAlarmScan(env) {
+  try {
+    if (!env || !env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY || !env.TG_BOT_TOKEN) return;
+    const chatIds = (env.ALLOWED_CHAT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (!chatIds.length) return;
+    const health = await crmRobotRpc(env, 'hc_crm_robot_health', {});
+    if (!health || health.v !== 1) return;   // no 052 yet, or an unreadable answer: silent
+    const decision = crmAlarmDecision(health, Date.now());
+    if (decision.action === 'none') return;
+    // Claim first. If the memory line cannot be written, send nothing:
+    // without it every tick would send again.
+    if (!(await crmAlarmRemember(env, decision.action))) {
+      console.log('crm alarm: could not record ' + decision.action + ', not sending');
+      return;
+    }
+    let delivered = false;
+    for (const cid of chatIds) {
+      // Plain text, no buttons, the same owner chats as every other alert.
+      if (await sendTelegramPlain(env.TG_BOT_TOKEN, cid, decision.text)) delivered = true;
+    }
+    if (!delivered) {
+      console.log('crm alarm: ' + decision.action + ' message not delivered');
+      await crmAlarmRemember(env, 'send_failed');
+    } else {
+      console.log('crm alarm: sent ' + decision.action + ' (' + decision.reason + ')');
+    }
+  } catch (e) {
+    console.error('runCrmRobotAlarmScan error:', (e && e.message) || e);
+  }
+}
+
 // Button taps arrive as callback_query updates on the bot's ONE
 // Telegram webhook - the same root POST that chat messages already
 // use - and the root handler routes them here. No webhook re-pointing
@@ -4533,7 +4705,9 @@ async function handleFormspreeWebhook(request, env) {
         const orderRow = {
           id: receiptId,
           client_name: extracted.client_name || submission.name || 'Unknown',
-          client_email: extracted.client_email || submission.email || null,
+          // A Google Voice relay is never stored as a client email (CRM Step C).
+          client_email: [extracted.client_email, submission.email]
+            .find((a) => a && !isVoiceRelayAddress(a)) || null,
           client_phone: extracted.client_phone || submission.phone || null,
           company: extracted.company || null,
           event_type: ['wedding','corporate','trade_show','hospitality','cruise','wellness','other'].includes(extracted.event_type) ? extracted.event_type : 'other',
@@ -4727,6 +4901,10 @@ function _scrubOperatorEmail(email) {
   if (!email) return null;
   const lower = String(email).trim().toLowerCase();
   if (!lower) return null;
+  // A Google Voice relay is never a client email either (CRM Step C).
+  // This scrub is the lead row's raw fallback, so without this line a
+  // relay dropped by leadLookupEmail could still be stored on the row.
+  if (isVoiceRelayAddress(lower)) return null;
   return lower.endsWith(OPERATOR_EMAIL_DOMAIN) ? null : email;
 }
 
@@ -4837,10 +5015,27 @@ export function leadLookupEmail(email) {
   const angled = e.match(/<([^<>]+)>/);
   if (angled) e = angled[1].trim();
   if (!e || !e.includes('@')) return null;
+  // Google Voice relays (CRM Step C) never name a lead: see below.
+  if (isVoiceRelayAddress(e)) return null;
   const [local, domain] = e.split('@');
   if (/^(no-?reply|do-?not-?reply|notifications?|mailer-daemon|postmaster)/.test(local)) return null;
   if (/(^|\.)(formspree\.io|formspree\.com|godaddy\.com|secureserver\.net)$/.test(domain)) return null;
   return e;
+}
+
+// Google Voice relay addresses (CRM Step C, plan 1.4). Mail from the
+// company Google Voice number arrives from voice-noreply@google.com (a
+// robot) or from <digits>.<digits>...@txt.voice.google.com, and a reply to
+// a txt.voice address TEXTS the customer. So neither is ever a client
+// email: leadLookupEmail drops them, reconfirmRecipientHolds holds them
+// as no_email, and the lead row fallback below never stores one. Works
+// on a bare address, a "Name <addr>" form or a list. Exported for tests.
+export function isVoiceRelayAddress(email) {
+  const s = String(email || '').trim().toLowerCase();
+  if (!s || !s.includes('@')) return false;
+  // "(?![a-z0-9.-])" stops a lookalike such as txt.voice.google.com.example.com.
+  if (/@txt\.voice\.google\.com(?![a-z0-9.-])/.test(s)) return true;
+  return /(^|[^a-z0-9._%+-])voice-noreply@google\.com(?![a-z0-9.-])/.test(s);
 }
 
 // PostgREST ilike: `_` and `%` are wildcards and `*` is an alias for `%`,
