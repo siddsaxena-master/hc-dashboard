@@ -119,11 +119,50 @@ test('8am digest: awaiting review counts email rows only, texts get their own li
   const waitingRead = intakeReads().find((u) => u.includes('status=in.(pending_review,approved)'));
   assert.ok(waitingRead.includes('&channel=eq.email'), waitingRead);
   const textsRead = intakeReads().find((u) => u.includes('channel=eq.sms_forward'));
-  assert.ok(textsRead.includes('status=eq.pending_review'));
   assert.ok(textsRead.includes('&replayed_at=is.null'));
   assert.ok(textsRead.startsWith('https://example.invalid/rest/v1/intake_messages?select=id&'));
   assert.ok(lines.some((l) => l.startsWith('Intake: 2 awaiting review')));
-  assert.ok(lines.includes('3 texts or voicemails in HC App New to sort'));
+  assert.ok(lines.includes('3 texts or voicemails came in over the last 24h (sort them in HC App)'), JSON.stringify(lines));
+  assert.ok(!lines.some((l) => l.includes('New to sort')), JSON.stringify(lines));
+});
+
+// A text that was already sorted (robot attach, Add to deal, Make lead)
+// keeps status pending_review, so the count must be keyed on arrival time
+// (last 24h), never on status, or it would grow every day.
+test('8am digest: the texts count is arrivals in the last 24h, never a status count', async () => {
+  urls = [];
+  answer = digestAnswer([], threeTexts);
+  const before = Date.now();
+  await buildIntakeDigestLines(env);
+  const after = Date.now();
+  const textsReads = intakeReads().filter((u) => u.includes('channel=eq.sms_forward'));
+  assert.equal(textsReads.length, 1);
+  const u = textsReads[0];
+  assert.ok(!u.includes('status='), 'no status filter: ' + u);
+  const m = u.match(/[?&]created_at=gte\.([^&]+)/);
+  assert.ok(m, 'created_at window missing: ' + u);
+  const since = Date.parse(m[1]);
+  assert.ok(since >= before - 24 * 3600000 - 1000 && since <= after - 24 * 3600000 + 1000, m[1]);
+  assert.ok(u.includes('&limit=1000'));
+});
+
+// A voicemail marked Not a lead (or set aside) in HC App must never be
+// reported as "1 email skipped ... show <id>", a Jarvis email command.
+test('8am digest: the skipped and not-orders audit reads are email rows only', async () => {
+  urls = [];
+  // The fake answers a Google Voice row to any audit read WITHOUT the
+  // email filter, the way the live table would once texts exist.
+  answer = (u) => {
+    if ((u.includes('status=eq.ignored') || u.includes('status=eq.dismissed')) && !u.includes('channel=eq.email')) {
+      return [{ id: 77 }];
+    }
+    return [];
+  };
+  const lines = await buildIntakeDigestLines(env);
+  const audit = intakeReads().filter((u) => u.includes('status=eq.ignored') || u.includes('status=eq.dismissed'));
+  assert.equal(audit.length, 2);
+  for (const u of audit) assert.ok(u.includes('&channel=eq.email'), u);
+  assert.ok(!lines.some((l) => l.includes('skipped') || l.includes('not-orders')), JSON.stringify(lines));
 });
 
 test('8am digest: no texts line when there are none or the read fails', async () => {
@@ -140,7 +179,7 @@ test('8am digest: a capped read says 1000 or more, never a false exact count', a
   urls = [];
   answer = digestAnswer([], Array.from({ length: 1000 }, (_, i) => ({ id: i + 1 })));
   const lines = await buildIntakeDigestLines(env);
-  assert.ok(lines.includes('1000 or more texts or voicemails in HC App New to sort'));
+  assert.ok(lines.includes('1000 or more texts or voicemails came in over the last 24h (sort them in HC App)'));
 });
 
 // ── runner ─────────────────────────────────────────────────────────

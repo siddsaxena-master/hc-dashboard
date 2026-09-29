@@ -2985,14 +2985,21 @@ export async function buildIntakeDigestLines(env) {
       hoursSince(intakeWaitingSince(oldestApproved)) + 'h) - if this does not clear, check the jarvis-bot service.');
   }
 
-  // Google Voice texts, voicemails and missed calls waiting in the HC App
-  // (CRM Step C). A count only: never a number, a name or the words. No
-  // line when there are none or the read failed.
+  // Google Voice texts, voicemails and missed calls that ARRIVED in the
+  // last 24 hours (CRM Step C). A count only: never a number, a name or
+  // the words. No line when there are none or the read failed.
+  // Keyed on created_at, not status: a text that was already sorted (the
+  // robot attached it, or Sidd tapped Add to deal or Make lead) keeps
+  // status pending_review, so a status count would grow every day and
+  // never match HC App's New to sort (2026-09-29 review). The real "New
+  // to sort" count arrives with 053 at P11.
+  const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
   const texts = await fetchIntakeLive(env,
-    'select=id&status=eq.pending_review&channel=eq.sms_forward&order=id.asc&limit=1000');
+    'select=id&channel=eq.sms_forward&created_at=gte.' + encodeURIComponent(since24h) +
+    '&order=id.asc&limit=1000');
   if (texts && texts.length > 0) {
     lines.push((texts.length >= 1000 ? '1000 or more' : String(texts.length)) +
-      ' texts or voicemails in HC App New to sort');
+      ' texts or voicemails came in over the last 24h (sort them in HC App)');
   }
 
   // Classifier visibility: emails set aside as not-orders. A wrong
@@ -3007,10 +3014,12 @@ export async function buildIntakeDigestLines(env) {
   // dismisses (or that Jarvis filed ignored) must never become a digest
   // line, or the day after a replay Sidd would be sent to "show <id>" on
   // dozens of old emails.
+  // Email rows only (CRM Step C): a Google Voice row set aside in HC App
+  // must never be reported as an email with a Jarvis "show <id>" hint.
   const cutoff = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
   const ignored = await fetchIntakeLive(env,
     'select=id&status=eq.ignored&reviewed_at=gte.' + cutoff +
-    '&order=reviewed_at.desc');
+    '&channel=eq.email&order=reviewed_at.desc');
   if (ignored && ignored.length > 0) {
     lines.push('Intake: ' + ignored.length + ' email' +
       (ignored.length === 1 ? '' : 's') +
@@ -3022,9 +3031,11 @@ export async function buildIntakeDigestLines(env) {
   // silent (2026-07-25 security review): a mis-tap, or a forged tap if
   // the webhook secret is ever missing, would otherwise bury a real
   // lead with nobody told.
+  // Email rows only, same as above: a voicemail Sidd marks Not a lead in
+  // HC App is not "1 email skipped".
   const dismissed = await fetchIntakeLive(env,
     'select=id&status=eq.dismissed&reviewed_at=gte.' + cutoff +
-    '&order=reviewed_at.desc');
+    '&channel=eq.email&order=reviewed_at.desc');
   if (dismissed && dismissed.length > 0) {
     lines.push('Intake: ' + dismissed.length + ' email' +
       (dismissed.length === 1 ? '' : 's') +
@@ -3528,7 +3539,13 @@ export async function runCrmRobotAlarmScan(env) {
     const health = await crmRobotRpc(env, 'hc_crm_robot_health', {});
     if (!health || health.v !== 1) return;   // no 052 yet, or an unreadable answer: silent
     const decision = crmAlarmDecision(health, Date.now());
-    if (decision.action === 'none') return;
+    if (decision.action === 'none') {
+      // One reason word per tick (no data), so `npx wrangler tail` proves
+      // the scan runs after a deploy: master_off, healthy, night_hold or
+      // already_sent.
+      console.log('crm alarm: none (' + decision.reason + ')');
+      return;
+    }
     // Claim first. If the memory line cannot be written, send nothing:
     // without it every tick would send again.
     if (!(await crmAlarmRemember(env, decision.action))) {

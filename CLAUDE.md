@@ -365,18 +365,48 @@ Nothing deployed. Ships at P5b as one Claudia deploy, its own "yes do it".
   alarms, and a still-old reader is never reported as back.
 - Google Voice guards (rows with channel sms_forward are sorted in HC App
   only): the card scan and the hourly nag add `&channel=neq.sms_forward`,
-  the 8am "awaiting review" read adds `&channel=eq.email`, and the digest
-  gets "N texts or voicemails in HC App New to sort" (only when N > 0).
+  the 8am "awaiting review", "set aside as not-orders" and "skipped" reads
+  add `&channel=eq.email`, and the digest gets "N texts or voicemails came
+  in over the last 24h (sort them in HC App)" (only when N > 0). That line
+  counts ARRIVALS by created_at, never status: a sorted text keeps status
+  pending_review, so a status count would grow forever. The true New to
+  sort count (texts included) comes with 053's hc_crm_sales_counts at P11.
   `isVoiceRelayAddress` (@txt.voice.google.com, voice-noreply@google.com)
   makes leadLookupEmail return null, reconfirmRecipientHolds return
   no_email, and the webhook lead row and Formspree row never store one.
 - Not built now: migration 053, the 8am Sales line, Open in HC App buttons,
   the thread check (plan 5 items 2 to 4, P11). CLAUDIA_CHAT_ORDER_WRITES
   stays off.
-- Tests: `node worker/test-crm-robot-alarm.mjs` (21 checks) and
-  `node worker/test-google-voice-guards.mjs` (10 checks), fake network.
-- Deploy: from this branch (live lineage, NEVER main), write down the live
-  version id first as the rollback target (08e36b45 on 2026-09-28).
+- Tests: `node worker/test-crm-robot-alarm.mjs` (22 checks) and
+  `node worker/test-google-voice-guards.mjs` (12 checks), fake network.
+  A tick that sends nothing logs one line, `crm alarm: none (<reason>)`
+  (master_off, healthy, night_hold or already_sent), never any data.
+- Deploy (P5b, its own "yes do it", claim the OPERATOR BOARD hc-dashboard
+  line first):
+  1. From `worker/`, run `npx --no-install wrangler deployments list` and
+     WRITE DOWN the live version id (08e36b45 on 2026-09-28). That id is the
+     rollback target. If it is not 08e36b45 (for example the coconut guard
+     G5 shipped first), merge that live branch into this one and rerun the
+     tests before deploying, or this deploy silently removes that code.
+  2. `cd worker && npx --no-install wrangler deploy` from THIS branch (never
+     main; it already contains fix/claudia-chat-order-writes-switch a5b47f3,
+     so the plan's "from fix/claudia-chat-order-writes-switch" means this
+     branch). Check the new version is 100% and one */5 tick is Ok in
+     `npx wrangler tail`.
+  3. Live proof (the P5b checkpoint, the local test is not enough): within
+     5 minutes `npx wrangler tail` shows `crm alarm: none (master_off)`
+     (before 052 exists it shows `crm alarm: hc_crm_robot_health answered
+     404` instead). After P6 turns the master switch On, it shows
+     `crm alarm: none (healthy)`. P7 waits for this.
+  4. Move the lineage forward so the next routine Claudia deploy cannot
+     remove the alarm or the guards: fast-forward
+     fix/claudia-chat-order-writes-switch to the commit you deployed
+     (check it out, then `git merge --ff-only <that commit>`; never a
+     rebase, never a force push) and push THAT branch (never main). Record the new live version id and that
+     branch head on the OPERATOR BOARD line and in the dashboard-lineage
+     memory. From then on either branch name is the live lineage.
+  Undo: `npx --no-install wrangler rollback <the id from step 1>` (rolling
+  back past another deploy also removes that deploy).
 
 ## Current uncommitted state (as of 2026-07-07)
 

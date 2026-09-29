@@ -246,6 +246,23 @@ test('master off, or no owner chat configured: no memory line, no message', asyn
   assert.deepEqual(calls, []);
 });
 
+// Live proof after a deploy (P5b checkpoint): every tick that sends
+// nothing logs one reason word, so `npx wrangler tail` shows the scan ran.
+test('a tick that sends nothing logs its reason (master_off, healthy), no data', async () => {
+  const logged = [];
+  const realLog = console.log;
+  console.log = (...a) => { logged.push(a.join(' ')); };
+  try {
+    resetFake({ health: () => health(Date.now(), { master: 'off', fail_streak: 9 }) });
+    await runCrmRobotAlarmScan(env);
+    resetFake({ health: liveFresh });
+    await runCrmRobotAlarmScan(env);
+  } finally {
+    console.log = realLog;
+  }
+  assert.deepEqual(logged, ['crm alarm: none (master_off)', 'crm alarm: none (healthy)']);
+});
+
 test('the scan rides the 5-minute chain right after the intake cards', () => {
   const src = fs.readFileSync(new URL('./worker.js', import.meta.url), 'utf8');
   const chain = src.slice(src.indexOf("cron === '*/5 * * * *'"));
