@@ -11,14 +11,16 @@ import {
 } from './worker.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const migration = await readFile(
+// Match the same reviewed SQL text on Windows and Linux. Only test input
+// line endings are normalized; the migration files are never rewritten.
+const migration = (await readFile(
   join(here, '..', 'migrations', '018_live_activity_start_dedup.sql'),
   'utf8',
-);
-const rollback = await readFile(
+)).replace(/\r\n/g, '\n');
+const rollback = (await readFile(
   join(here, '..', 'migrations', '018_live_activity_start_dedup_rollback.sql'),
   'utf8',
-);
+)).replace(/\r\n/g, '\n');
 const workerSource = await readFile(join(here, 'worker.js'), 'utf8');
 
 let failed = 0;
@@ -365,7 +367,7 @@ await check('normal clock-in alert scan contains no Live Activity START path', (
     workerSource.indexOf('await runClockInAlertScan(env);'));
   assert.match(
     workerSource,
-    /updateShiftLiveActivity\(\s*env,\s*row\.id,\s*laStatus,\s*laMins,\s*p\.at,\s*row\.market,?\s*\)/,
+    /updateShiftLiveActivity\(\s*env,\s*row\.id,\s*laStatus,\s*laMins,\s*location\.lastReportISO,\s*row\.market,?\s*\)/,
   );
 });
 

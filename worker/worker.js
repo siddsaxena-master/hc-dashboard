@@ -1057,6 +1057,12 @@ async function runScheduled(event, env, alsoNotify = true) {
       // cannot delay the field-ops scans above.
       try { await runWebhookIntakeScan(env, 2); }
       catch (e) { console.error('runWebhookIntakeScan error:', e); }
+      // Email reader (migration 056): coconut counts from customer emails
+      // that sit on a deal. LAST on purpose (3 subrequests at most) so it
+      // can never starve a scan above. Off unless DEAL_FACTS is 'on', and
+      // fully wrapped inside.
+      try { await runDealFactScan(env); }
+      catch (e) { console.error('runDealFactScan error:', (e && e.name) || 'error'); }
     }
   } catch (e) {
     console.error('runScheduled error:', e);
@@ -5824,7 +5830,8 @@ async function runClockInAlertScan(env) {
 const GARAGE_LAT = 40.586659;   // 'NJ Garage', 55 Cambridge Dr, Colonia NJ (census-geocoded)
 const GARAGE_LNG = -74.323824;
 const GARAGE_RADIUS_M = 150;    // within this = at the garage, never alert
-const STOP_ALERT_MIN = 15;      // still this long while enroute = STOPPED
+const STOP_ALERT_MIN = 15;      // no current location after this report age
+const LOCATION_FRESH_MS = STOP_ALERT_MIN * 60000;
 
 // Straight-line meters between two lat/lng points (haversine).
 function distMeters(lat1, lng1, lat2, lng2) {
@@ -5835,13 +5842,33 @@ function distMeters(lat1, lng1, lat2, lng2) {
   return 12742000 * Math.asin(Math.sqrt(a)); // 2 x Earth radius in meters
 }
 
+// A last-known position is not a current position. Missing, malformed or future
+// reports are uncertain too, even when their coordinates resemble the garage.
+// Keep this 15-minute boundary and the words in sync with the phone and widget.
+export function classifyShiftLocationReport(report, nowMs = Date.now()) {
+  const atMs = typeof report?.at === 'string' && report.at.trim()
+    ? Date.parse(report.at) : NaN;
+  const timeValid = Number.isFinite(atMs) && atMs <= nowMs;
+  const coordinatesValid = Number.isFinite(report?.lat) && Math.abs(report.lat) <= 90 &&
+    Number.isFinite(report?.lng) && Math.abs(report.lng) <= 180;
+  const validReport = timeValid && coordinatesValid;
+  const ageMin = validReport ? (nowMs - atMs) / 60000 : null;
+  const fresh = validReport && nowMs - atMs < LOCATION_FRESH_MS;
+  const atGarage = coordinatesValid &&
+    distMeters(report.lat, report.lng, GARAGE_LAT, GARAGE_LNG) <= GARAGE_RADIUS_M;
+  return {
+    fresh, atGarage, ageMin, coordinatesValid,
+    lastReportISO: validReport ? new Date(atMs).toISOString() : null,
+    status: !fresh ? 'Location delayed' : atGarage ? 'At NJ Garage' : 'Enroute',
+    statusMinutes: !fresh && ageMin !== null ? Math.floor(ageMin / 5) * 5 : 0,
+  };
+}
+
 // Every 5 minutes, after the clock-in scan: warn the owner when an
-// on-shift worker has been still 15+ minutes while enroute.
-// Stillness age = minutes since the NEWEST shift_locations point: iOS
-// only emits a point on ~150m of movement, so a fresh point means
-// moving and a stale one means parked (or the phone died — the alert
-// text owns up to that). Zero-point shifts fall back to the clock-in
-// stamp. AT_GARAGE (within GARAGE_RADIUS_M) and MOVING never alert.
+// on-shift worker has no fresh location. A report does not prove movement or
+// stillness: the phone can stop reporting while its worker keeps driving.
+// Zero-point shifts use a valid clock-in position only while it is fresh.
+// The card ages out at the garage too; historical alert suppression is kept.
 // Stateless one-shot windows, the intake-nag idea scaled to the 5-min
 // tick: alert only when the age sits in [15,21) or [45,51) minutes.
 // Each window is one tick wide plus a minute of cron-jitter slack, so
@@ -5868,54 +5895,46 @@ export async function runShiftStatusScan(env) {
       try {
         const pts = await fetchSb(env, 'shift_locations?select=at,lat,lng' +
           '&shift_id=eq.' + row.id + '&order=at.desc&limit=1');
-        if (!pts) continue; // read failed — retry next tick, never classify from a stale stamp
-        const p = pts.length ? pts[0]
+        // A failed read must clear the current-location claim, not preserve it.
+        const p = pts === null ? null : pts.length ? pts[0]
           : { at: row.clock_in_at, lat: row.clock_in_lat, lng: row.clock_in_lng };
-        const atMs = new Date(p.at).getTime();
-        if (!Number.isFinite(atMs)) continue;
-        const ageMin = (Date.now() - atMs) / 60000;
-        const atGarage = p.lat != null && p.lng != null &&
-          distMeters(p.lat, p.lng, GARAGE_LAT, GARAGE_LNG) <= GARAGE_RADIUS_M;
+        const location = classifyShiftLocationReport(p);
+        const { ageMin, atGarage } = location;
 
         // Live Activity state runs for every classification; the continue
         // guards below only gate ALERTS. Its dedupe key includes the latest GPS
         // report time, so an owner can see honest freshness even when the
         // status label itself has not changed.
         try {
-          let laStatus = 'Enroute';
-          let laMins = 0;
-          if (atGarage) {
-            laStatus = 'At NJ Garage';
-          } else if (ageMin >= STOP_ALERT_MIN) {
-            laStatus = 'Stopped';
-            laMins = Math.floor(ageMin / 5) * 5; // bucket = what we render, "Stopped 15m", "Stopped 20m"...
-          }
+          let laStatus = location.status;
+          const laMins = location.statusMinutes;
           // When a departure plan exists for this market today, the card
           // says "Leave by 10:55a", "LEAVE NOW · Pridwin", "Late 30m · ..."
-          // or "ETA 4:45p · ..." instead. "Stopped" always wins: a stale
+          // or "ETA 4:45p · ..." instead. "Location delayed" always wins: a stale
           // GPS is a safety signal, so the plan is not even consulted.
           // The whole card rides in laStatus: its .status is the 20-char
           // line every build renders, the rest (stage, headline, jobTag,
           // leaveByISO, etaISO, lateMinutes) feeds build 34's countdown,
           // ETA clock and journey bar.
-          if (laStatus !== 'Stopped') {
+          if (location.fresh) {
             const mk = marketKey(row.market);
             if (!cardByMarket.has(mk)) cardByMarket.set(mk, await departureCardStatusForMarket(env, mk, Date.now()));
             const card = cardByMarket.get(mk);
             if (card) laStatus = card;
           }
           await updateShiftLiveActivity(
-            env, row.id, laStatus, laMins, p.at, row.market,
+            env, row.id, laStatus, laMins, location.lastReportISO, row.market,
           );
         } catch (e) { console.error('la status hook:', e); }
 
         // AT_GARAGE: parked at base is normal. (Miami has no garage, so
         // Miami shifts only ever classify MOVING or STOPPED.)
         if (atGarage) continue;
-        // MOVING: the point is fresh.
-        if (ageMin < STOP_ALERT_MIN) continue;
+        // No valid evidence means no invented en-route stop or map link.
+        if (ageMin === null || !location.coordinatesValid) continue;
+        if (location.fresh) continue;
 
-        // STOPPED: alert only inside a window.
+        // A known report gap: alert only inside an existing one-shot window.
         const inWindow =
           (ageMin >= STOP_ALERT_MIN && ageMin < STOP_ALERT_MIN + 6) ||
           (ageMin >= 45 && ageMin < 51);
@@ -5923,9 +5942,9 @@ export async function runShiftStatusScan(env) {
 
         const mins = Math.floor(ageMin);
         const mkt = (row.market || 'ny').toUpperCase();
-        let text = '⚠️ ' + row.worker_name + ': GPS has not reported for ' + mins +
-          ' min while en route (' + mkt + ').';
-        if (p.lat != null && p.lng != null) {
+        let text = '⚠️ ' + row.worker_name + ': no fresh location report for ' + mins +
+          ' min (' + mkt + ').';
+        if (location.coordinatesValid) {
           text += '\nLast reported location: https://www.google.com/maps/search/?api=1&query=' + p.lat + ',' + p.lng;
         }
 
@@ -5937,7 +5956,7 @@ export async function runShiftStatusScan(env) {
         // The stateless windows above stay the once-only mechanism.
         const queued = await sendPushToOwners(env,
           '⚠️ ' + row.worker_name + ': GPS stale ' + mins + ' min',
-          'No fresh GPS report while en route (' + mkt + '). Open the live map.',
+          'No fresh location report (' + mkt + '). Open the live map.',
           text, chatIds, { excludeEmail: row.worker_email, market: row.market });
         if (!queued) {
           // Plain mode: worker names must never break Telegram Markdown.
@@ -6888,9 +6907,7 @@ export function pickupSeenByGps(recentPoints, base) {
 }
 export function movementState({ marketHasGarage, origin, dest, clockInPoint, newestPoint, recentPoints, nowMs, pickupSeenAt, pickupSource, hasOpenShift }) {
   if (hasOpenShift === false || (!clockInPoint && !newestPoint)) return 'nobody';
-  const fresh = newestPoint && finite(newestPoint.lat) && finite(newestPoint.lng)
-    && finite(new Date(newestPoint.at).getTime()) && (nowMs - new Date(newestPoint.at).getTime()) <= STOP_ALERT_MIN * 60000;
-  if (!fresh) return 'unknown';
+  if (!classifyShiftLocationReport(newestPoint, nowMs).fresh) return 'unknown';
   const d = (a, b) => distMeters(a.lat, a.lng, b.lat, b.lng);
   if (dest && finite(dest.lat) && d(newestPoint, dest) <= ARRIVED_RADIUS_M) return 'arrived';
   if (marketHasGarage) {
@@ -9411,7 +9428,8 @@ export async function runDeliveryConfirmationScan(env) {
 // tells the operator once over Telegram, and alert pushes (separate
 // topic string, same key) keep working untouched.
 const LA_TOPIC = 'com.hamptonscoconuts.field.push-type.liveactivity';
-let laLastSent = new Map();   // shiftId -> JSON of the last pushed content state (isolate memory; a recycle just re-sends one priority-5 update)
+let laLastSent = new Map();   // shiftId -> queued state, targets, exact queue id and time (never a phone-delivery receipt)
+const LA_UPDATE_REFRESH_MS = 15 * 60000; // bounded recovery even after a queue outcome cannot be read
 
 // ContentState gained lastReportISO as an optional field. Old app builds ignore
 // the unknown JSON key, while the next widget can render the latest GPS report
@@ -9421,9 +9439,9 @@ let laLastSent = new Map();   // shiftId -> JSON of the last pushed content stat
 // departureCard): stage, headline, jobTag, leaveByISO, etaISO, lateMinutes.
 // Each is written only when the card has it, so a call without a card
 // produces exactly the old shape and Swift's optionals stay nil. A
-// "Stopped" status never carries them: a stale GPS is a safety signal and
+// "Stopped" and "Location delayed" never carry a departure plan: stale GPS is a safety signal and
 // the phone must not paint a countdown or a late count over it.
-const LA_STAGES = ['garage', 'enroute', 'arrived', 'stopped', 'ended'];
+const LA_STAGES = ['garage', 'enroute', 'arrived', 'stopped', 'ended', 'location_delayed'];
 export function buildLiveActivityContentState(
   status,
   statusMinutes,
@@ -9444,7 +9462,12 @@ export function buildLiveActivityContentState(
   else if (marketWord === 'miami') state.marketLabel = 'Miami';
   else if (marketWord === 'vegas') state.marketLabel = 'Vegas'; // parity with App.js
   const stopped = /^Stopped/.test(String(status || ''));
-  if (departure && typeof departure === 'object' && !stopped) {
+  const delayed = String(status || '') === 'Location delayed';
+  if (delayed) {
+    state.stage = 'location_delayed';
+    state.headline = 'Location delayed';
+  }
+  if (departure && typeof departure === 'object' && !stopped && !delayed) {
     const stage = String(departure.stage || '').trim().toLowerCase();
     if (LA_STAGES.includes(stage)) state.stage = stage;
     for (const key of ['headline', 'jobTag']) {
@@ -9534,16 +9557,22 @@ async function laTokensForShift(env, shiftId, market) {
 
 const LA_START_LEASE_MS = 30 * 60 * 1000;
 
+// Native staleness stops a missed update looking live. Already-uncertain cards
+// get a near-current deadline, never an ancient date or a malformed value.
+export function liveActivityStaleDate(lastReportISO, nowMs = Date.now()) {
+  const reportMs = typeof lastReportISO === 'string' && lastReportISO.trim()
+    ? Date.parse(lastReportISO) : NaN;
+  const deadline = Number.isFinite(reportMs) && reportMs <= nowMs
+    ? Math.floor((reportMs + LOCATION_FRESH_MS) / 1000) : 0;
+  return Math.max(Math.floor(nowMs / 1000) + 1, deadline);
+}
+
 function liveActivityStartStatus(row) {
-  const reportMs = new Date(row.report_at || row.clock_in_at).getTime();
-  const ageMin = Number.isFinite(reportMs) ? Math.max(0, (Date.now() - reportMs) / 60000) : 0;
-  const atGarage = row.report_lat != null && row.report_lng != null &&
-    distMeters(row.report_lat, row.report_lng, GARAGE_LAT, GARAGE_LNG) <= GARAGE_RADIUS_M;
-  if (atGarage) return { status: 'At NJ Garage', minutes: 0 };
-  if (ageMin >= STOP_ALERT_MIN) {
-    return { status: 'Stopped', minutes: Math.floor(ageMin / 5) * 5 };
-  }
-  return { status: 'Enroute', minutes: 0 };
+  return classifyShiftLocationReport({
+    at: row.report_at,
+    lat: row.report_lat,
+    lng: row.report_lng,
+  });
 }
 
 function liveActivityStartIdentityQuery(row, claimStamp) {
@@ -9677,11 +9706,10 @@ export async function runLiveActivityStartScan(env) {
         throw new Error('malformed START claim row');
       }
       const clockInISO = new Date(row.clock_in_at).toISOString();
-      const reportISO = new Date(row.report_at || row.clock_in_at).toISOString();
       const initial = liveActivityStartStatus(row);
       const name = row.worker_name || 'Team';
       const contentState = buildLiveActivityContentState(
-        initial.status, initial.minutes, reportISO, row.market,
+        initial.status, initial.statusMinutes, initial.lastReportISO, row.market,
       );
       const queued = await enqueueLiveActivityPush(
         env,
@@ -9689,6 +9717,7 @@ export async function runLiveActivityStartScan(env) {
         'start',
         contentState,
         {
+          staleDate: liveActivityStaleDate(initial.fresh ? initial.lastReportISO : null),
           attributes: {
             workerName: name,
             clockInISO: clockInISO,
@@ -9735,7 +9764,9 @@ export async function runLiveActivityStartScan(env) {
 // event:update only when something the phone would see changed: the rendered
 // status, its 5-minute stopped bucket, the latest GPS report timestamp, or
 // any departure field (a moved leave-by, a fresh ETA, one more late minute).
-// No tokens means retry on the next tick.
+// No tokens or a failed insert means retry on the next tick. Queuing is not
+// delivery: unchanged data is retried after a failed queue outcome, a new phone
+// target, or a bounded refresh. Pending rows remain the drainer's responsibility.
 // `status` is the 20-character words, or the structured departure card from
 // departureCardStatusForMarket whose .status holds the same words (the shift
 // scan passes the whole card so one call carries both).
@@ -9756,13 +9787,29 @@ async function updateShiftLiveActivity(
     );
     // Keys are written in a fixed order, so the JSON text is a stable
     // fingerprint of the whole content state.
-    const key = JSON.stringify(contentState);
-    if (laLastSent.get(shiftId) === key) return;
     const tokens = await laTokensForShift(env, shiftId, market);
     if (!tokens || !tokens.length) return; // null (read failed) or none: do not mark sent, retry next tick
-    const queued = await enqueueLiveActivityPush(env, tokens.map((t) => t.token), 'update',
-      contentState);
-    if (queued) laLastSent.set(shiftId, key);
+    const targets = [...new Set(tokens.map((t) => t.token).filter(Boolean))].sort();
+    const key = JSON.stringify([contentState, targets]);
+    const nowMs = Date.now();
+    const previous = laLastSent.get(shiftId);
+    if (previous?.key === key) {
+      if (nowMs <= previous.queuedAtMs) return; // one same-tick attempt
+      const rows = await fetchSb(env, 'push_queue?select=id,done_at,last_error&id=eq.' +
+        encodeURIComponent(previous.queueId) + '&limit=1');
+      // A confirmed pending row belongs to the drainer even past our refresh
+      // boundary. Its own expiry closes it before a replacement is safe.
+      if (Array.isArray(rows) && rows.some((r) => r?.id === previous.queueId &&
+          Object.hasOwn(r, 'done_at') && r.done_at === null)) return;
+      // Unknown outcomes and completed rows without errors wait only until
+      // the bounded refresh. Queue processing is not proof of phone rendering.
+      if (nowMs - previous.queuedAtMs < LA_UPDATE_REFRESH_MS &&
+          (!Array.isArray(rows) || rows.some((r) => !r?.done_at || !r.last_error))) return;
+    }
+    const queueId = crypto.randomUUID();
+    const queued = await enqueueLiveActivityPush(env, targets, 'update', contentState,
+      { staleDate: liveActivityStaleDate(words === 'Location delayed' ? null : lastReportISO, nowMs) }, queueId);
+    if (queued) laLastSent.set(shiftId, { key, queueId, queuedAtMs: nowMs });
   } catch (e) { console.error('updateShiftLiveActivity error:', e); }
 }
 
@@ -10156,5 +10203,713 @@ async function handleTeamInvite(request, env) {
     }
     console.error('team invite failed:', error && error.message);
     return teamReply({ ok: false, error: 'Request failed' }, 500);
+  }
+}
+
+// ── EMAIL READER: coconut counts from customer emails on a deal (056) ──
+// Spec: scratchpad deal-facts/DEAL-FACTS-SPEC.md section 2, built
+// 2026-10-01. Every 5 minutes, LAST in the chain, this asks SQL (056's
+// hc_crm_facts_tick) for emails that sit on a deal through a live
+// crm_intake_links row and were not read yet, reads their stored raw_text
+// (exactly as the address and time scans already do), runs
+// extractCoconutCounts, and sends SQL back NUMBERS AND REASON CODES ONLY
+// (hc_crm_facts_report). SQL decides everything: fill, Practice card,
+// suggestion, info note or ignore. The count never goes into orders,
+// QuickBooks or Jarvis; it lives in crm_email_facts. The CRM mail robot
+// (crm_mail_robot.py, hc_crm_robot_*) stays envelope only. Three
+// subrequests per tick at most. Behind DEAL_FACTS (a secret, default off).
+//
+// The extractor is strict on purpose: a wrong count that fills itself is
+// worse than a miss. A number counts only when a coconut word sits right
+// next to it. Anything shaky (a guess, a range, a change, a per-day
+// amount, another event, another date) is 'unclear', which SQL turns into
+// a one-tap card at most, never a fill.
+
+// The only words allowed between a number and "coconuts" ("350 fresh
+// young coconuts").
+const FACT_ADJECTIVES = new Set(['fresh', 'young', 'drinking', 'thai', 'branded', 'stamped', 'cracked', 'whole', 'logo']);
+// Words that may also sit there but make the count unclear: "100 more
+// coconuts" is a change, "350ish coconuts" a guess, "1.5k" a shorthand.
+const FACT_BETWEEN_FLAGS = new Map([
+  ['more', 'change_word'], ['extra', 'change_word'], ['additional', 'change_word'],
+  ['fewer', 'change_word'], ['less', 'change_word'], ['ish', 'hedge'], ['k', 'thousands_unclear'],
+]);
+const FACT_COCONUT_RE = /^(?:coconuts?|cocos?)$/;
+const FACT_COUNT_WORDS = new Set(['qty', 'quantity', 'count']);
+const FACT_LEAD_HEDGES = new Set(['about', 'around', 'approx', 'approximately', 'roughly', 'maybe']);
+// Guess words within 3 words before the number, or just after the count.
+const FACT_HEDGE_BEFORE_RE = /\b(?:about|around|approx|approximately|roughly|maybe|max|maximum|min|minimum|estimated|estimate|est|probably|possibly|perhaps|tentatively|nearly|almost|over|under|up to|at least|at most|close to|upwards of|might|may need)\b/;
+const FACT_HEDGE_AFTER_RE = /\b(?:or so|max|maximum|min|minimum|ish|or more|or less|give or take|approx|approximately|roughly|tbd|tbc|maybe|might|could (?:go|be|change|increase|decrease|grow|drop)|may (?:go|be|change|increase|decrease|grow)|will confirm|pending|subject to change)\b/;
+// Change words within 4 words of the number. "drop off" is a delivery,
+// not a change: it is folded into one word "dropoff" before this runs.
+const FACT_CHANGE_RE = /\b(?:add|adding|added|more|extra|another|additional|cut|cutting|fewer|less|reduce|reducing|drop|dropping|remove|removing|minus|plus|increase|increasing|decrease|decreasing|instead|subtract|bump|lower|lowering|raise|raising|go down|go up|change|changing|changed|update|updated|updating|cancel|cancelled|canceled|cancelling|canceling|no longer)\b/;
+// "actually" corrects the number BEFORE it ("Coconuts: 350; actually
+// 400"), so it only flags a hit when it comes after. "Actually 350
+// coconuts" is her new count and stays clear.
+const FACT_CHANGE_AFTER_RE = /\bactually\b/;
+// A negation right before the count ("not 350 coconuts", "rather than
+// 300 coconuts") is the number she does NOT want. Only 2 words before,
+// so "350 coconuts, not 300" keeps 350.
+const FACT_NEGATE_BEFORE_RE = /\b(?:not|rather than)\b/;
+// A rejection can start farther back in the same clause ("do not send
+// us 350"). Track it once per clause instead of rescanning every hit.
+const FACT_NEGATION_WORDS = new Set(['not', 'no', 'never', 'without', 'neither', 'cannot']);
+const FACT_REJECT_AFTER_RE = /\b(?:too many|too much|not (?:needed|wanted|correct|right)|unwanted|unnecessary)\b/;
+// Arrows and '+' between a count and another number are a change
+// ("Coconuts: 350 -> 400", "300 coconuts + 50").
+const FACT_CHANGE_MARKS = new Set(['+', '>', '\u2192', '\u21d2', '\u279c', '\u2794']);
+// Per-unit amounts ("350 coconuts per day for 2 days" is 700).
+const FACT_PER_AFTER_RE = /\b(?:per|each|daily|a day|every day|an hour|for (?:\d+|two|three|four|five|both|all) days|both days|all days|weekend|(?:\d+|two|three|four|five|multi) days?|day (?:\d|one|two|three))\b/;
+const FACT_PER_BEFORE_RE = /\b(?:per|each|daily|a day|every day|weekend|day (?:\d|one|two|three))\b/;
+// Weekday names, full or short. Two of them joined ("Friday and
+// Saturday") make a count per day.
+const FACT_WEEKDAY_SRC = '(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)';
+const FACT_WEEKDAY_RE = new RegExp('\\b' + FACT_WEEKDAY_SRC + '\\b', 'g');
+const FACT_WEEKDAY_PAIR_RE = new RegExp('\\b' + FACT_WEEKDAY_SRC + '\\b\\.?\\s*(?:and|&|through|thru|to|-|\u2013|,|/)\\s*(?:on\\s+)?' + FACT_WEEKDAY_SRC + '\\b');
+// Recurring deliveries are not a one-event total, even when the email
+// writes the count only once or puts the schedule several words away.
+const FACT_RECURRENCE_RE = new RegExp('\\b(?:every(?:\\s+(?:other|single))?\\s+(?:' + FACT_WEEKDAY_SRC +
+  '|days?|weeks?|months?|years?|weekends?)|daily|weekly|monthly|yearly|annually|' +
+  '(?:each|per)\\s+(?:' + FACT_WEEKDAY_SRC + '|weeks?|months?|years?)|' +
+  '(?:for|over|across)\\s+(?:\\d+|two|three|four|five|several|multiple)\\s+(?:weeks|months|years))\\b');
+// Signs that one email covers more than one day. Used when the same
+// count is written twice in different paragraphs.
+const FACT_MULTI_DAY_RE = /\b(?:weekend|both days|each day|every day|daily|per day|a day|day (?:\d|one|two|three)|(?:\d+|two|three|four|five|multi) days?)\b/;
+// Another event in the same paragraph ("last year we did 350").
+const FACT_OTHER_EVENT_RE = /\b(?:last year|last time|last summer|last season|last event|previous|previously|other event|next event|another event|also for|in the past|past event|next year)\b/;
+// A bare year next to these words names an event ("in 2025", "our 2025
+// event"). Another year than the deal's is another event.
+const FACT_YEAR_BEFORE = new Set(['in', 'of', 'our', 'since', 'during', 'from', 'back', 'year', 'summer', 'spring', 'fall', 'winter', 'season', 'for']);
+const FACT_YEAR_AFTER = new Set(['event', 'events', 'season', 'summer', 'party', 'wedding', 'gala', 'edition', 'show', 'festival', 'conference']);
+// The word right after "350 coconut" that makes it a place or a product,
+// never an order count ("350 Coconut Grove Ave", "350 coconut cups").
+// Places count for the singular only; products for every form.
+const FACT_PLACE_WORDS = new Set(['grove', 'row', 'creek', 'ln', 'lane', 'ave', 'avenue', 'st', 'street', 'dr', 'drive', 'rd', 'road',
+  'blvd', 'boulevard', 'way', 'ct', 'court', 'pl', 'place', 'beach', 'bay', 'key', 'cay', 'island', 'isle', 'point', 'pt', 'circle',
+  'cir', 'ter', 'terrace', 'trail', 'trl', 'pkwy', 'parkway', 'hwy', 'highway', 'plaza', 'club', 'village', 'park', 'cove', 'palm', 'palms']);
+const FACT_PRODUCT_WORDS = new Set(['water', 'waters', 'cup', 'cups', 'drink', 'drinks', 'bottle', 'bottles', 'shell', 'shells', 'milk',
+  'cream', 'oil', 'flakes', 'juice', 'sugar', 'bowl', 'bowls', 'cocktail', 'cocktails', 'mocktail', 'mocktails', 'macaroons', 'cake', 'cakes']);
+// Characters that hide inside a number ("3<zero width>50"): removed first.
+const FACT_INVISIBLE_RE = /[\u00ad\u200b\u200c\u200d\u2060\ufeff]/g;
+// Spaces that look like spaces ("1<no-break space>350"): made plain first.
+const FACT_ODD_SPACE_RE = /[\u00a0\u2007\u2009\u202f]/g;
+const FACT_GUEST_WORDS = new Set(['guests', 'guest', 'people', 'attendees', 'attendee', 'pax', 'employees', 'heads', 'persons', 'person', 'ppl']);
+// Hyphen, en dash, em dash and slash between two numbers make a range.
+const FACT_RANGE_MARKS = new Set(['-', '\u2013', '\u2014', '/']);
+const FACT_TIMES_MARKS = new Set(['x', '\u00d7', '*']);
+// The website form's labels (Jarvis supabase_sync.py _FORM_LABELS).
+const FACT_FORM_LABELS = new Set(['name', 'email', 'phone', 'event_date', 'event_type', 'delivery_market', 'coconut_count', 'budget', 'message']);
+// Long PDF text is cut here so one email can never eat the tick's time.
+const FACT_MAX_CHARS = 20000;
+
+// The website form notice: one of the first 3 non-blank lines starts with
+// "New form submission on" (the strict test in Jarvis supabase_sync.py
+// parse_formspree_fields). For a notice only the field block after the
+// heading is read. Each field becomes its own paragraph, the label lines
+// are dropped, and the form's own coconut_count field becomes "coconut
+// count: <value>" so it is read like any other count. A label seen twice
+// gives that field up (same rule as Jarvis).
+function factFormBlock(body) {
+  const lines = String(body || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const head = lines.slice(0, 3).findIndex((l) => l.toLowerCase().startsWith('new form submission on'));
+  if (head < 0) return { notice: false, text: body };
+  const rest = lines.slice(head + 1);
+  const countLabels = rest.filter((l) => l.toLowerCase() === 'coconut_count').length;
+  const out = [];
+  for (let i = 0; i < rest.length; i++) {
+    const lower = rest[i].toLowerCase();
+    if (lower === 'coconut_count') {
+      const value = rest[i + 1];
+      if (countLabels === 1 && value && !FACT_FORM_LABELS.has(value.toLowerCase())) {
+        out.push('coconut count: ' + value);
+        i++;
+      }
+      continue;
+    }
+    if (FACT_FORM_LABELS.has(lower)) continue;
+    out.push(rest[i]);
+  }
+  return { notice: true, text: out.join('\n\n') };
+}
+
+// A reply attribution line in English or the usual other languages
+// ("Test Customer wrote:", "Sidd Test Customer wrote on Tue:", "... schrieb Sidd <..>:",
+// "... a ecrit :"): the word anywhere on a short line that ends with a
+// colon or holds an email address. "My boss wrote: 350 coconuts" does not
+// end with a colon, so her own words are kept.
+const FACT_ATTRIBUTION_RE = /(?:^|[\s,])(?:wrote|schrieb|schreef|skrev|escribi[o\u00f3]|escreveu|ha scritto|a [e\u00e9]crit)(?=[\s:]|$)/i;
+const FACT_ATTRIBUTION_COLON_RE = new RegExp(FACT_ATTRIBUTION_RE.source + '\\s*:', 'i');
+function factAttributionLine(t) {
+  return t.length < 400 && FACT_ATTRIBUTION_RE.test(t) && (/:\s*$/.test(t) || /@/.test(t));
+}
+
+// Cuts the body at the FIRST quote or forward separator of any kind and
+// returns { fresh, quoted }. Stricter than stripQuotedText on purpose:
+// ANY "From:" block cuts (not only ours), and so does a forward, because
+// a forwarded email is someone else's words. A signature ("-- ") ends the
+// fresh words too.
+function factCutQuoted(body) {
+  const lines = String(body || '').split('\n');
+  const at = (j) => String(lines[j] || '').trim();
+  let signatureAt = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const t = at(i);
+    let cut = false;
+    if (/^--\s*$/.test(t)) {
+      // A signature ends her words, but it is not a quote: keep looking
+      // for a quote below it (only that part counts as quoted).
+      if (signatureAt < 0) signatureAt = i;
+      continue;
+    }
+    if (/^>/.test(t)) cut = true;                                   // "> quoted line"
+    else if (/^-{2,}\s*original message\s*-{2,}/i.test(t)) cut = true;
+    else if (/^_{5,}$/.test(t)) cut = true;                          // Outlook's rule line
+    else if (/^-{2,}\s*forwarded message/i.test(t) || /^begin forwarded message/i.test(t)) cut = true;
+    else if (/^\*?from:/i.test(t)) {
+      // Mobile mail can flatten From/Sent/To/Subject onto ONE line.
+      // A lone "From: our planner, we need ..." is still her words.
+      if (/\s\*?(?:sent|date|to|subject):/i.test(t)) cut = true;
+      // Or a header block: Sent:, Date:, To: or Subject: within 4 lines.
+      for (let j = 1; j <= 4; j++) if (/^\*?(?:sent|date|to|subject):/i.test(at(i + j))) cut = true;
+    } else if (factAttributionLine(t)) cut = true;
+    else if (/^(?:on|am|le|el|il|op|em|den)\s/i.test(t) && t.length < 400) {
+      // "On Tue, Sep 29, 2026 at 10:00 AM Sidd <...>" with the "wrote:"
+      // on this line (words may follow the colon) or wrapped onto one of
+      // the next two lines.
+      if (FACT_ATTRIBUTION_COLON_RE.test(t) || factAttributionLine(at(i + 1)) || factAttributionLine(at(i + 2))) cut = true;
+    }
+    if (cut) {
+      return { fresh: lines.slice(0, signatureAt >= 0 ? signatureAt : i).join('\n'), quoted: lines.slice(i).join('\n'), ended: true };
+    }
+  }
+  return { fresh: lines.slice(0, signatureAt >= 0 ? signatureAt : lines.length).join('\n'), quoted: '', ended: signatureAt >= 0 };
+}
+
+// Our own reconfirmation bullet ("Count: 350 coconuts") is never news.
+function factDropOwnBullets(text) {
+  return String(text || '').split('\n').filter((l) => !/^\W*count:\s*[\d,]+\s*coconuts?/i.test(l)).join('\n');
+}
+
+const FACT_MONTH_SRC = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+const FACT_MONTH_FIRST_RE = new RegExp('\\b' + FACT_MONTH_SRC + '\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b(?:,?\\s*(20\\d\\d)\\b)?', 'g');
+const FACT_DAY_FIRST_RE = new RegExp('\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?' + FACT_MONTH_SRC + '\\b\\.?(?:,?\\s*(20\\d\\d)\\b)?', 'g');
+function factMonthNumber(word) {
+  return ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(String(word).slice(0, 3)) + 1;
+}
+
+// Blanks what is never a count (links, emails, phones, money, clock
+// times) and pulls the dates out. Returns { text, dates } for ONE
+// paragraph, lowercased; each blanked shape becomes one placeholder word
+// (hcurl, hcemail, hcphone, hcmoney, hctime, hcdate) so word distances
+// still work. A date is { m, d, y } (y null when not written).
+function factCleanParagraph(paragraph) {
+  const dates = [];
+  const validDate = (m, d, y) => {
+    const year = y ? (y < 100 ? 2000 + y : y) : 2000;
+    const date = new Date(Date.UTC(year, m - 1, d));
+    return m >= 1 && m <= 12 && d >= 1 && date.getUTCMonth() === m - 1 && date.getUTCDate() === d;
+  };
+  const keepDate = (m, d, y, whole) => {
+    // An invalid date-like value is uncertainty, not permission to fill.
+    if (!validDate(m, d, y)) { dates.push({ unclear: true }); return ' hcdate '; }
+    dates.push({ m, d, y: y ? (y < 100 ? 2000 + y : y) : null });
+    return ' hcdate ';
+  };
+  const keepNumericDate = (first, second, y, whole) => {
+    const us = validDate(first, second, y);
+    const dayFirst = validDate(second, first, y);
+    // 10/27 and 27/10 are clear. 10/11 has two meanings, so neither
+    // interpretation may silently authorize a count for one of them.
+    if (us && (!dayFirst || first === second)) return keepDate(first, second, y, whole);
+    if (dayFirst && !us) return keepDate(second, first, y, whole);
+    dates.push({ unclear: true });
+    return ' hcdate ';
+  };
+  let t = String(paragraph || '').toLowerCase()
+    // Straight and curly contractions both carry a negation. The exact
+    // auxiliary verb is irrelevant here, but losing "not" is unsafe.
+    .replace(/\b[a-z]+n['\u2019]t\b/g, 'not')
+    .replace(/<(?:mailto|tel):[^>]*>/g, ' ')
+    .replace(/\b(?:https?:\/\/|www\.)\S+/g, ' hcurl ')
+    .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/g, ' hcemail ')
+    .replace(/(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g, ' hcphone ')
+    .replace(/\$\s*\d[\d,]*(?:\.\d+)?(?:\s*k\b)?/g, ' hcmoney ')
+    .replace(/\busd\s*\d[\d,]*(?:\.\d+)?/g, ' hcmoney ')
+    .replace(/\b\d[\d,]*(?:\.\d+)?\s*(?:dollars?|usd|bucks)\b/g, ' hcmoney ')
+    .replace(/\b\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|am|pm)(?![a-z])/g, ' hctime ')
+    .replace(/\b\d{1,2}:\d{2}\b/g, ' hctime ');
+  t = t.replace(/\b(20\d\d)-(\d{1,2})-(\d{1,2})\b/g, (w, y, m, d) => keepDate(+m, +d, +y, w))
+    .replace(FACT_MONTH_FIRST_RE, (w, mon, d, y) => keepDate(factMonthNumber(mon), +d, y ? +y : null, w))
+    .replace(FACT_DAY_FIRST_RE, (w, d, mon, y) => keepDate(factMonthNumber(mon), +d, y ? +y : null, w))
+    .replace(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{4}|\d{2}))?\b/g, (w, a, b, y) => keepNumericDate(+a, +b, y ? +y : null, w))
+    .replace(/\b(\d{1,2})[.-](\d{1,2})[.-](\d{4}|\d{2})\b/g, (w, a, b, y) => keepNumericDate(+a, +b, +y, w))
+    .replace(/\b(\d{1,2})-(\d{1,2})\b/g, (w, a, b) => keepNumericDate(+a, +b, null, w))
+    // "drop off" / "drop-off" is a delivery word, never a change word.
+    .replace(/\bdrop(?:ping|ped)?[\s-]*off\b/g, 'dropoff');
+  return { text: t, dates };
+}
+
+// Tokens: numbers (with comma thousands, "1,350" = 1350), words and single
+// punctuation marks, each with its place in the text.
+function factTokens(text) {
+  const out = [];
+  const re = /(\d{1,3}(?:,\d{3})+|\d+)|([a-z]+)|(\S)/g;
+  let m;
+  let clauseNegated = false;
+  while ((m = re.exec(text))) {
+    const kind = m[1] ? 'n' : (m[2] ? 'w' : 'p');
+    // Sentence ends and semicolons end the rejection. A comma does not:
+    // "do not, under any circumstances, send us 350" still rejects it.
+    if (kind === 'p' && /^[.!?;]$/.test(m[0])) clauseNegated = false;
+    out.push({ kind, t: m[0], s: m.index, e: m.index + m[0].length,
+      v: kind === 'n' ? Number(m[0].replace(/,/g, '')) : null, negatedBefore: clauseNegated });
+    if (kind === 'w' && FACT_NEGATION_WORDS.has(m[0])) clauseNegated = true;
+  }
+  return out;
+}
+
+// Up to n words or numbers (punctuation skipped) next to token i, read in
+// text order. dir -1 = before, +1 = after. stopWord ends the walk.
+function factWindow(toks, i, dir, n, stopWord) {
+  const out = [];
+  for (let k = i + dir; k >= 0 && k < toks.length && out.length < n; k += dir) {
+    if (toks[k].kind === 'p') continue;
+    if (stopWord && toks[k].t === stopWord) break;
+    out.push(toks[k].t);
+  }
+  return dir < 0 ? out.reverse() : out;
+}
+
+// Word distance between tokens a and b (punctuation does not count).
+function factWordGap(toks, a, b) {
+  const lo = Math.min(a, b), hi = Math.max(a, b);
+  let n = 0;
+  for (let k = lo + 1; k <= hi; k++) if (toks[k].kind !== 'p') n++;
+  return n;
+}
+
+// The hits in one cleaned paragraph. A hit is NUMBER, 0 to 2 words from
+// the fixed list, then a coconut word ("350 fresh coconuts"); or a coconut
+// word, an optional qty / quantity / count, then ':' '=' or 'of', then
+// NUMBER ("Coconuts: 350"). Nothing else may sit between. Returns
+// [{ num, end, word, flags }] (token indexes), one per number.
+function factFindHits(toks) {
+  const hits = [];
+  const seen = new Set();
+  const add = (hit) => { if (!seen.has(hit.num)) { seen.add(hit.num); hits.push(hit); } };
+  for (let i = 0; i < toks.length; i++) {
+    const tok = toks[i];
+    if (tok.kind === 'n') {
+      let k = i + 1;
+      // "350-coconut order": one hyphen glued to the number.
+      if (toks[k] && toks[k].t === '-' && toks[k].s === tok.e && toks[k + 1] && toks[k + 1].kind === 'w') k++;
+      const flags = [];
+      let between = 0;
+      while (toks[k] && toks[k].kind === 'w' && between < 2 && !FACT_COCONUT_RE.test(toks[k].t)
+             && (FACT_ADJECTIVES.has(toks[k].t) || FACT_BETWEEN_FLAGS.has(toks[k].t))) {
+        if (FACT_BETWEEN_FLAGS.has(toks[k].t)) flags.push(FACT_BETWEEN_FLAGS.get(toks[k].t));
+        k++;
+        between++;
+      }
+      if (toks[k] && toks[k].kind === 'w' && FACT_COCONUT_RE.test(toks[k].t)) {
+        // "350 Coconut Grove Ave" is an address and "350 coconut cups" a
+        // product: the word right after decides.
+        const next = toks[k + 1] && toks[k + 1].kind === 'w' ? toks[k + 1].t : '';
+        const singular = toks[k].t === 'coconut' || toks[k].t === 'coco';
+        if (FACT_PRODUCT_WORDS.has(next) || (singular && FACT_PLACE_WORDS.has(next))) continue;
+        add({ num: i, end: k, word: k, flags });
+      }
+    } else if (tok.kind === 'w' && FACT_COCONUT_RE.test(tok.t)) {
+      let k = i + 1;
+      if (toks[k] && FACT_COUNT_WORDS.has(toks[k].t)) k++;
+      if (!(toks[k] && (toks[k].t === ':' || toks[k].t === '=' || toks[k].t === 'of'))) continue;
+      k++;
+      const flags = [];
+      // "Coconuts: ~350" or "Coconuts: about 350" is read, as a guess.
+      if (toks[k] && toks[k].t === '~') { flags.push('hedge'); k++; }
+      else if (toks[k] && FACT_LEAD_HEDGES.has(toks[k].t)) {
+        flags.push('hedge');
+        k++;
+        if (toks[k] && toks[k].t === '.') k++;
+      }
+      if (toks[k] && toks[k].kind === 'n') add({ num: k, end: k, word: i, flags });
+    }
+  }
+  return hits.sort((a, b) => a.num - b.num);
+}
+
+// True when a guest word within 3 words belongs to THIS number: the
+// number is the nearest one to it, and the hit's coconut word does not
+// sit between them. "Coconuts: 350 guests" drops the hit; "200 guests
+// and need 150 coconuts" and "350 coconuts for our guests" keep it.
+// ("120 guests, 150 coconuts" is dropped: 150 is 1 word from the guest
+// word and no number is nearer. A miss, the safe direction.)
+// Only the words within 3 of the number are looked at (and, for each
+// guest word, the words nearer to it than the number), so the work stays
+// small however long the paragraph is. A long PDF table of "Guests 120
+// Coconuts 150" once cost seconds when every token was compared.
+function factGuestOwnsHit(toks, hit) {
+  for (const dir of [-1, 1]) {
+    let words = 0;
+    for (let g = hit.num + dir; g >= 0 && g < toks.length; g += dir) {
+      if (toks[g].kind === 'p') continue;
+      if (++words > 3) break;
+      if (toks[g].kind !== 'w' || !FACT_GUEST_WORDS.has(toks[g].t)) continue;
+      // words is the word gap from this guest word to the number.
+      if (factNumberWithin(toks, g, words - 1, hit.num)) continue;
+      const wordBetween = (hit.word > Math.min(g, hit.num)) && (hit.word < Math.max(g, hit.num));
+      if (!wordBetween) return true;
+    }
+  }
+  return false;
+}
+
+// True when a number other than token skip sits within n words of token g.
+function factNumberWithin(toks, g, n, skip) {
+  for (const dir of [-1, 1]) {
+    let words = 0;
+    for (let k = g + dir; k >= 0 && k < toks.length; k += dir) {
+      if (toks[k].kind === 'p') continue;
+      if (++words > n) break;
+      if (k !== skip && toks[k].kind === 'n') return true;
+    }
+  }
+  return false;
+}
+
+// What one paragraph says as a whole, worked out ONCE per paragraph (not
+// once per hit): another event, a date that is not the deal's, a year
+// that is not the deal's, two weekdays joined ("Friday and Saturday").
+function factParagraphFacts(toks, hits, text, dates, eventDate) {
+  const hitNums = new Set(hits.map((h) => h.num));
+  let otherYear = false;
+  for (let k = 0; k < toks.length && !otherYear; k++) {
+    const tok = toks[k];
+    if (tok.kind !== 'n' || !/^20\d\d$/.test(tok.t) || hitNums.has(k)) continue;
+    const prev = factWindow(toks, k, -1, 1)[0] || '';
+    const next = factWindow(toks, k, 1, 1)[0] || '';
+    if ((FACT_YEAR_BEFORE.has(prev) || FACT_YEAR_AFTER.has(next)) && (!eventDate || tok.v !== eventDate.y)) otherYear = true;
+  }
+  return {
+    otherEvent: otherYear || FACT_OTHER_EVENT_RE.test(text),
+    dateMismatch: dates.some((d) => d.unclear || !eventDate || d.m !== eventDate.m || d.d !== eventDate.d || (d.y && d.y !== eventDate.y)),
+    weekdayPair: FACT_WEEKDAY_PAIR_RE.test(text),
+    recurring: FACT_RECURRENCE_RE.test(text),
+  };
+}
+
+// True when the text names two different weekdays or another sign of a
+// count that covers more than one day.
+function factMultiDay(text) {
+  if (FACT_MULTI_DAY_RE.test(text)) return true;
+  const days = new Set((text.match(FACT_WEEKDAY_RE) || []).map((w) => w.slice(0, 3)));
+  return days.size >= 2;
+}
+
+// The first reason a hit is unclear, or null when it is clear. Checked in
+// the spec's order after the thousands test (which changes the number
+// itself). text is the cleaned paragraph, dates its dates.
+function factHitReason(toks, hit, text, para) {
+  const i = hit.num;
+  const at = (k) => toks[k] || { kind: '', t: '', s: -1, e: -1 };
+  const tok = at(i);
+  const gapText = (a, b) => text.slice(at(a).e, at(b).s);
+  const digits3 = /^\d{3}$/.test(tok.t);
+  // "1 350", "1.350", "3.5", "1.5k": the real number is not clear.
+  if (hit.flags.includes('thousands_unclear')) return 'thousands_unclear';
+  if (at(i - 1).kind === 'n' && gapText(i - 1, i) === ' ' && digits3) return 'thousands_unclear';
+  if ((at(i - 1).t === '.' || at(i - 1).t === ',') && at(i - 2).kind === 'n'
+      && at(i - 1).s === at(i - 2).e && at(i - 1).e === tok.s) return 'thousands_unclear';
+  if (at(i + 1).kind === 'n' && gapText(i, i + 1) === ' ' && /^\d{3}$/.test(at(i + 1).t)) return 'thousands_unclear';
+  // A dot only counts with a digit glued after it ("Coconuts: 350." ends a sentence).
+  if (at(i + 1).t === '.' && at(i + 1).s === tok.e && at(i + 2).kind === 'n' && at(i + 2).s === at(i + 1).e) return 'thousands_unclear';
+  if (at(i + 1).t === 'k' && at(i + 1).s === tok.e) return 'thousands_unclear';
+  const before3 = factWindow(toks, i, -1, 3).join(' ');
+  const before4 = factWindow(toks, i, -1, 4).join(' ');
+  const after3 = factWindow(toks, hit.end, 1, 3).join(' ');
+  const after4 = factWindow(toks, i, 1, 4).join(' ');
+  // "Coconuts: 350+" means 350 or more.
+  const plusGlued = at(i + 1).t === '+' && at(i + 1).s === tok.e;
+  if (hit.flags.includes('hedge') || at(i - 1).t === '~' || plusGlued
+      || FACT_HEDGE_BEFORE_RE.test(before3) || FACT_HEDGE_AFTER_RE.test(after3)) return 'hedge';
+  const rangeLink = (k) => FACT_RANGE_MARKS.has(at(k).t) || at(k).t === 'to' || at(k).t === 'or';
+  if ((rangeLink(i - 1) && at(i - 2).kind === 'n') || (rangeLink(i + 1) && at(i + 2).kind === 'n')
+      || (rangeLink(hit.end + 1) && at(hit.end + 2).kind === 'n') || /\bbetween\b/.test(before4)) return 'range';
+  // An arrow or '+' (up to 2 marks, "->", "=>" or ">>") with a number on
+  // the other side, or a '+' right after the count ("300 coconuts + 50").
+  const markThen = (k, dir) => {
+    let j = k;
+    if (!FACT_CHANGE_MARKS.has(at(j).t) && !((at(j).t === '=' || at(j).t === '-') && at(j + dir).t === '>')) return false;
+    while (at(j).kind === 'p' && Math.abs(j - k) < 3) j += dir;
+    return at(j).kind === 'n';
+  };
+  const plusAfter = at(hit.end + 1).t === '+' && !plusGlued;
+  const startTok = Math.min(hit.num, hit.word);
+  const before2 = factWindow(toks, startTok, -1, 2).join(' ');
+  if (hit.flags.includes('change_word') || FACT_CHANGE_RE.test(before4) || FACT_CHANGE_RE.test(after4)
+      || FACT_CHANGE_AFTER_RE.test(after4) || FACT_NEGATE_BEFORE_RE.test(before2) || plusAfter
+      || at(startTok).negatedBefore || FACT_REJECT_AFTER_RE.test(factWindow(toks, hit.end, 1, 4).join(' '))
+      || markThen(i + 1, 1) || markThen(hit.end + 1, 1) || markThen(i - 1, -1)) return 'change_word';
+  // A price ("at $10 each") ends the after window: "each" there is money.
+  const perAfter = factWindow(toks, hit.end, 1, 4, 'hcmoney').join(' ');
+  if (FACT_PER_AFTER_RE.test(perAfter) || FACT_PER_BEFORE_RE.test(before4) || para.weekdayPair || para.recurring) return 'per_unit';
+  const timesMark = (k) => FACT_TIMES_MARKS.has(at(k).t);
+  if ((timesMark(i - 1) && at(i - 2).kind === 'n') || (timesMark(i + 1) && at(i + 2).kind === 'n')
+      || (timesMark(hit.end + 1) && at(hit.end + 2).kind === 'n')
+      || /\btimes\b/.test(before3) || /\btimes\b/.test(after3)) return 'multiply';
+  if (para.otherEvent) return 'other_event';
+  if (para.dateMismatch) return 'date_mismatch';
+  if (tok.v < 10 || tok.v > 5000) return 'out_of_range';
+  return null;
+}
+
+// Every hit in a text, paragraph by paragraph, in reading order:
+// { hits: [{ value, reason }], guestDropped }. value is null when the
+// number itself is unclear (thousands_unclear: "1 350" may be 1350).
+function factReadText(text, eventDate) {
+  const hits = [];
+  let guestDropped = false;
+  const paragraphs = factDropOwnBullets(text).split(/\n[ \t]*\n/);
+  for (const paragraph of paragraphs) {
+    if (!/\d/.test(paragraph) || !/coco/i.test(paragraph)) continue;
+    const { text: clean, dates } = factCleanParagraph(paragraph);
+    const toks = factTokens(clean);
+    const found = factFindHits(toks);
+    const para = factParagraphFacts(toks, found, clean, dates, eventDate);
+    const mine = [];
+    for (const hit of found) {
+      if (factGuestOwnsHit(toks, hit)) { guestDropped = true; continue; }
+      const reason = factHitReason(toks, hit, clean, para);
+      mine.push({ value: reason === 'thousands_unclear' ? null : toks[hit.num].v, reason });
+    }
+    // The same count twice in ONE paragraph is a list ("Sat: 350
+    // coconuts / Sun: 350 coconuts"): a count per day or per bar, so the
+    // real total is not clear.
+    const seen = new Map();
+    for (const h of mine) if (h.value !== null) seen.set(h.value, (seen.get(h.value) || 0) + 1);
+    for (const h of mine) {
+      if (h.reason === null && seen.get(h.value) >= 2) h.reason = 'per_unit';
+      hits.push(h);
+    }
+  }
+  return { hits, guestDropped };
+}
+
+// A value SQL accepts (a whole number 1 to 20000), else null.
+function factSqlValue(v) {
+  return Number.isSafeInteger(v) && v >= 1 && v <= 20000 ? v : null;
+}
+
+// Distinct values in reading order (nulls left out).
+function factDistinct(hits) {
+  const out = new Set();
+  for (const h of hits) if (h.value !== null) out.add(h.value);
+  return [...out];
+}
+
+// extractCoconutCounts(rawText, { eventDate }) -> { result, value,
+// reason, otherValues, formNotice }. Pure: no network, no clock, no model.
+// eventDate is the deal's day, 'YYYY-MM-DD' or null. Results (the 056
+// report shapes):
+//   one      every hit clear, all the same value (10 to 5000), reason null
+//   several  two or more different values: reason two_values, value the
+//            last clear value or null, otherValues up to 3 of the rest
+//   unclear  a reason (the first one found); value the number when there
+//            is exactly one, else null
+//   none     no hit; reason null, or guest_word (a guest count was the
+//            only number), or quoted_only (counts only in quoted text)
+// A count found only in an attachment is unclear / attachment_only.
+// Spelled-out numbers ("three hundred") are a silent miss.
+export function extractCoconutCounts(rawText, opts = {}) {
+  const ev = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String((opts && opts.eventDate) || ''));
+  const eventDate = ev ? { y: +ev[1], m: +ev[2], d: +ev[3] } : null;
+  const normalized = String(rawText || '').replace(/\r\n?/g, '\n').replace(FACT_INVISIBLE_RE, '')
+    .replace(FACT_ODD_SPACE_RE, ' ');
+  const truncated = normalized.length > FACT_MAX_CHARS;
+  const text = normalized.slice(0, FACT_MAX_CHARS);
+  // Attachment sections (the poller's '=== ATTACHMENT: ' marker) are
+  // read apart from the email's own words.
+  const parts = text.split(/^=== ATTACHMENT: /m);
+  const attachments = parts.slice(1).map((s) => (s.indexOf('\n') >= 0 ? s.slice(s.indexOf('\n') + 1) : ''));
+  const form = factFormBlock(parts[0]);
+  const { fresh, quoted, ended } = factCutQuoted(form.text);
+  const out = (result, value, reason, otherValues) => ({
+    result, value: factSqlValue(value), reason: reason || null,
+    otherValues: (otherValues || []).map(factSqlValue).filter((v) => v !== null).slice(0, 3),
+    formNotice: form.notice,
+  });
+
+  // The unseen tail may contain a correction. Never fill or suggest a
+  // number from partially read fresh words. A quote, signature or real
+  // attachment boundary within the prefix proves the fresh part ended.
+  // Reuse the existing no_value code, so this requires no database change.
+  if (truncated && !ended && parts.length === 1) return out('unclear', null, 'no_value', []);
+
+  const body = factReadText(fresh, eventDate);
+  if (body.hits.length) {
+    const values = factDistinct(body.hits);
+    if (values.length >= 2) {
+      const clear = body.hits.filter((h) => h.reason === null);
+      const value = clear.length ? clear[clear.length - 1].value : null;
+      return out('several', value, 'two_values', values.filter((v) => v !== value));
+    }
+    // The same count in two paragraphs is usually her repeating herself,
+    // unless the email covers more than one day ("Saturday ... 350
+    // coconuts" and "Sunday ... 350 coconuts").
+    if (body.hits.length >= 2 && values.length === 1 && body.hits.every((h) => h.reason === null)
+        && factMultiDay(factCleanParagraph(fresh).text)) {
+      return out('unclear', values[0], 'per_unit', []);
+    }
+    if (body.hits.every((h) => h.reason === null)) return out('one', values[0], null, []);
+    const first = body.hits.find((h) => h.reason !== null);
+    return out('unclear', values.length === 1 ? values[0] : null, first.reason, []);
+  }
+  // Nothing in her own words. An attachment can only ever suggest.
+  const fileHits = attachments.flatMap((a) => factReadText(a, eventDate).hits);
+  const fromFiles = factDistinct(fileHits);
+  if (fileHits.length) {
+    return out('unclear', fromFiles.length === 1 ? fromFiles[0] : null, 'attachment_only',
+      fromFiles.length >= 2 ? fromFiles : []);
+  }
+  if (body.guestDropped) return out('none', null, 'guest_word', []);
+  if (quoted && factReadText(quoted, eventDate).hits.length) return out('none', null, 'quoted_only', []);
+  return out('none', null, null, []);
+}
+
+// DEAL_FACTS (a worker secret): 'on' runs the Email reader; unset or any
+// other value means off and the scan returns at once with no call at all.
+export function dealFactsOn(env) {
+  return String((env && env.DEAL_FACTS) || '').toLowerCase() === 'on';
+}
+
+const FACT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const FACT_REPORT_COUNTS = ['applied', 'would_apply', 'suggested', 'info', 'same', 'ignored', 'closed', 'waited', 'skipped', 'repeat', 'bad'];
+const FACT_REASONS = new Set(['hedge', 'range', 'change_word', 'per_unit', 'multiply', 'other_event', 'date_mismatch',
+  'out_of_range', 'thousands_unclear', 'two_values', 'guest_word', 'attachment_only', 'quoted_only', 'no_value']);
+
+// One 056 call with the service key. Returns the JSON object, or null
+// after ONE log line (status and error code only, never a body). A 404 or
+// PGRST202 means 056 is not live yet: the scan simply stops.
+async function dealFactRpc(env, name, body) {
+  try {
+    const resp = await webhookFetch(env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/rpc/' + name, {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    }, 10000);
+    if (!resp) { console.log('deal facts: ' + name + ' answered nothing'); return null; }
+    if (!resp.ok) {
+      let code = '';
+      try {
+        const err = await resp.json();
+        if (err && /^[A-Z0-9]{5,8}$/.test(String(err.code || ''))) code = err.code;
+      } catch (_) { /* no JSON body */ }
+      if (resp.status === 404 || code === 'PGRST202') console.log('deal facts: ' + name + ' answered 404, 056 is not live');
+      else console.log('deal facts: ' + name + ' answered ' + resp.status + (code ? ' (' + code + ')' : ''));
+      return null;
+    }
+    const data = await resp.json();
+    if (data && typeof data === 'object' && !Array.isArray(data)) return data;
+    // A wrong function shape (a list, a bare value) must not stop quietly.
+    console.log('deal facts: ' + name + ' answered ' + resp.status + ' (not an object)');
+    return null;
+  } catch (e) {
+    console.log('deal facts: ' + name + ' failed: ' + ((e && e.name) || 'error'));
+    return null;
+  }
+}
+
+// The stored bodies of these emails, ONE read for the whole tick.
+async function dealFactBodies(env, ids) {
+  try {
+    const resp = await webhookFetch(env.SUPABASE_URL.replace(/\/+$/, '') +
+      '/rest/v1/intake_messages?id=in.(' + ids.join(',') + ')&select=id,raw_text', { headers: sbHeaders(env) }, 10000);
+    if (!resp || !resp.ok) { console.log('deal facts: intake read answered ' + (resp ? resp.status : 'nothing')); return null; }
+    const rows = await resp.json();
+    if (Array.isArray(rows)) return rows;
+    console.log('deal facts: intake read answered ' + resp.status + ' (not a list)');
+    return null;
+  } catch (e) {
+    console.log('deal facts: intake read failed: ' + ((e && e.name) || 'error'));
+    return null;
+  }
+}
+
+// A tick item the worker will act on: whole-number ids, a uuid, a day or null.
+function dealFactTickItemOk(it) {
+  return !!it && typeof it === 'object'
+    && Number.isSafeInteger(it.intake_id) && it.intake_id > 0
+    && Number.isSafeInteger(it.link_id) && it.link_id > 0
+    && typeof it.order_id === 'string' && FACT_UUID_RE.test(it.order_id)
+    && (it.event_date === null || it.event_date === undefined || /^\d{4}-\d{2}-\d{2}$/.test(String(it.event_date)));
+}
+
+// The same shape rules 056's report checks, so a bad item never leaves.
+export function dealFactReportItemOk(item) {
+  const keys = Object.keys(item || {}).sort().join(',');
+  if (keys !== 'form_notice,intake_id,link_id,order_id,other_values,reason,result,value') return false;
+  const v = item.value;
+  if (!(v === null || factSqlValue(v) === v)) return false;
+  if (!(item.reason === null || FACT_REASONS.has(item.reason))) return false;
+  if (!Array.isArray(item.other_values) || item.other_values.length > 3
+      || item.other_values.some((o) => factSqlValue(o) !== o)) return false;
+  if (typeof item.form_notice !== 'boolean') return false;
+  if (item.result === 'one') return v !== null && v >= 10 && v <= 5000 && item.reason === null;
+  if (item.result === 'none') return v === null;
+  if (item.result === 'unclear') return item.reason !== null;
+  if (item.result === 'several') return item.reason === null || item.reason === 'two_values';
+  return false;
+}
+
+// The 5-minute Email reader tick, LAST in the chain. Three subrequests at
+// most: (1) the tick, (2) one read of the bodies, (3) one report. Never
+// throws. Logs carry counts and codes only, never an email word.
+export async function runDealFactScan(env) {
+  try {
+    if (!dealFactsOn(env)) return;
+    if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) return;
+    const tick = await dealFactRpc(env, 'hc_crm_facts_tick', { p: { v: 1, limit: 10 } });
+    if (!tick) return;
+    const closed = Number.isSafeInteger(tick.closed) ? tick.closed : 0;
+    if (tick.v !== 1 || tick.code !== 'ok') {
+      console.log('deal facts: tick code ' + (/^[a-z_]{1,20}$/.test(String(tick.code)) ? tick.code : 'unknown'));
+      return;
+    }
+    if (tick.mode !== 'shadow' && tick.mode !== 'on') {
+      console.log('deal facts: none (off, closed ' + closed + ')');
+      return;
+    }
+    const items = (Array.isArray(tick.items) ? tick.items : []).filter(dealFactTickItemOk).slice(0, 10);
+    if (!items.length) {
+      console.log('deal facts: none (no new emails, mode ' + tick.mode + ', closed ' + closed + ')');
+      return;
+    }
+    const rows = await dealFactBodies(env, [...new Set(items.map((it) => it.intake_id))]);
+    if (!rows) return;
+    const bodies = new Map(rows.filter((r) => r && Number.isSafeInteger(r.id)).map((r) => [r.id, r.raw_text]));
+    const report = [];
+    for (const it of items) {
+      // An email that is gone is never guessed at; the tick drops it.
+      if (!bodies.has(it.intake_id)) continue;
+      const fact = extractCoconutCounts(bodies.get(it.intake_id), { eventDate: it.event_date || null });
+      const item = {
+        intake_id: it.intake_id, order_id: it.order_id, link_id: it.link_id,
+        result: fact.result, value: fact.value, reason: fact.reason,
+        other_values: fact.otherValues, form_notice: fact.formNotice,
+      };
+      if (dealFactReportItemOk(item)) report.push(item);
+    }
+    if (!report.length) {
+      console.log('deal facts: nothing to report (mode ' + tick.mode + ', offered ' + items.length + ')');
+      return;
+    }
+    const answer = await dealFactRpc(env, 'hc_crm_facts_report', { p: { v: 1, items: report } });
+    if (!answer) return;
+    const counts = answer.counts && typeof answer.counts === 'object' ? answer.counts : {};
+    const words = FACT_REPORT_COUNTS.map((k) => k + ' ' + (Number.isSafeInteger(counts[k]) ? counts[k] : 0));
+    console.log('deal facts: ' + (/^[a-z_]{1,20}$/.test(String(answer.code)) ? answer.code : 'unknown') +
+      ', mode ' + tick.mode + ', read ' + report.length + ', tick closed ' + closed + ', ' + words.join(', '));
+  } catch (e) {
+    console.error('runDealFactScan error:', (e && e.name) || 'error');
   }
 }

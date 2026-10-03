@@ -399,7 +399,7 @@ const crewShift = { id: 's-crew', worker_name: 'Hashim Nadir', worker_email: 'cr
   } finally { quiet.restore(); }
   pass('card: the structured card before and after leave-by, the words path, venue-only tag without the order, null with no plan or no leave-by');
 }
-// ── 13b. The shift scan sends the card in content-state; Stopped wins ─
+// ── 13b. The shift scan sends the card; location uncertainty wins ─
 {
   const laShift = (id) => ({ id, worker_name: 'Hashim Nadir', worker_email: 'crew@example.invalid', market: 'ny', clock_in_at: '2026-09-12T12:30:00Z', clock_in_lat: GARAGE.lat + 0.0009, clock_in_lng: GARAGE.lng });
   const laTokens = (id) => [{ shift_id: id, email: 'owner@example.invalid', token: 'la-owner-' + id }];
@@ -426,17 +426,17 @@ const crewShift = { id: 's-crew', worker_name: 'Hashim Nadir', worker_email: 'cr
     assert.equal(late.length, 2);
     assert.equal(late[1].state.status, 'Late 30m · Pridwin'); assert.equal(late[1].state.headline, 'Late 30m'); assert.equal(late[1].state.lateMinutes, 30);
   } finally { atGarage.restore(); }
-  // A GPS stamp 30 minutes old away from the garage: "Stopped 30m" and none of the plan's keys.
+  // A GPS stamp 30 minutes old cannot prove a stop or carry the plan's keys.
   const stopped = harness({ plans: [plannedRow()], orders: [pridwinOrder()], shifts: [laShift('la-2')], points: { 'la-2': [fresh({ lat: 40.7555, lng: -74.1059 }, '2026-09-12T13:00:00Z', 30)] }, laTokens: laTokens('la-2') });
   try {
     await at('2026-09-12T13:00:00Z', () => runShiftStatusScan(APPLE_ENV));
     const sent = contentStates(stopped);
     assert.equal(sent.length, 1);
-    assert.deepEqual(sent[0].state, { status: 'Stopped', statusMinutes: 30, lastReportISO: '2026-09-12T12:30:00.000Z', marketLabel: 'NJ' });
+    assert.deepEqual(sent[0].state, { status: 'Location delayed', statusMinutes: 30, lastReportISO: '2026-09-12T12:30:00.000Z', marketLabel: 'NJ', stage: 'location_delayed', headline: 'Location delayed' });
     // The plan was never even read for a stopped shift.
     assert.ok(!stopped.calls.some((c) => c.url.includes('order_departures?')));
   } finally { stopped.restore(); }
-  pass('shift scan: content-state carries the card (stage, headline, jobTag, leaveByISO), dedupes on it, resends on a new late count; Stopped keeps precedence and skips the plan');
+  pass('shift scan: content-state carries the card, dedupes on it, resends on a new late count; location uncertainty keeps precedence and skips the plan');
 }
 // ── 14. The router facade and the Apple token ───────────────────────
 {
