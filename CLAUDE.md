@@ -408,6 +408,84 @@ Nothing deployed. Ships at P5b as one Claudia deploy, its own "yes do it".
   Undo: `npx --no-install wrangler rollback <the id from step 1>` (rolling
   back past another deploy also removes that deploy).
 
+## Email reader: coconut counts from customer emails (migration 056, built 2026-10-01, LOCAL ONLY)
+
+Branch `feature/crm-email-facts`, cut from the live lineage
+fix/claudia-chat-order-writes-switch 7a6ff67 (NEVER main). Spec: scratchpad
+deal-facts/DEAL-FACTS-SPEC.md section 2; SQL half: HC Secure
+Backups/tools/crm/056 (APPLY-RUNBOOK-056.md). Nothing deployed. The why:
+Test Customer wrote "350 coconuts" three times and her deal still said "Missing
+count".
+
+- DO NOT "FIX" THIS BACK. The Email reader is THIS worker. It reads stored
+  email bodies exactly like the address and time scans already do. SQL
+  (056's hc_crm_facts_* functions) receives numbers and reason codes only,
+  never an email word. crm_mail_robot.py and the hc_crm_robot_* functions
+  stay envelope only. The count lives in crm_email_facts and NEVER in
+  orders.coconuts_qty, QuickBooks or Jarvis, so a robot count can never
+  reach the 8am digest, the HC Field buy plan or an invoice.
+- `runDealFactScan` is the LAST step of the */5 chain (after
+  runWebhookIntakeScan), behind the worker secret `DEAL_FACTS` ('on' runs
+  it; unset means no call at all). Three subrequests at most: (1)
+  rpc/hc_crm_facts_tick {"p":{"v":1,"limit":10}}; stop on mode off or no
+  items; (2) one GET intake_messages?id=in.(...)&select=id,raw_text; (3)
+  rpc/hc_crm_facts_report with 1 to 10 items of exactly 8 keys (intake_id,
+  order_id, link_id, result, value, reason, other_values, form_notice).
+  Before 056 exists the tick answers 404 and the scan logs `deal facts:
+  hc_crm_facts_tick answered 404, 056 is not live` and stops. Every log
+  line is counts and codes only.
+- `extractCoconutCounts(rawText, {eventDate})` is pure and strict: a number
+  counts only next to a coconut word ("350 coconuts", "Coconuts: 350", up
+  to 2 words from fresh, young, drinking, thai, branded, stamped, cracked,
+  whole, logo between). The body is cut at the FIRST quote or forward of any
+  kind (On ... wrote:, Original Message, an underscore line, ANY From: plus
+  Sent:/Date: block, forwards, '>' lines) and at a '-- ' signature; our own
+  "Count: N coconuts" bullet, money, phones, emails, links and clock times
+  are ignored. Guesses, ranges, change words (except "drop off"), per-day
+  or per-station amounts, multiplies, another event or another date in the
+  paragraph, "1 350" style numbers and anything outside 10 to 5000 make it
+  'unclear' (a card at most). Two different counts are 'several'. A count
+  only in an attachment is unclear / attachment_only. The website form's
+  coconut_count field is read as "Coconuts: N" (strict "New form submission
+  on" heading test, copied from Jarvis). Spelled-out numbers are a miss.
+- Deviation from the spec's guest rule, on purpose: a guest word within 3
+  words drops a hit only when that hit's number is the nearest number to it
+  and the coconut word is not between them. So "Coconuts: 350 guests" is
+  dropped, but "200 guests and 150 coconuts" and "350 coconuts for our
+  guests" still read. A 'none' result may carry reason guest_word or
+  quoted_only (056 accepts both) for the Practice review.
+- Review fixes (2026-10-02), each pinned in the test file section 4b:
+  the guest check looks only at the 3 words around a hit (a 20,000
+  character guest-dense paragraph took 8 to 27 seconds, now under 20 ms,
+  same answers); the same count twice in one paragraph, or in two
+  paragraphs of an email that names two weekdays, "weekend", "day 1" or
+  "2-day", is per_unit (a weekend order is never read as half its total);
+  more change words (lower, go down, change, instead, update, cancel, no
+  longer, "actually" after the count, "not" or "rather than" right before
+  it, '+' and arrows to another number) and hedges (maybe, might, "could
+  go", "will confirm", "350+"); "350 Coconut Grove/Row/Ln" and "350
+  coconut cups/waters" are not counts; more quote headers (From: plus To:
+  or Subject:, "X wrote on Tue:", schrieb, a écrit, escribió); a bare year
+  other than the deal's ("in 2025", "our 2025 event") is other_event;
+  zero-width characters are removed and no-break spaces read as spaces;
+  a 2xx answer that is not an object (or not a list for the intake read)
+  logs one line instead of stopping silently.
+- Tests: `node worker/test-deal-facts.mjs` (43 checks: the spec 2c vectors,
+  Test Customer's three-email pattern, the website form, every trap, the review
+  fixes with a timing check, the 056 shape rules, and the scan against a
+  fake network). 20 of the first 21 planted bugs caught (the 21st removes a
+  backstop the extractor cannot trip), and 23 of 23 for the review fixes.
+- Ship order (each its own "yes do it", claim the OPERATOR BOARD lines
+  first): 056 applied; then deploy THIS branch with DEAL_FACTS unset (write
+  down the live version id first; if it is not 030440ec, merge the live
+  branch in and rerun the tests); then HC App; then `wrangler secret put
+  DEAL_FACTS` (on) with 056's switch on Practice for about 7 days; then On.
+  Live proof with DEAL_FACTS unset: no facts-reader calls are made; the
+  reader returns silently. Do not enable the secret to manufacture an off
+  log. After an approved Practice activation, `npx wrangler tail` should
+  show a counts or none line. Undo: `wrangler secret delete DEAL_FACTS`, or
+  `npx --no-install wrangler rollback <the version written down>`.
+
 ## Current uncommitted state (as of 2026-07-07)
 
 index.html has the one-line pending-payment fix described above staged

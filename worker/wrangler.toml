@@ -175,3 +175,18 @@ crons = [
 #   ARTWORK_PROPOSALS`, value on; `wrangler secret delete ARTWORK_PROPOSALS`
 #   is the kill switch (rows already in the table stay visible in the app,
 #   so tell Sidd).
+# EMAIL READER (2026-10-01, DEAL-FACTS-SPEC.md section 2; migration 056 must
+# be live first). The LAST step of the 5-minute chain, runDealFactScan,
+# asks 056's hc_crm_facts_tick for customer emails that sit on a deal
+# through a live crm_intake_links row, reads their stored raw_text, finds a
+# coconut count with the strict extractCoconutCounts and sends 056's
+# hc_crm_facts_report numbers and reason codes only (never a word of the
+# email). SQL decides fill, Practice card, suggestion or info. The count
+# lives in crm_email_facts, never in orders. 3 subrequests per tick at most.
+# One setting, a secret, default off, never in this file:
+# DEAL_FACTS - 'on' runs the scan; unset (or any other value) means off and
+#   the scan makes no call at all. 056's own switch (Off / Practice / On in
+#   HC App, plus the CRM Stop all) still decides what a read does.
+#   `wrangler secret put DEAL_FACTS`, value on; `wrangler secret delete
+#   DEAL_FACTS` is the kill switch (rows already made stay in the app until
+#   Sidd undoes them).
