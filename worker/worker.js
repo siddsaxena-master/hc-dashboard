@@ -5584,8 +5584,33 @@ async function processMsGraphNotification(env, eventKey, notification) {
       let normalizedLeadEmail = null; // the exact lowercase address the lookup used (stored on the row so later lookups match)
       let noteFailed = false;      // a suppressed email whose note did not reach the dashboard row
       let suppressedTargetId = null; // the row that absorbed a suppressed email (named in the alert)
+      // Website form notices (see parseWebsiteForm): on the lead_inquiry path
+      // only, the form's own fields replace the model's guesses BEFORE the
+      // dedupe guard, so the lookup, the decision and the new row all use the
+      // same email and date. A suppressed email still only appends today's
+      // note (no form lines, no column), and every other category is
+      // untouched. Any failure here keeps the model's fields.
+      let leadFields = cls.extracted_lead;
+      let websiteForm = null;
+      if (cls.category === 'lead_inquiry' && cls.extracted_lead &&
+          typeof cls.extracted_lead === 'object' && !Array.isArray(cls.extracted_lead)) {
+        try {
+          websiteForm = websiteFormFromNotification(notification);
+          if (websiteForm) {
+            const applied = applyWebsiteFormToLead(cls.extracted_lead, websiteForm);
+            leadFields = applied.lead;
+            // Field names only, never a value.
+            console.log('ms_graph website form: read ' + Object.keys(websiteForm).sort().join(',') +
+              '; changed ' + (applied.changed.join(',') || 'none'));
+          }
+        } catch (e) {
+          websiteForm = null;
+          leadFields = cls.extracted_lead;
+          console.error('ms_graph website form: read failed, model fields kept');
+        }
+      }
       if (cls.category === 'lead_inquiry' && cls.extracted_lead) {
-        const lead = cls.extracted_lead;
+        const lead = leadFields;
         await renewLease();
         // Dedupe guard (see leadDedupeDecision). Both addresses that can name
         // this sender are looked up EXACTLY: the address the model extracted
@@ -5664,7 +5689,11 @@ async function processMsGraphNotification(env, eventKey, notification) {
         }
       }
       if (cls.category === 'lead_inquiry' && cls.extracted_lead && !suppressedReason) {
-        const lead = cls.extracted_lead;
+        const lead = leadFields;
+        // A form lead's fixed lines go right after the subject line (HC App
+        // reads the subject from the first notes line). '' for any other email,
+        // which keeps today's notes text byte for byte.
+        const formNotes = websiteForm ? websiteFormNoteLines(websiteForm) : '';
         await insertWebhookOrder(env, {
           id: receiptId,
           client_name: lead.client_name || 'Unknown',
@@ -5683,7 +5712,8 @@ async function processMsGraphNotification(env, eventKey, notification) {
           stage: 'inquiry',
           source: 'website',
           notes: 'Email lead via MS Graph: ' +
-            (cls.subject || '') + '\n\n' + (lead.notes || ''),
+            (cls.subject || '') + '\n\n' +
+            (formNotes ? formNotes + (lead.notes ? '\n\n' : '') : '') + (lead.notes || ''),
           stamp_status: 'not_ordered',
           logo_received: false,
           deposit_cents: 0,

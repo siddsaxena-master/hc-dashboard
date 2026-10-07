@@ -7,9 +7,10 @@
 // form leads) and often guessed market and event type. Every person, address
 // and phone number below is invented (example.com, 555 numbers).
 import assert from 'node:assert/strict';
-import {
+import worker, {
   parseWebsiteForm, websiteFormMarket, websiteFormEventType,
   websiteFormFromNotification, applyWebsiteFormToLead, websiteFormNoteLines,
+  runWebhookIntakeScan,
 } from './worker.js';
 
 let failed = 0;
@@ -421,6 +422,434 @@ await check('notes lines: count and budget, each only when it passed', () => {
   assert.equal(websiteFormNoteLines({ coconut_count: '20' }), '');
   assert.equal(websiteFormNoteLines({}), '');
   assert.equal(websiteFormNoteLines(null), '');
+});
+
+// ── 6. End to end: the real /webhooks/ms-graph route, the */5 intake drain
+// (runWebhookIntakeScan) and a fake network. Nothing leaves this process. ──
+const GRAPH_CLIENT_STATE = 'graph-test-client-state';
+const ENV = {
+  MS_GRAPH_CLIENT_STATE: GRAPH_CLIENT_STATE,
+  SUPABASE_URL: 'https://sandbox.supabase.test',
+  SUPABASE_SERVICE_KEY: 'sandbox-service-key',
+  ANTHROPIC_API_KEY: 'sandbox-anthropic-key',
+  TG_BOT_TOKEN: 'sandbox-telegram-token',
+  ALLOWED_CHAT_IDS: '',
+};
+const SB = ENV.SUPABASE_URL + '/rest/v1/';
+// The lead row's columns today (processMsGraphNotification's insert).
+const ROW_KEYS = ['client_email', 'client_name', 'client_phone', 'coi_required', 'coi_submitted',
+  'deposit_cents', 'event_start_at', 'event_type', 'event_tz', 'headcount', 'id', 'is_recurring',
+  'logo_received', 'market', 'notes', 'source', 'stage', 'stamp_status', 'venue'];
+const FORM_SUBJECT = 'Hamptons Coconuts, new quote request';
+
+function installHarness({ classification, existingOrders = [], loseFirstInsertResponse = false }) {
+  const original = globalThis.fetch;
+  const st = { intake: [], receipts: new Map(), inserts: [], insertHeaders: [], stored: new Map(),
+    lookups: [], patches: [], ai: [], nextId: 1, insertResponseLost: false };
+  const uuid = () => '20000000-0000-4000-8000-' + String(st.nextId++).padStart(12, '0');
+  const reply = (status, value) => new Response(JSON.stringify(value), {
+    status, headers: { 'Content-Type': 'application/json' } });
+  globalThis.fetch = async (input, options = {}) => {
+    const url = String(input);
+    const method = String(options.method || 'GET').toUpperCase();
+    let body = null;
+    try { body = options.body ? JSON.parse(options.body) : null; } catch {}
+    const rpc = url.startsWith(SB + 'rpc/') ? url.slice((SB + 'rpc/').length) : null;
+    if (rpc === 'hc_enqueue_webhook_intake') {
+      for (const item of body.p_items) st.intake.push({ id: uuid(), item, state: 'pending', token: null, attempts: 0 });
+      return reply(200, body.p_items.length);
+    }
+    if (rpc === 'hc_claim_webhook_intake') {
+      const row = st.intake.find((r) => r.state === 'pending');
+      if (!row) return reply(200, []);
+      row.state = 'processing';
+      row.token = uuid();
+      row.attempts++;
+      return reply(200, [{ intake_id: row.id, provider: row.item.provider, event_key: row.item.event_key,
+        payload: row.item.payload, attempt_count: row.attempts, claim_token: row.token }]);
+    }
+    if (rpc === 'hc_finish_webhook_intake' || rpc === 'hc_release_webhook_intake') {
+      const row = st.intake.find((r) => r.id === body.p_intake_id && r.token === body.p_claim_token);
+      if (row) { row.state = rpc === 'hc_finish_webhook_intake' ? 'done' : 'released'; row.token = null; }
+      return reply(200, !!row);
+    }
+    if (rpc === 'hc_claim_webhook_delivery') {
+      const key = body.p_provider + '|' + body.p_event_key;
+      let receipt = st.receipts.get(key);
+      if (receipt && receipt.state === 'completed') {
+        return reply(200, [{ claim_state: 'completed', receipt_id: receipt.id, claim_token: null, claim_expires_at: null }]);
+      }
+      if (!receipt) { receipt = { id: uuid(), state: 'processing' }; st.receipts.set(key, receipt); }
+      receipt.token = uuid();
+      return reply(200, [{ claim_state: 'claimed', receipt_id: receipt.id, claim_token: receipt.token,
+        claim_expires_at: new Date(Date.now() + 300000).toISOString() }]);
+    }
+    if (rpc === 'hc_renew_webhook_delivery' || rpc === 'hc_release_webhook_delivery') return reply(200, true);
+    if (rpc === 'hc_finish_webhook_delivery') {
+      const receipt = st.receipts.get(body.p_provider + '|' + body.p_event_key);
+      if (receipt) receipt.state = 'completed';
+      return reply(200, true);
+    }
+    if (url === 'https://api.anthropic.com/v1/messages') {
+      st.ai.push(body);
+      return reply(200, { content: [{ type: 'text', text: JSON.stringify(classification) }] });
+    }
+    if (url.startsWith(SB + 'orders?on_conflict=id') && method === 'POST') {
+      st.inserts.push(body);
+      st.insertHeaders.push(options.headers || {});
+      // resolution=ignore-duplicates: a row already stored is never replaced.
+      if (!st.stored.has(body.id)) st.stored.set(body.id, body);
+      if (loseFirstInsertResponse && !st.insertResponseLost) {
+        st.insertResponseLost = true;
+        throw new Error('simulated lost insert response after commit');
+      }
+      return new Response(null, { status: 201 });
+    }
+    if (url.startsWith(SB + 'orders?select=') && method === 'GET') {
+      st.lookups.push(url);
+      const needle = String(new URL(url).searchParams.get('client_email') || '')
+        .replace(/^ilike\./, '').replace(/\*/g, '').replace(/\\(.)/g, '$1').toLowerCase();
+      return reply(200, existingOrders.filter((row) => String(row.client_email || '').toLowerCase().includes(needle)));
+    }
+    if (url.startsWith(SB + 'orders?id=eq.') && method === 'PATCH') {
+      st.patches.push({ url, body });
+      return new Response(null, { status: 204 });
+    }
+    throw new Error('unexpected offline fetch: ' + method + ' ' + url);
+  };
+  return { st, restore() { globalThis.fetch = original; } };
+}
+
+// One notification through the real webhook, then one drain, exactly as
+// production runs it. Logs are captured (and checked for leaks), not printed.
+async function runCase({ classification, resourceData, existingOrders, loseFirstInsertResponse, drains = 1 }) {
+  const h = installHarness({ classification, existingOrders, loseFirstInsertResponse });
+  const logs = [];
+  const keepLog = console.log;
+  const keepError = console.error;
+  console.log = (...args) => logs.push(args.map(String).join(' '));
+  console.error = (...args) => logs.push(args.map(String).join(' '));
+  try {
+    const response = await worker.fetch(new Request('https://worker.example.test/webhooks/ms-graph', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: [{
+        clientState: GRAPH_CLIENT_STATE,
+        subscriptionId: 'outlook-poller',
+        changeType: 'created',
+        resource: '/me/messages/' + resourceData.id,
+        resourceData,
+      }] }),
+    }), ENV);
+    const drained = [];
+    for (let i = 0; i < drains; i++) {
+      // A released item is retried on the next drain.
+      for (const row of h.st.intake) if (row.state === 'released') row.state = 'pending';
+      drained.push(await runWebhookIntakeScan(ENV));
+    }
+    return { ...h.st, status: response.status, drained, logs };
+  } finally {
+    console.log = keepLog;
+    console.error = keepError;
+    h.restore();
+  }
+}
+
+// What the poller forwards for a Formspree notice (forward_to_claudia).
+function formResource(id, body, overrides = {}) {
+  return {
+    id,
+    subject: FORM_SUBJECT,
+    from: { emailAddress: { name: 'Formspree', address: 'noreply@formspree.io' } },
+    toRecipients: [],
+    bodyPreview: '',
+    body,
+    bodyContentType: 'text',
+    attachmentNames: [],
+    receivedDateTime: '2026-09-15T14:00:00Z',
+    conversationId: 'conv-' + id,
+    ...overrides,
+  };
+}
+
+// What the model did with such a notice: the count as guests, market and
+// type guessed as other, no phone.
+function formClassification(leadFields = {}, fields = {}) {
+  return {
+    category: 'lead_inquiry',
+    from_email: 'noreply@formspree.io',
+    from_name: 'Formspree',
+    subject: FORM_SUBJECT,
+    summary: 'Website quote request',
+    should_alert: true,
+    extracted_lead: {
+      client_name: 'Avery Testcase',
+      client_email: 'avery.testcase@example.com',
+      client_phone: null,
+      event_type: 'other',
+      event_date: '2027-07-17',
+      headcount: 20,
+      venue: null,
+      market: 'other',
+      notes: 'Wedding, 20 coconuts, budget $1,500 to $3,000.',
+      ...leadFields,
+    },
+    ...fields,
+  };
+}
+
+// Today's row for a classification, built with the insert's own rules, so
+// "untouched" means byte for byte what the worker wrote before this change.
+function todaysRow(row, cls, email) {
+  const lead = cls.extracted_lead;
+  return {
+    id: row.id,
+    client_name: lead.client_name || 'Unknown',
+    client_email: email,
+    client_phone: lead.client_phone || null,
+    event_type: ['wedding', 'corporate', 'trade_show', 'hospitality', 'cruise', 'wellness', 'other']
+      .includes(lead.event_type) ? lead.event_type : 'other',
+    event_start_at: lead.event_date ? lead.event_date + 'T12:00:00Z' : null,
+    event_tz: 'America/New_York',
+    headcount: parseInt(lead.headcount) || null,
+    venue: lead.venue || null,
+    market: ['ny', 'miami', 'vegas', 'other'].includes(lead.market) ? lead.market : 'ny',
+    stage: 'inquiry',
+    source: 'website',
+    notes: 'Email lead via MS Graph: ' + (cls.subject || '') + '\n\n' + (lead.notes || ''),
+    stamp_status: 'not_ordered',
+    logo_received: false,
+    deposit_cents: 0,
+    coi_required: false,
+    coi_submitted: false,
+    is_recurring: false,
+  };
+}
+
+const formLogLines = (logs) => logs.filter((line) => line.startsWith('ms_graph website form'));
+
+function assertCompleted(r) {
+  assert.equal(r.status, 202);
+  assert.deepEqual(r.drained.at(-1), { claimed: 1, completed: 1, released: 0 });
+  assert.equal(r.ai.length, r.drained.length);
+}
+
+await check('end to end: the form lead row gets the form fields and the count never becomes guests', async () => {
+  const cls = formClassification();
+  const r = await runCase({ classification: cls, resourceData: formResource('form-e2e-1', formNotice()) });
+  assertCompleted(r);
+  assert.equal(r.inserts.length, 1);
+  const row = r.inserts[0];
+  assert.deepEqual(Object.keys(row).sort(), ROW_KEYS);
+  assert.equal('coconuts_qty' in row, false);
+  assert.equal(row.headcount, null);
+  assert.equal(row.market, 'ny');
+  assert.equal(row.event_type, 'wedding');
+  assert.equal(row.client_phone, '(555) 010-0142');
+  assert.equal(row.client_email, 'avery.testcase@example.com');
+  assert.equal(row.client_name, 'Avery Testcase');
+  assert.equal(row.event_start_at, '2027-07-17T12:00:00Z');
+  assert.equal(row.notes, 'Email lead via MS Graph: ' + FORM_SUBJECT + '\n\n' +
+    'Coconuts requested (form): 20\nBudget (form): $1,500 to $3,000\n\n' + cls.extracted_lead.notes);
+  assert.equal(row.notes.split('\n')[0], 'Email lead via MS Graph: ' + FORM_SUBJECT);
+  // Everything else is today's row.
+  const today = todaysRow(row, cls, 'avery.testcase@example.com');
+  for (const key of ['id', 'event_tz', 'venue', 'stage', 'source', 'stamp_status', 'logo_received',
+    'deposit_cents', 'coi_required', 'coi_submitted', 'is_recurring']) {
+    assert.deepEqual(row[key], today[key], key);
+  }
+  assert.match(String(r.insertHeaders[0].Prefer || r.insertHeaders[0].prefer), /resolution=ignore-duplicates/);
+});
+
+await check('end to end: the log names fields only, never a value', async () => {
+  const r = await runCase({ classification: formClassification(),
+    resourceData: formResource('form-e2e-log', formNotice()) });
+  const lines = formLogLines(r.logs);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0], 'ms_graph website form: read budget,coconut_count,delivery_market,email,event_date,' +
+    'event_type,name,phone; changed client_phone,event_type,market,headcount');
+  for (const line of r.logs) {
+    assert.doesNotMatch(line, /avery|testcase|555|1,500|wedding|greater ny|2027-07-17/i, line);
+  }
+});
+
+await check('end to end: every live market option sets the row market', async () => {
+  for (const [option, market] of MARKET_OPTIONS) {
+    const modelMarket = market === 'ny' ? 'vegas' : 'ny';
+    const r = await runCase({
+      classification: formClassification({ market: modelMarket }),
+      resourceData: formResource('form-market-' + market + '-' + option.length, formNotice({ delivery_market: option })),
+    });
+    assertCompleted(r);
+    assert.equal(r.inserts[0].market, market, option);
+  }
+});
+
+await check('end to end: every live event type sets the row event_type', async () => {
+  for (const [option, type] of EVENT_OPTIONS) {
+    const modelType = type === 'wedding' ? 'corporate' : 'wedding';
+    const r = await runCase({
+      classification: formClassification({ event_type: modelType }),
+      resourceData: formResource('form-type-' + option.length, formNotice({ event_type: option })),
+    });
+    assertCompleted(r);
+    assert.equal(r.inserts[0].event_type, type, option);
+  }
+});
+
+await check('end to end: a guest number different from the count stays as guests', async () => {
+  const r = await runCase({ classification: formClassification({ headcount: 150 }),
+    resourceData: formResource('form-guests-150', formNotice()) });
+  assertCompleted(r);
+  assert.equal(r.inserts[0].headcount, 150);
+  assert.match(r.inserts[0].notes, /Coconuts requested \(form\): 20/);
+});
+
+await check('end to end: empty model name and email are filled from the form, and the lookup uses that email', async () => {
+  const r = await runCase({ classification: formClassification({ client_name: null, client_email: null }),
+    resourceData: formResource('form-fill-name', formNotice()) });
+  assertCompleted(r);
+  assert.equal(r.inserts[0].client_name, 'Avery Testcase');
+  assert.equal(r.inserts[0].client_email, 'avery.testcase@example.com');
+  assert.equal(r.lookups.length, 1);
+  assert.ok(decodeURIComponent(r.lookups[0]).includes('avery.testcase@example.com'));
+});
+
+await check('end to end: a form with missing fields keeps the model value for each missing one', async () => {
+  const cls = formClassification({ client_phone: '555-0199', market: 'miami' });
+  const r = await runCase({ classification: cls,
+    resourceData: formResource('form-missing', formNotice({ phone: '', coconut_count: '' }, { omit: ['budget', 'delivery_market'] })) });
+  assertCompleted(r);
+  const row = r.inserts[0];
+  assert.equal(row.client_phone, '555-0199');
+  assert.equal(row.market, 'miami');
+  assert.equal(row.headcount, 20, 'no count on the form, nothing to compare');
+  assert.equal(row.event_type, 'wedding');
+  assert.equal(row.notes, 'Email lead via MS Graph: ' + FORM_SUBJECT + '\n\n' + cls.extracted_lead.notes);
+});
+
+await check('end to end: a form of junk values leaves today\'s row exactly', async () => {
+  const cls = formClassification();
+  const junk = formNotice({ name: '123', email: 'x', phone: 'call me', event_date: '07/17/2027',
+    event_type: 'Bar mitzvah', delivery_market: 'Mars', coconut_count: 'lots', budget: 'cheap' });
+  const r = await runCase({ classification: cls, resourceData: formResource('form-junk', junk) });
+  assertCompleted(r);
+  assert.deepEqual(r.inserts[0], todaysRow(r.inserts[0], cls, 'avery.testcase@example.com'));
+  assert.deepEqual(formLogLines(r.logs), []);
+});
+
+await check('end to end: a non-form email is untouched (same row as today)', async () => {
+  const cls = formClassification({
+    client_name: 'Robin Sample', client_email: 'robin.sample@example.net', headcount: 120,
+    market: 'other', event_type: 'other', notes: 'Asked about 120 coconuts.',
+  }, { from_email: 'robin.sample@example.net', from_name: 'Robin Sample', subject: 'Coconuts for our party' });
+  const body = 'Hi there,\n\nCould you do coconuts for our party?\n\ncoconut_count\n\n120\n\nThanks, Robin';
+  const r = await runCase({ classification: cls, resourceData: formResource('plain-email', body, {
+    subject: 'Coconuts for our party',
+    from: { emailAddress: { name: 'Robin Sample', address: 'robin.sample@example.net' } },
+  }) });
+  assertCompleted(r);
+  assert.deepEqual(r.inserts[0], todaysRow(r.inserts[0], cls, 'robin.sample@example.net'));
+  assert.deepEqual(formLogLines(r.logs), []);
+});
+
+await check('end to end: the same form layout from a non-Formspree sender is untouched', async () => {
+  const cls = formClassification({}, { subject: 'Fwd: ' + FORM_SUBJECT, from_email: null });
+  const r = await runCase({ classification: cls, resourceData: formResource('self-forward', formNotice(), {
+    subject: 'Fwd: ' + FORM_SUBJECT,
+    from: { emailAddress: { name: 'Owner', address: 'sidd@hamptonscoconuts.com' } },
+  }) });
+  assertCompleted(r);
+  assert.deepEqual(r.inserts[0], todaysRow(r.inserts[0], cls, 'avery.testcase@example.com'));
+  assert.equal(r.inserts[0].headcount, 20);
+  assert.deepEqual(formLogLines(r.logs), []);
+});
+
+await check('end to end: an HTML form body is untouched (no guessed parser)', async () => {
+  const cls = formClassification();
+  const r = await runCase({ classification: cls, resourceData: formResource('form-html', formNotice(), { bodyContentType: 'html' }) });
+  assertCompleted(r);
+  assert.deepEqual(r.inserts[0], todaysRow(r.inserts[0], cls, 'avery.testcase@example.com'));
+});
+
+const OPEN_LEAD = {
+  id: '30000000-0000-4000-8000-000000000001',
+  stage: 'inquiry',
+  external_invoice_id: null,
+  total_cents: null,
+  deposit_cents: 0,
+  client_email: 'avery.testcase@example.com',
+  client_phone: '555-0100',
+  headcount: 75,
+  market: 'ny',
+  notes: 'Email lead via MS Graph: earlier request',
+  event_start_at: '2027-07-17T12:00:00+00:00',
+  created_at: '2026-09-10T00:00:00Z',
+};
+
+await check('end to end: the suppressed path writes today\'s note only, never a column', async () => {
+  const cls = formClassification();
+  const r = await runCase({ classification: cls, resourceData: formResource('form-suppressed', formNotice()),
+    existingOrders: [OPEN_LEAD] });
+  assertCompleted(r);
+  assert.equal(r.inserts.length, 0);
+  assert.equal(r.patches.length, 1);
+  assert.ok(r.patches[0].url.endsWith('orders?id=eq.' + OPEN_LEAD.id));
+  assert.deepEqual(Object.keys(r.patches[0].body), ['notes']);
+  const receiptId = [...r.receipts.values()][0].id;
+  assert.equal(r.patches[0].body.notes, OPEN_LEAD.notes + '\n\nFollow-up email via MS Graph: ' + FORM_SUBJECT +
+    '\n' + cls.extracted_lead.notes + ' [rcpt ' + receiptId.slice(0, 8) + ']');
+  assert.doesNotMatch(r.patches[0].body.notes, /\(form\)/);
+});
+
+await check('end to end: the duplicate check finds the open lead by the form email when the model got it wrong', async () => {
+  const cls = formClassification({ client_email: 'someone.else@example.org' });
+  const r = await runCase({ classification: cls, resourceData: formResource('form-dedupe-email', formNotice()),
+    existingOrders: [OPEN_LEAD] });
+  assertCompleted(r);
+  assert.equal(r.inserts.length, 0);
+  assert.equal(r.patches.length, 1);
+  assert.deepEqual(Object.keys(r.patches[0].body), ['notes']);
+  assert.ok(decodeURIComponent(r.lookups[0]).includes('avery.testcase@example.com'));
+  assert.ok(r.lookups.every((url) => !decodeURIComponent(url).includes('someone.else@example.org')));
+});
+
+await check('end to end: customer_reply, vendor and noise on a form notice write nothing', async () => {
+  for (const category of ['customer_reply', 'vendor', 'noise']) {
+    for (const extracted of [null, formClassification().extracted_lead]) {
+      const r = await runCase({
+        classification: formClassification({}, { category, extracted_lead: extracted }),
+        resourceData: formResource('form-' + category + '-' + (extracted ? 'x' : 'n'), formNotice()),
+      });
+      assertCompleted(r);
+      assert.equal(r.inserts.length, 0, category);
+      assert.equal(r.patches.length, 0, category);
+      assert.equal(r.lookups.length, 0, category);
+      assert.deepEqual(formLogLines(r.logs), [], category);
+    }
+  }
+});
+
+await check('end to end: lead_inquiry without extracted_lead on a form notice writes nothing', async () => {
+  const r = await runCase({ classification: formClassification({}, { extracted_lead: null }),
+    resourceData: formResource('form-no-lead', formNotice()) });
+  assertCompleted(r);
+  assert.equal(r.inserts.length, 0);
+  assert.equal(r.patches.length, 0);
+});
+
+await check('end to end: a retried delivery never replaces the stored row', async () => {
+  const r = await runCase({ classification: formClassification(),
+    resourceData: formResource('form-retry', formNotice()), loseFirstInsertResponse: true, drains: 2 });
+  assert.deepEqual(r.drained[0], { claimed: 1, completed: 0, released: 1 });
+  assert.deepEqual(r.drained[1], { claimed: 1, completed: 1, released: 0 });
+  assert.equal(r.inserts.length, 2);
+  assert.deepEqual(r.inserts[1], r.inserts[0]);
+  assert.equal(r.stored.size, 1);
+  assert.deepEqual([...r.stored.values()][0], r.inserts[0]);
+  for (const headers of r.insertHeaders) {
+    assert.match(String(headers.Prefer || headers.prefer), /resolution=ignore-duplicates/);
+  }
 });
 
 console.log('');
