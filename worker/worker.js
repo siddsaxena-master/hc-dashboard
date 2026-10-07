@@ -5204,6 +5204,304 @@ export function isOwnColdEmailNotification(notification) {
   return OWN_COLD_EMAIL_DOMAINS.some((domain) => address.endsWith(domain));
 }
 
+// ── Website quote form notices (Formspree), read by code ──
+// The website quote form is emailed by Formspree ("New form submission on
+// Hamptons Coconuts Quote Requests") and the poller forwards that email here
+// as PLAIN TEXT (it asks Graph for text bodies). Layout, one blank line
+// between every line:
+//   You've received a new form submission. --          (preheader)
+//   New form submission on Hamptons Coconuts Quote Requests
+//   Someone just submitted a form on hamptonscoconuts.com/. Here's what ...
+//   name, <value>, email, <value>, ... coconut_count, <value>, budget,
+//   <value>, message, <value>
+// The classifier prompt offers no coconut count or budget, so the model
+// filed the form's coconut_count as guests (headcount) on most form leads
+// and often guessed market and event type. These pure functions read the
+// form with code; processMsGraphNotification uses them on the lead_inquiry
+// path only (see applyWebsiteFormToLead for the row rules).
+// SAME READING RULES IN THREE PLACES, change them together: Jarvis
+// (hc-invoice-bot supabase_sync.py parse_formspree_fields, _FORM_LABELS),
+// this worker's 056 facts reader (factFormBlock, FACT_FORM_LABELS) and the
+// 2026-10-01 form-phones data fix SQL. One of the first 3 non-blank lines
+// starts with "New form submission on" (any letter case); a field's value is
+// the first non-blank line after a line that is exactly its label; a label
+// seen twice gives that field up; a value that is itself a label means the
+// field was left blank; Graph's "text<mailto:text>" link suffix is dropped.
+// No GoDaddy form parser on purpose: none has arrived since intake began, so
+// its labels are unknown (save a real one as a test case first).
+const WEBSITE_FORM_LABELS = ['name', 'email', 'phone', 'event_date', 'event_type',
+  'delivery_market', 'coconut_count', 'budget', 'message'];
+const WEBSITE_FORM_LABEL_SET = new Set(WEBSITE_FORM_LABELS);
+const WEBSITE_FORM_HEADING_MAX_LINE = 3;
+const WEBSITE_FORM_LINK_SUFFIX_RE = /^(.+?)\s*<(?:mailto|tel):[^>]*>$/i;
+// HC App's phone rule (public/sales/data.js; Jarvis valid_form_phone).
+const WEBSITE_FORM_PHONE_CHARS_RE = /^[0-9()+.\s-]+$/;
+const WEBSITE_FORM_EMAIL_RE = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z]{2,24}$/;
+// Every dash character (hyphen, non-breaking hyphen, figure dash, the two
+// long dashes, horizontal bar, minus), written as escapes.
+const WEBSITE_FORM_DASHES = '\\-\\u2010\\u2011\\u2012\\u2013\\u2014\\u2015\\u2212';
+const WEBSITE_FORM_KEY_STRIP_RE = new RegExp('[\\s' + WEBSITE_FORM_DASHES + ']+', 'g');
+// One dollar amount as the site writes it ("$1,500", "$15,000"), or plain
+// digits ("$1500").
+const WEBSITE_FORM_MONEY = '\\$\\s?(?:\\d{1,3}(?:,\\d{3})+|\\d{1,7})';
+const WEBSITE_FORM_BUDGET_RANGE_RE = new RegExp('^(' + WEBSITE_FORM_MONEY + ')\\s*(?:to|[' +
+  WEBSITE_FORM_DASHES + '])\\s*(' + WEBSITE_FORM_MONEY + ')$', 'i');
+const WEBSITE_FORM_BUDGET_PLUS_RE = new RegExp('^(' + WEBSITE_FORM_MONEY + ')\\s*\\+$');
+
+// An option's comparison key: letter case, spaces and dash characters do not
+// matter ("Corporate/brand activation" is "Corporate / brand activation").
+function websiteFormOptionKey(value) {
+  return String(value == null ? '' : value).toLowerCase().replace(WEBSITE_FORM_KEY_STRIP_RE, '');
+}
+
+// The live site's delivery_market options (hc-seo-site
+// site/src/pages/quote.astro, origin/main 25a4bf2, 15 options; the last one
+// shows "Other US city (tell us in the notes)" but sends "Other US city").
+// Florida is the Miami market and Nevada the Vegas market everywhere else
+// (Jarvis supabase_sync.py _STATE_MARKETS), so a booked Orlando job lands in
+// miami anyway. Text not listed here (an older option, a typo) maps to
+// nothing and the model's market stays.
+const WEBSITE_FORM_MARKETS = new Map([
+  ['Greater NY area (NY, NJ, CT)', 'ny'],
+  ['The Hamptons / Long Island', 'ny'],
+  ['Greater Miami / South Florida', 'miami'],
+  ['Orlando / Tampa / Central Florida', 'miami'],
+  ['Boston', 'other'],
+  ['Philadelphia / Washington DC / Baltimore', 'other'],
+  ['Chicago / Midwest', 'other'],
+  ['Atlanta / Southeast', 'other'],
+  ['Dallas / Houston / Austin / Texas', 'other'],
+  ['Las Vegas', 'vegas'],
+  ['Los Angeles / Orange County / San Diego', 'other'],
+  ['San Francisco / Bay Area', 'other'],
+  ['Denver / Phoenix / Salt Lake City', 'other'],
+  ['Seattle / Portland', 'other'],
+  ['Other US city', 'other'],
+  ['Other US city (tell us in the notes)', 'other'],
+].map(([label, market]) => [websiteFormOptionKey(label), market]));
+
+// The live site's event_type options (same file), onto the lead insert's
+// allowlist (wedding, corporate, trade_show, hospitality, cruise, wellness,
+// other). The form has no wellness, trade show or cruise option.
+const WEBSITE_FORM_EVENT_TYPES = new Map([
+  ['Wedding', 'wedding'],
+  ['Corporate / brand activation', 'corporate'],
+  ['Hotel / hospitality', 'hospitality'],
+  ['Festival / large event', 'other'],
+  ['Private party', 'other'],
+  ['Other', 'other'],
+].map(([label, type]) => [websiteFormOptionKey(label), type]));
+
+// ny, miami, vegas or other for a delivery_market option, else null.
+export function websiteFormMarket(text) {
+  const key = websiteFormOptionKey(text);
+  return key && WEBSITE_FORM_MARKETS.has(key) ? WEBSITE_FORM_MARKETS.get(key) : null;
+}
+
+// The insert's event_type word for an event_type option, else null.
+export function websiteFormEventType(text) {
+  const key = websiteFormOptionKey(text);
+  return key && WEBSITE_FORM_EVENT_TYPES.has(key) ? WEBSITE_FORM_EVENT_TYPES.get(key) : null;
+}
+
+// A person's name: 1 to 100 characters with a letter, no address or link.
+function websiteFormName(value) {
+  const v = value.replace(/\s+/g, ' ').trim();
+  if (!v || v.length > 100 || !/\p{L}/u.test(v) || /[@<>]|:\/\//.test(v)) return null;
+  return v;
+}
+
+// One plain address in lower case, never one of ours: the owner's domain,
+// a Google Voice relay, a form or no-reply relay (leadLookupEmail and
+// _scrubOperatorEmail), or Emma's cold-email domains.
+function websiteFormEmail(value) {
+  const v = value.trim().toLowerCase();
+  if (v.length > 254 || v.split('@').length !== 2 || !WEBSITE_FORM_EMAIL_RE.test(v)) return null;
+  const local = v.split('@')[0];
+  if (local.startsWith('.') || local.endsWith('.') || local.includes('..')) return null;
+  if (!leadLookupEmail(v) || !_scrubOperatorEmail(v)) return null;
+  if (OWN_COLD_EMAIL_DOMAINS.some((domain) => v.endsWith(domain))) return null;
+  return v;
+}
+
+// HC App's phone rule: digits, spaces and ( ) + . - only, at most 40
+// characters, 7 to 15 digits. Kept as the customer wrote it.
+function websiteFormPhone(value) {
+  const v = value.trim();
+  const digits = v.replace(/\D/g, '').length;
+  return v && v.length <= 40 && WEBSITE_FORM_PHONE_CHARS_RE.test(v) && digits >= 7 && digits <= 15 ? v : null;
+}
+
+// A real calendar date written YYYY-MM-DD (the form's date input).
+function websiteFormDate(value) {
+  const m = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (y < 2000 || y > 2099) return null;
+  const t = new Date(Date.UTC(y, mo - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d ? m[0] : null;
+}
+
+// The form's coconut_count: digits only, 1 to 20000, else absent.
+function websiteFormCount(value) {
+  const v = value.trim();
+  if (!/^\d{1,5}$/.test(v)) return null;
+  const n = Number(v);
+  return n >= 1 && n <= 20000 ? n : null;
+}
+
+// A budget choice in the site's shape: "$1,500 to $3,000" (any dash is
+// written as "to"), "$15,000+" or "Not sure yet". Free text is dropped, so
+// nothing but a choice ever reaches the notes line.
+function websiteFormBudget(value) {
+  const v = value.replace(/\s+/g, ' ').trim();
+  if (/^not sure(?: yet)?$/i.test(v)) return 'Not sure yet';
+  const money = (s) => s.replace(/\s+/g, '');
+  let m = v.match(WEBSITE_FORM_BUDGET_RANGE_RE);
+  if (m) return money(m[1]) + ' to ' + money(m[2]);
+  m = v.match(WEBSITE_FORM_BUDGET_PLUS_RE);
+  if (m) return money(m[1]) + '+';
+  return null;
+}
+
+// A select option as written (spaces collapsed), only when it is one of the
+// site's known options.
+function websiteFormOption(value, mapper) {
+  const v = value.replace(/\s+/g, ' ').trim();
+  return mapper(v) ? v : null;
+}
+
+// Pure and strict. Returns only the known fields that passed their checks:
+// { name, email, phone, event_date, event_type, delivery_market,
+// coconut_count, budget }. coconut_count is a number; event_type and
+// delivery_market are the option text (map them with websiteFormEventType
+// and websiteFormMarket). The message is not returned. {} when the text is
+// not a form notice. Exported for worker/test-website-form.mjs.
+export function parseWebsiteForm(text) {
+  const lines = String(text == null ? '' : text)
+    .replace(/[\u00ad\u200b\u200c\u200d\u2060\ufeff]/g, '')
+    .replace(/[\u00a0\u2007\u2009\u202f]/g, ' ')
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const head = lines.slice(0, WEBSITE_FORM_HEADING_MAX_LINE)
+    .findIndex((line) => line.toLowerCase().startsWith('new form submission on'));
+  if (head < 0) return {};
+  const raw = {};
+  for (const label of WEBSITE_FORM_LABELS) {
+    // Label lines after the heading that have a value line after them.
+    const hits = [];
+    for (let i = head + 1; i < lines.length - 1; i++) {
+      if (lines[i].toLowerCase() === label) hits.push(i);
+    }
+    if (hits.length !== 1) continue;
+    let value = lines[hits[0] + 1];
+    if (WEBSITE_FORM_LABEL_SET.has(value.toLowerCase())) continue;
+    const link = value.match(WEBSITE_FORM_LINK_SUFFIX_RE);
+    if (link) value = link[1].trim();
+    raw[label] = value;
+  }
+  const checks = {
+    name: websiteFormName,
+    email: websiteFormEmail,
+    phone: websiteFormPhone,
+    event_date: websiteFormDate,
+    event_type: (v) => websiteFormOption(v, websiteFormEventType),
+    delivery_market: (v) => websiteFormOption(v, websiteFormMarket),
+    coconut_count: websiteFormCount,
+    budget: websiteFormBudget,
+  };
+  const out = {};
+  for (const [key, check] of Object.entries(checks)) {
+    if (typeof raw[key] !== 'string') continue;
+    const value = check(raw[key]);
+    if (value !== null && value !== undefined && value !== '') out[key] = value;
+  }
+  return out;
+}
+
+// The parsed form of a forwarded Formspree notice, or null. The sender comes
+// from the notification (code, never the model's echo) and must be
+// Formspree itself; the body must be plain text (forward_to_claudia puts it
+// in resourceData.body and its type in resourceData.bodyContentType; a
+// Graph-shaped {contentType, content} body is read too). An HTML body, any
+// other sender, or a notice with no field that passed is null, and the lead
+// follows the model's path unchanged. Exported for tests.
+export function websiteFormFromNotification(notification) {
+  const n = notification && typeof notification === 'object' ? notification : null;
+  const rd = n && n.resourceData && typeof n.resourceData === 'object' ? n.resourceData : null;
+  if (!rd) return null;
+  let from = String(graphNotificationFrom(n) || '').trim().toLowerCase();
+  const angled = from.match(/<([^<>]+)>/);
+  if (angled) from = angled[1].trim();
+  if (!/^[^@\s]+@formspree\.(?:io|com)$/.test(from)) return null;
+  let body = rd.body;
+  let type = rd.bodyContentType;
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    if (body.contentType != null) type = body.contentType;
+    body = body.content;
+  }
+  if (typeof body !== 'string') return null;
+  if (type != null && String(type).trim().toLowerCase() !== 'text') return null;
+  const form = parseWebsiteForm(body);
+  return Object.keys(form).length ? form : null;
+}
+
+// The classifier's extracted_lead with the website form's fields applied
+// (Sidd's decisions, 2026-10-06). Returns { lead, changed }: lead is a NEW
+// object (the model's object is never changed) and changed names the
+// fields that moved, for the log (names only, never values).
+// - client_name: the form's name when the model's is empty or a different
+//   name ("Unknown" included); the same name in another letter case keeps
+//   the model's.
+// - client_email, client_phone, event_date: the form's value when it passed
+//   the checks above. The email also drives the duplicate-lead lookup.
+// - event_type and market: the form's option when it maps; an unknown
+//   option keeps the model's value.
+// - headcount: null when it equals the form's coconut_count. The form has no
+//   guests field, so that number is coconuts, never guests. A different
+//   number the model read from the message stays.
+// - Nothing else. orders.coconuts_qty is NEVER set from a form: the count is
+//   the customer's request, shown on the deal by the 056 facts path and in a
+//   notes line (websiteFormNoteLines), until Sidd's own Save or the invoice.
+export function applyWebsiteFormToLead(lead, form) {
+  const base = lead && typeof lead === 'object' && !Array.isArray(lead) ? lead : {};
+  const out = { ...base };
+  const changed = [];
+  if (!form || typeof form !== 'object') return { lead: out, changed };
+  const set = (key, value) => {
+    if (out[key] !== value) { out[key] = value; changed.push(key); }
+  };
+  if (form.name) {
+    const modelName = String(base.client_name == null ? '' : base.client_name).replace(/\s+/g, ' ').trim();
+    if (modelName.toLowerCase() !== form.name.toLowerCase()) set('client_name', form.name);
+  }
+  if (form.email && String(base.client_email == null ? '' : base.client_email).trim().toLowerCase() !== form.email) {
+    set('client_email', form.email);
+  }
+  if (form.phone) set('client_phone', form.phone);
+  if (form.event_date) set('event_date', form.event_date);
+  const type = websiteFormEventType(form.event_type);
+  if (type) set('event_type', type);
+  const market = websiteFormMarket(form.delivery_market);
+  if (market) set('market', market);
+  if (Number.isInteger(form.coconut_count) && parseInt(base.headcount) === form.coconut_count) {
+    set('headcount', null);
+  }
+  return { lead: out, changed };
+}
+
+// The fixed notes lines for a form lead row ('' when there are none). Only a
+// checked number and a checked budget choice can appear here.
+export function websiteFormNoteLines(form) {
+  const lines = [];
+  if (form && Number.isInteger(form.coconut_count)) lines.push('Coconuts requested (form): ' + form.coconut_count);
+  if (form && typeof form.budget === 'string' && form.budget) lines.push('Budget (form): ' + form.budget);
+  return lines.join('\n');
+}
+
 async function handleMsGraphWebhook(request, env, url) {
   // Microsoft Graph subscriptions send a validationToken on creation; echo it back.
   if (url.searchParams.has('validationToken')) {
