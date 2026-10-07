@@ -547,9 +547,9 @@ leads and often guessed market and event type.
   missing body, junk values) logs one line instead, `ms_graph website
   form: formspree notice, no field read (body text|html|other|missing)`
   (`websiteFormRead`), so a silent fall back to the model's guesses can be
-  told apart from ordinary mail. wrangler.toml has no [observability] block, so these lines
-  exist only during a live `npx wrangler tail`; the one-week check in the
-  live proof below is the backstop.
+  told apart from ordinary mail. wrangler.toml has no [observability]
+  block, so these lines exist only during a live `npx wrangler tail`; the
+  one-week check in the live proof below is the backstop.
 - The classifier prompt is unchanged on purpose (it affects every email).
 - Tests: `node worker/test-website-form.mjs` (55 checks, fake network: the
   real layout, every market and event type option, junk values, blank and
