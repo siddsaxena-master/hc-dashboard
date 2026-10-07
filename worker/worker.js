@@ -5492,8 +5492,12 @@ export function websiteFormFromNotification(notification) {
 //   guests field, so that number is coconuts, never guests. A different
 //   number the model read from the message stays.
 // - Nothing else. orders.coconuts_qty is NEVER set from a form: the count is
-//   the customer's request, shown on the deal by the 056 facts path and in a
-//   notes line (websiteFormNoteLines), until Sidd's own Save or the invoice.
+//   the customer's request. Today it shows only in a notes line
+//   (websiteFormNoteLines); the deal's Coconuts tile still says Missing
+//   count. It reaches that tile through the 056 facts path only after
+//   DEAL_FACTS is on (Practice first) and the form email is linked to its
+//   deal (design decisions D3 and D4). The order count stays Sidd's own
+//   Save or the invoice's.
 export function applyWebsiteFormToLead(lead, form) {
   const base = lead && typeof lead === 'object' && !Array.isArray(lead) ? lead : {};
   const out = { ...base };

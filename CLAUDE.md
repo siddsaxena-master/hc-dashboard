@@ -532,9 +532,15 @@ leads and often guessed market and event type.
   3 said "Website form: 20 coconuts requested" and "Budget (website form):
   ..."); a recorded change, not a slip. Nothing reads these lines (no match
   in this worker, hc-app 3fb8598 public or Jarvis, checked 2026-10-07), so
-  change the words only together with any future reader. orders.coconuts_qty is NEVER set from a form
-  (the 056 facts path shows the request on the deal). The suppressed path
-  still appends today's note only, customer_reply / vendor / noise are
+  change the words only together with any future reader.
+  orders.coconuts_qty is NEVER set from a form. In THIS release the request
+  shows only in that notes line: the deal's Coconuts tile in HC App still
+  says Missing count. The number reaches the tile through the 056 facts
+  path only after DEAL_FACTS is on (Practice first) and the form email is
+  linked to its deal (design decisions D3 and D4, not done; 0
+  crm_intake_links exist). It ships with DEAL_FACTS unset and 056's switch
+  Off, so tell Sidd to read the count from the notes until then. The
+  suppressed path still appends today's note only, customer_reply / vendor / noise are
   untouched, and any failure keeps the model's fields. One log line per
   form lead names the fields read and changed, never a value. A Formspree
   notice that gives NO field (a changed layout, an HTML or missing body,
