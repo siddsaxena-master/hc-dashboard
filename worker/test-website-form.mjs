@@ -120,6 +120,11 @@ await check('a blank field (label straight to the next label) and a missing labe
   assert.equal('delivery_market' in parsed, false);
   assert.equal(parsed.coconut_count, 20);
   assert.equal(parsed.event_date, '2027-07-17');
+  // A blank name is followed by the "email" label, a word that would pass
+  // the name check: the blank-field rule is what keeps it out.
+  const noName = parseWebsiteForm(formNotice({ name: '' }));
+  assert.equal('name' in noName, false);
+  assert.equal(noName.email, EXPECTED.email);
 });
 
 await check('a label repeated inside the message gives that field up', () => {
