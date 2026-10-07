@@ -540,14 +540,14 @@ leads and often guessed market and event type.
   linked to its deal (design decisions D3 and D4, not done; 0
   crm_intake_links exist). It ships with DEAL_FACTS unset and 056's switch
   Off, so tell Sidd to read the count from the notes until then. The
-  suppressed path still appends today's note only, customer_reply / vendor / noise are
-  untouched, and any failure keeps the model's fields. One log line per
-  form lead names the fields read and changed, never a value. A Formspree
-  notice that gives NO field (a changed layout, an HTML or missing body,
-  junk values) logs one line instead, `ms_graph website form: formspree
-  notice, no field read (body text|html|other|missing)` (`websiteFormRead`),
-  so a silent fall back to the model's guesses can be told apart from
-  ordinary mail. wrangler.toml has no [observability] block, so these lines
+  suppressed path still appends today's note only, customer_reply / vendor /
+  noise are untouched, and any failure keeps the model's fields. One log
+  line per form lead names the fields read and changed, never a value. A
+  Formspree notice that gives NO field (a changed layout, an HTML or
+  missing body, junk values) logs one line instead, `ms_graph website
+  form: formspree notice, no field read (body text|html|other|missing)`
+  (`websiteFormRead`), so a silent fall back to the model's guesses can be
+  told apart from ordinary mail. wrangler.toml has no [observability] block, so these lines
   exist only during a live `npx wrangler tail`; the one-week check in the
   live proof below is the backstop.
 - The classifier prompt is unchanged on purpose (it affects every email).
@@ -559,11 +559,51 @@ leads and often guessed market and event type.
   32 planted bugs caught. Jarvis parity on 14 notices: same email and phone.
 - The same branch aligns the stale GPS wording check in
   test-webhook-security.mjs with f7aab0b's "no fresh location report" words.
-- Ship with the PR 5 Claudia release (its own "yes do it", OPERATOR BOARD
-  first, live version written down as the undo target, quiet minute outside
-  11:45 to 12:15 UTC and not at :00). Live proof: the next form lead shows
-  headcount empty, the form's type and market, the two notes lines, and
-  `npx wrangler tail` shows one `ms_graph website form: read ...` line.
+- Ship with the PR 5 Claudia release (its own "yes do it", claim the
+  OPERATOR BOARD hc-dashboard line first):
+  1. WHICH COMMIT: deploy the reviewed head of THIS branch,
+     fix/website-form-fields (8a01946 plus the 2026-10-07 review fixes on
+     top). It already contains PR 5 f7aab0b and the live 7a6ff67. PR 5's own
+     ship order above ("deploy THIS branch") means
+     fix/crm-reviewed-release-oct03 at f7aab0b, which does NOT contain the
+     form reader. Deploying f7aab0b
+     ships PR 5 without it. To deploy from PR 5's branch instead, add this
+     branch's commits to PR 5 and review them there first.
+  2. FIRST CHECK: from `worker/`, `npx --no-install wrangler deployments
+     list` must show 030440ec-7402-48be-96e2-5fa5187035ae (code 7a6ff67) as
+     live. WRITE DOWN the live id either way; it is the undo target. If it
+     is not 030440ec, something else shipped: merge that live branch into
+     this one and rerun all 28 worker test files on an LF export (`git -c
+     core.autocrlf=false archive <commit> | tar -x -C <dir>`, with a copy of
+     ../hc-field-app/App.js beside <dir> for the payroll test) before
+     deploying, or this deploy silently removes that code.
+  3. `cd worker && npx --no-install wrangler deploy` with DEAL_FACTS unset,
+     at a quiet minute outside 11:45 to 12:15 UTC and not at :00. Check the
+     new version is 100% and one */5 tick is Ok in `npx wrangler tail`.
+  4. MOVE THE LINEAGE FORWARD right after the deploy, so the next routine
+     Claudia deploy cannot silently remove the form reader: fast-forward
+     the live lineage branch fix/claudia-chat-order-writes-switch (7a6ff67
+     today) to the deployed commit (check it out, then `git merge --ff-only
+     <that commit>`; never a rebase, never a force push) and push THAT
+     branch (never main). Record the new live version id and that branch
+     head on the OPERATOR BOARD line and in the dashboard-lineage memory.
+  5. UPSTREAM TRAP: this branch was cut from
+     origin/fix/crm-reviewed-release-oct03, so git tracks PR 5's remote
+     branch as its upstream. Run `git branch --unset-upstream` on
+     fix/website-form-fields before ANY push, then push with its own name
+     (`git push -u origin fix/website-form-fields`), so nothing can land
+     these commits on PR 5's branch by accident.
+  Undo: `npx --no-install wrangler rollback <the id written down in step 2>`
+  (030440ec-7402-48be-96e2-5fa5187035ae if nothing else shipped first;
+  rolling back past another deploy also removes that deploy). NEVER roll
+  back below 657f45c0 while MS_GRAPH_CLIENT_STATE is set (see "Lead webhook
+  fixed": the ms-graph alerts come back and retry for ever). After an undo,
+  note on the OPERATOR BOARD that the lineage branch is ahead of the live
+  worker, so the next deploy from it does not bring the reader back
+  unnoticed.
+  Live proof: the next form lead shows headcount empty, the form's type and
+  market, the two notes lines, and `npx wrangler tail` shows one
+  `ms_graph website form: read ...` line.
   One week after the deploy, a counts-only read-only check (counts, never
   names, emails or notes text): website lead rows (source website) created
   since the deploy, with versus without a `(form):` notes line, beside the
