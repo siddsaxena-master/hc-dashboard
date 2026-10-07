@@ -486,6 +486,56 @@ count".
   show a counts or none line. Undo: `wrangler secret delete DEAL_FACTS`, or
   `npx --no-install wrangler rollback <the version written down>`.
 
+## Website form fields on ms-graph leads (built 2026-10-07, LOCAL ONLY)
+
+Branch `fix/website-form-fields`, stacked on PR 5 `fix/crm-reviewed-release-oct03`
+f7aab0b (NEVER main). Design: workspace handoff-2026-10-05/FORM-FIELDS-DESIGN.md.
+Nothing deployed. The why: a website quote form said 20 coconuts and the lead
+showed none. The classifier prompt has no count or budget field, so the model
+filed the form's coconut_count as guests (headcount) on 13 of 16 recent form
+leads and often guessed market and event type.
+
+- `parseWebsiteForm(text)` is pure and strict, the same reading rules as Jarvis
+  parse_formspree_fields, factFormBlock (056) and the 2026-10-01 form-phones
+  data fix (change all of them together). Only known labels, each checked:
+  email (one plain address, never ours, a relay or Emma's domains), phone (HC
+  App rule), event_date (real YYYY-MM-DD), coconut_count (digits, 1 to
+  20000), budget (the site's choice shape only, any dash written "to"),
+  event_type and delivery_market (the live site's options only, hc-seo-site
+  quote.astro 25a4bf2; unknown text maps to nothing). The message is never
+  returned. Orlando / Tampa maps to miami, as Jarvis _STATE_MARKETS does for
+  Florida; the other non-NY cities map to other.
+- `websiteFormFromNotification` reads only a notice FROM @formspree.io or
+  @formspree.com (the notification's From, never the model) with a plain-text
+  body. HTML, other senders (a self-forward included) and GoDaddy notices keep
+  the model's path unchanged. No GoDaddy parser until a real one is saved as
+  a test case.
+- In processMsGraphNotification, lead_inquiry with extracted_lead ONLY, the
+  form's fields replace the model's BEFORE the dedupe guard
+  (`applyWebsiteFormToLead`): email, phone, date, type and market when they
+  passed; the name when the model's is empty or a different name; headcount
+  null when it equals the form's count (a different guest number stays). The
+  new row gets "Coconuts requested (form): N" and "Budget (form): <choice>"
+  right after the subject line (HC App reads the subject from line 1; Sales
+  hides the dollar amounts). orders.coconuts_qty is NEVER set from a form
+  (the 056 facts path shows the request on the deal). The suppressed path
+  still appends today's note only, customer_reply / vendor / noise are
+  untouched, and any failure keeps the model's fields. One log line per
+  form lead names the fields read and changed, never a value.
+- The classifier prompt is unchanged on purpose (it affects every email).
+- Tests: `node worker/test-website-form.mjs` (51 checks, fake network: the
+  real layout, every market and event type option, junk values, blank and
+  repeated labels, the sender and HTML gates, the suppressed, customer_reply
+  and retry paths, today's row byte for byte for non-form mail). 32 of 32
+  planted bugs caught. Jarvis parity on 14 notices: same email and phone.
+- The same branch aligns the stale GPS wording check in
+  test-webhook-security.mjs with f7aab0b's "no fresh location report" words.
+- Ship with the PR 5 Claudia release (its own "yes do it", OPERATOR BOARD
+  first, live version written down as the undo target, quiet minute outside
+  11:45 to 12:15 UTC and not at :00). Live proof: the next form lead shows
+  headcount empty, the form's type and market, the two notes lines, and
+  `npx wrangler tail` shows one `ms_graph website form: read ...` line.
+
 ## Current uncommitted state (as of 2026-07-07)
 
 index.html has the one-line pending-payment fix described above staged
