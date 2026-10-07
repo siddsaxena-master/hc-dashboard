@@ -1771,9 +1771,11 @@ await check('all provider webhook bodies are capped before parsing or downstream
 
 await check('stale GPS alerts describe report freshness without claiming movement', async () => {
   const source = readFileSync(new URL('./worker.js', import.meta.url), 'utf8');
-  assert.match(source, /GPS has not reported for/);
+  // Wording from the location freshness review (f7aab0b): a report's age,
+  // never a claim about movement.
+  assert.match(source, /no fresh location report for ['"]? \+ mins/);
   assert.match(source, /GPS stale ['"]? \+ mins/);
-  assert.match(source, /No fresh GPS report while en route/);
+  assert.match(source, /No fresh location report \(['"]? \+ mkt/);
   assert.doesNotMatch(source, /has not moved for/);
   assert.doesNotMatch(source, /Not moving while enroute/);
 });
