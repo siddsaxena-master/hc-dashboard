@@ -219,6 +219,33 @@ await check('hidden characters: zero-width removed, no-break spaces read as spac
   assert.deepEqual(parseWebsiteForm(nbsp), EXPECTED);
 });
 
+// Review fix (2026-10-07): the "<mailto:...>" suffix strip slowed down with
+// the square of a value's length on long runs of spaces or tabs (0.6 s for
+// spaces and 0.85 s for tabs at the poller's 28,000-byte cap, 7 s at the
+// worker's 64 KB limit, on every retry). The message is free customer text.
+await check('a long run of spaces or tabs in any value stays fast', () => {
+  const run = (ws) => 'a' + ws.repeat(28000) + 'b';
+  const cases = [
+    [{ message: run(' ') }, (p) => assert.deepEqual(p, EXPECTED)],
+    [{ message: run('\t') }, (p) => assert.deepEqual(p, EXPECTED)],
+    [{ email: run(' ') }, (p) => assert.equal('email' in p, false)],
+    [{ phone: run('\t') }, (p) => assert.equal('phone' in p, false)],
+    [{ budget: run(' ') + '<mailto:x@example.com>' }, (p) => assert.equal('budget' in p, false)],
+  ];
+  parseWebsiteForm(formNotice());   // warm up
+  for (const [fields, expect] of cases) {
+    const t0 = performance.now();
+    const parsed = parseWebsiteForm(formNotice(fields));
+    const ms = performance.now() - t0;
+    assert.ok(ms < 100, 'took ' + ms.toFixed(0) + ' ms for ' + Object.keys(fields)[0]);
+    expect(parsed);
+  }
+  // A real address with its suffix is still read (the bound is far above
+  // the longest value any field accepts).
+  const long = 'a'.repeat(64) + '@' + 'b'.repeat(60) + '.example.com';
+  assert.equal(parsedField('email', long + '<mailto:' + long + '>'), long);
+});
+
 // ── 2. Market and event type from the live site's options ──
 const MARKET_OPTIONS = [
   ['Greater NY area (NY, NJ, CT)', 'ny'],

@@ -5234,6 +5234,11 @@ const WEBSITE_FORM_LABELS = ['name', 'email', 'phone', 'event_date', 'event_type
 const WEBSITE_FORM_LABEL_SET = new Set(WEBSITE_FORM_LABELS);
 const WEBSITE_FORM_HEADING_MAX_LINE = 3;
 const WEBSITE_FORM_LINK_SUFFIX_RE = /^(.+?)\s*<(?:mailto|tel):[^>]*>$/i;
+// The suffix strip slows down with the square of a value's length on long
+// runs of spaces or tabs, so it runs only on values this short. Every field
+// that is returned fails its own length check far below this (the longest
+// is an email plus its mailto suffix, about 517 characters).
+const WEBSITE_FORM_LINK_STRIP_MAX = 600;
 // HC App's phone rule (public/sales/data.js; Jarvis valid_form_phone).
 const WEBSITE_FORM_PHONE_CHARS_RE = /^[0-9()+.\s-]+$/;
 const WEBSITE_FORM_EMAIL_RE = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z]{2,24}$/;
@@ -5391,6 +5396,9 @@ export function parseWebsiteForm(text) {
   if (head < 0) return {};
   const raw = {};
   for (const label of WEBSITE_FORM_LABELS) {
+    // The message is free customer text and is never returned, so it is not
+    // read at all (it stays in the label list for the blank-field rule).
+    if (label === 'message') continue;
     // Label lines after the heading that have a value line after them.
     const hits = [];
     for (let i = head + 1; i < lines.length - 1; i++) {
@@ -5399,7 +5407,7 @@ export function parseWebsiteForm(text) {
     if (hits.length !== 1) continue;
     let value = lines[hits[0] + 1];
     if (WEBSITE_FORM_LABEL_SET.has(value.toLowerCase())) continue;
-    const link = value.match(WEBSITE_FORM_LINK_SUFFIX_RE);
+    const link = value.length <= WEBSITE_FORM_LINK_STRIP_MAX ? value.match(WEBSITE_FORM_LINK_SUFFIX_RE) : null;
     if (link) value = link[1].trim();
     raw[label] = value;
   }
