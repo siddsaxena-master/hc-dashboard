@@ -521,13 +521,21 @@ leads and often guessed market and event type.
   (the 056 facts path shows the request on the deal). The suppressed path
   still appends today's note only, customer_reply / vendor / noise are
   untouched, and any failure keeps the model's fields. One log line per
-  form lead names the fields read and changed, never a value.
+  form lead names the fields read and changed, never a value. A Formspree
+  notice that gives NO field (a changed layout, an HTML or missing body,
+  junk values) logs one line instead, `ms_graph website form: formspree
+  notice, no field read (body text|html|other|missing)` (`websiteFormRead`),
+  so a silent fall back to the model's guesses can be told apart from
+  ordinary mail. wrangler.toml has no [observability] block, so these lines
+  exist only during a live `npx wrangler tail`; the one-week check in the
+  live proof below is the backstop.
 - The classifier prompt is unchanged on purpose (it affects every email).
-- Tests: `node worker/test-website-form.mjs` (51 checks, fake network: the
+- Tests: `node worker/test-website-form.mjs` (55 checks, fake network: the
   real layout, every market and event type option, junk values, blank and
   repeated labels, the sender and HTML gates, the suppressed, customer_reply
-  and retry paths, today's row byte for byte for non-form mail). 32 of 32
-  planted bugs caught. Jarvis parity on 14 notices: same email and phone.
+  and retry paths, today's row byte for byte for non-form mail, the
+  no-field line for junk, a changed layout, HTML and a missing body). 32 of
+  32 planted bugs caught. Jarvis parity on 14 notices: same email and phone.
 - The same branch aligns the stale GPS wording check in
   test-webhook-security.mjs with f7aab0b's "no fresh location report" words.
 - Ship with the PR 5 Claudia release (its own "yes do it", OPERATOR BOARD
@@ -535,6 +543,13 @@ leads and often guessed market and event type.
   11:45 to 12:15 UTC and not at :00). Live proof: the next form lead shows
   headcount empty, the form's type and market, the two notes lines, and
   `npx wrangler tail` shows one `ms_graph website form: read ...` line.
+  One week after the deploy, a counts-only read-only check (counts, never
+  names, emails or notes text): website lead rows (source website) created
+  since the deploy, with versus without a `(form):` notes line, beside the
+  number of Formspree notices that reached intake in the same week. Form
+  leads with no `(form):` line at all means the reader stopped reading
+  (Formspree changed its layout or the poller's body type); treat it as a
+  bug to fix, not as quiet traffic.
 
 ## Current uncommitted state (as of 2026-07-07)
 

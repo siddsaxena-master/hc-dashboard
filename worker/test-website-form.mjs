@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import worker, {
   parseWebsiteForm, websiteFormMarket, websiteFormEventType,
-  websiteFormFromNotification, applyWebsiteFormToLead, websiteFormNoteLines,
+  websiteFormFromNotification, websiteFormRead, applyWebsiteFormToLead, websiteFormNoteLines,
   runWebhookIntakeScan,
 } from './worker.js';
 
@@ -367,6 +367,31 @@ await check('a notice with no field that passed, or no body, is null', () => {
   assert.equal(websiteFormFromNotification(formspreeNotification({ content: 7 })), null);
   assert.equal(websiteFormFromNotification({}), null);
   assert.equal(websiteFormFromNotification(null), null);
+});
+
+// Review fix (2026-10-07): a Formspree notice that gives no field must be
+// told apart from other mail, so a changed layout is not a silent fallback.
+await check('websiteFormRead: the body type is named for a Formspree notice, null for any other sender', () => {
+  assert.deepEqual(websiteFormRead(formspreeNotification(formNotice())), { form: EXPECTED, body: 'text' });
+  const junk = formNotice({ name: '123', email: 'x', phone: 'x', event_date: 'x', event_type: 'x',
+    delivery_market: 'x', coconut_count: 'x', budget: 'x' });
+  assert.deepEqual(websiteFormRead(formspreeNotification(junk)), { form: null, body: 'text' });
+  // Formspree's layout changed to "Label: value" on one line.
+  const oneLine = 'New form submission on Hamptons Coconuts Quote Requests\n\nName: Avery Testcase\n\n' +
+    'coconut_count: 20\n\nemail: avery.testcase@example.com\n';
+  assert.deepEqual(websiteFormRead(formspreeNotification(oneLine)), { form: null, body: 'text' });
+  assert.deepEqual(websiteFormRead(formspreeNotification(formNotice(), { bodyContentType: 'html' })), { form: null, body: 'html' });
+  assert.deepEqual(websiteFormRead(formspreeNotification({ contentType: 'HTML', content: formNotice() })), { form: null, body: 'html' });
+  assert.deepEqual(websiteFormRead(formspreeNotification(formNotice(), { bodyContentType: 'rtf' })), { form: null, body: 'other' });
+  for (const missing of [undefined, null, '', '  \r\n ', { content: 7 }, ['x']]) {
+    assert.deepEqual(websiteFormRead(formspreeNotification(missing)), { form: null, body: 'missing' }, JSON.stringify(missing));
+  }
+  for (const address of ['sidd@hamptonscoconuts.com', 'noreply@formspree.io.example.com', '']) {
+    assert.deepEqual(websiteFormRead(formspreeNotification(formNotice(), { from: { emailAddress: { address } } })),
+      { form: null, body: null }, address);
+  }
+  assert.deepEqual(websiteFormRead(null), { form: null, body: null });
+  assert.deepEqual(websiteFormRead({}), { form: null, body: null });
 });
 
 // ── 4. Applying the form to the model's extracted_lead ──
@@ -760,14 +785,37 @@ await check('end to end: a form with missing fields keeps the model value for ea
   assert.equal(row.notes, 'Email lead via MS Graph: ' + FORM_SUBJECT + '\n\n' + cls.extracted_lead.notes);
 });
 
-await check('end to end: a form of junk values leaves today\'s row exactly', async () => {
+// A Formspree notice that gave no field logs this one line (no values), so a
+// silent fall back to the model's guesses shows in `wrangler tail`.
+const noFieldLine = (body) => 'ms_graph website form: formspree notice, no field read (body ' + body + ')';
+
+await check('end to end: a form of junk values leaves today\'s row exactly and logs one no-field line', async () => {
   const cls = formClassification();
   const junk = formNotice({ name: '123', email: 'x', phone: 'call me', event_date: '07/17/2027',
     event_type: 'Bar mitzvah', delivery_market: 'Mars', coconut_count: 'lots', budget: 'cheap' });
   const r = await runCase({ classification: cls, resourceData: formResource('form-junk', junk) });
   assertCompleted(r);
   assert.deepEqual(r.inserts[0], todaysRow(r.inserts[0], cls, 'avery.testcase@example.com'));
-  assert.deepEqual(formLogLines(r.logs), []);
+  assert.deepEqual(formLogLines(r.logs), [noFieldLine('text')]);
+  for (const line of r.logs) assert.doesNotMatch(line, /avery|testcase|mitzvah|mars|lots|cheap|call me/i, line);
+});
+
+await check('end to end: a changed Formspree layout keeps today\'s row and logs one no-field line', async () => {
+  const cls = formClassification();
+  const oneLine = 'New form submission on Hamptons Coconuts Quote Requests\r\n\r\nName: Avery Testcase\r\n\r\n' +
+    'Email: avery.testcase@example.com\r\n\r\ncoconut_count: 20\r\n\r\nbudget: $1,500 to $3,000\r\n';
+  const r = await runCase({ classification: cls, resourceData: formResource('form-one-line', oneLine) });
+  assertCompleted(r);
+  assert.deepEqual(r.inserts[0], todaysRow(r.inserts[0], cls, 'avery.testcase@example.com'));
+  assert.deepEqual(formLogLines(r.logs), [noFieldLine('text')]);
+});
+
+await check('end to end: a Formspree notice with no body keeps today\'s row and logs one no-field line', async () => {
+  const cls = formClassification();
+  const r = await runCase({ classification: cls, resourceData: formResource('form-no-body', undefined) });
+  assertCompleted(r);
+  assert.deepEqual(r.inserts[0], todaysRow(r.inserts[0], cls, 'avery.testcase@example.com'));
+  assert.deepEqual(formLogLines(r.logs), [noFieldLine('missing')]);
 });
 
 await check('end to end: a non-form email is untouched (same row as today)', async () => {
@@ -797,11 +845,12 @@ await check('end to end: the same form layout from a non-Formspree sender is unt
   assert.deepEqual(formLogLines(r.logs), []);
 });
 
-await check('end to end: an HTML form body is untouched (no guessed parser)', async () => {
+await check('end to end: an HTML form body is untouched (no guessed parser) and logs one no-field line', async () => {
   const cls = formClassification();
   const r = await runCase({ classification: cls, resourceData: formResource('form-html', formNotice(), { bodyContentType: 'html' }) });
   assertCompleted(r);
   assert.deepEqual(r.inserts[0], todaysRow(r.inserts[0], cls, 'avery.testcase@example.com'));
+  assert.deepEqual(formLogLines(r.logs), [noFieldLine('html')]);
 });
 
 const OPEN_LEAD = {

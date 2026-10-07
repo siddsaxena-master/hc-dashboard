@@ -5430,31 +5430,44 @@ export function parseWebsiteForm(text) {
   return out;
 }
 
-// The parsed form of a forwarded Formspree notice, or null. The sender comes
-// from the notification (code, never the model's echo) and must be
-// Formspree itself; the body must be plain text (forward_to_claudia puts it
-// in resourceData.body and its type in resourceData.bodyContentType; a
-// Graph-shaped {contentType, content} body is read too). An HTML body, any
-// other sender, or a notice with no field that passed is null, and the lead
-// follows the model's path unchanged. Exported for tests.
-export function websiteFormFromNotification(notification) {
+// What the form reader made of a forwarded notification: { form, body }.
+// The sender comes from the notification (code, never the model's echo) and
+// must be Formspree itself, or the answer is { form: null, body: null } (not
+// a form notice at all). For a Formspree notice, body names what the reader
+// saw: 'text' (plain text, the only kind it parses), 'html', 'other' (any
+// other content type) or 'missing' (no body, or a blank one).
+// forward_to_claudia puts the body in resourceData.body and its type in
+// resourceData.bodyContentType; a Graph-shaped {contentType, content} body is
+// read too. form is the parsed fields, or null when no field passed. Codes
+// only, never a value, so processMsGraphNotification can log a Formspree
+// notice that gave no field. Exported for tests.
+export function websiteFormRead(notification) {
+  const none = { form: null, body: null };
   const n = notification && typeof notification === 'object' ? notification : null;
   const rd = n && n.resourceData && typeof n.resourceData === 'object' ? n.resourceData : null;
-  if (!rd) return null;
+  if (!rd) return none;
   let from = String(graphNotificationFrom(n) || '').trim().toLowerCase();
   const angled = from.match(/<([^<>]+)>/);
   if (angled) from = angled[1].trim();
-  if (!/^[^@\s]+@formspree\.(?:io|com)$/.test(from)) return null;
+  if (!/^[^@\s]+@formspree\.(?:io|com)$/.test(from)) return none;
   let body = rd.body;
   let type = rd.bodyContentType;
   if (body && typeof body === 'object' && !Array.isArray(body)) {
     if (body.contentType != null) type = body.contentType;
     body = body.content;
   }
-  if (typeof body !== 'string') return null;
-  if (type != null && String(type).trim().toLowerCase() !== 'text') return null;
+  if (typeof body !== 'string' || !body.trim()) return { form: null, body: 'missing' };
+  const kind = type == null ? 'text' : String(type).trim().toLowerCase();
+  if (kind !== 'text') return { form: null, body: kind === 'html' ? 'html' : 'other' };
   const form = parseWebsiteForm(body);
-  return Object.keys(form).length ? form : null;
+  return { form: Object.keys(form).length ? form : null, body: 'text' };
+}
+
+// The parsed form of a forwarded Formspree notice, or null: an HTML body,
+// any other sender, or a notice with no field that passed is null, and the
+// lead follows the model's path unchanged. Exported for tests.
+export function websiteFormFromNotification(notification) {
+  return websiteFormRead(notification).form;
 }
 
 // The classifier's extracted_lead with the website form's fields applied
@@ -5603,13 +5616,20 @@ async function processMsGraphNotification(env, eventKey, notification) {
       if (cls.category === 'lead_inquiry' && cls.extracted_lead &&
           typeof cls.extracted_lead === 'object' && !Array.isArray(cls.extracted_lead)) {
         try {
-          websiteForm = websiteFormFromNotification(notification);
+          const formRead = websiteFormRead(notification);
+          websiteForm = formRead.form;
           if (websiteForm) {
             const applied = applyWebsiteFormToLead(cls.extracted_lead, websiteForm);
             leadFields = applied.lead;
             // Field names only, never a value.
             console.log('ms_graph website form: read ' + Object.keys(websiteForm).sort().join(',') +
               '; changed ' + (applied.changed.join(',') || 'none'));
+          } else if (formRead.body) {
+            // A Formspree notice that gave no field (a changed layout, an
+            // HTML or missing body, junk values): the lead keeps the model's
+            // guesses. One line with the body code only, so a silent fall
+            // back can be told apart from ordinary mail.
+            console.log('ms_graph website form: formspree notice, no field read (body ' + formRead.body + ')');
           }
         } catch (e) {
           websiteForm = null;
