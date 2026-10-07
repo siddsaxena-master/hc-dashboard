@@ -5288,10 +5288,17 @@ const WEBSITE_FORM_MARKETS = new Map([
 // The live site's event_type options (same file), onto the lead insert's
 // allowlist (wedding, corporate, trade_show, hospitality, cruise, wellness,
 // other). The form has no wellness, trade show or cruise option.
+// 'Hotel / hospitality' maps to other UNTIL SIDD DECIDES (review 2026-10-07).
+// HC App reads event_type hospitality as a venue account: Sales shows type
+// venue (hc-app public/sales/core.js TYPE_MAP) and isVenueStampOrder
+// (public/index.html) puts a booked one on the reusable house-stamp path.
+// The classifier never offered hospitality, so no website lead carried it
+// before this reader. If Sidd says a hotel form is a venue account, change
+// this one line to 'hospitality' and its test in test-website-form.mjs.
 const WEBSITE_FORM_EVENT_TYPES = new Map([
   ['Wedding', 'wedding'],
   ['Corporate / brand activation', 'corporate'],
-  ['Hotel / hospitality', 'hospitality'],
+  ['Hotel / hospitality', 'other'],
   ['Festival / large event', 'other'],
   ['Private party', 'other'],
   ['Other', 'other'],

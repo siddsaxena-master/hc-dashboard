@@ -505,6 +505,17 @@ leads and often guessed market and event type.
   quote.astro 25a4bf2; unknown text maps to nothing). The message is never
   returned. Orlando / Tampa maps to miami, as Jarvis _STATE_MARKETS does for
   Florida; the other non-NY cities map to other.
+- OPEN DECISION FOR SIDD (review 2026-10-07): the form's "Hotel /
+  hospitality" option is filed as event_type `other`, NOT `hospitality`
+  (the design, section 3, said hospitality). In HC App, hospitality means a
+  venue account: Sales shows the deal as type venue (hc-app main 3fb8598
+  public/sales/core.js TYPE_MAP) and, once it books, isVenueStampOrder
+  (public/index.html) groups it as a reusable venue house-stamp order
+  instead of a one-off event. The old dashboard shows it as Other. The
+  classifier never offered hospitality, so no website lead carried it
+  before this reader. If Sidd says a hotel form is a venue account, change
+  the one line in WEBSITE_FORM_EVENT_TYPES and its test, and expect those
+  HC App effects.
 - `websiteFormFromNotification` reads only a notice FROM @formspree.io or
   @formspree.com (the notification's From, never the model) with a plain-text
   body. HTML, other senders (a self-forward included) and GoDaddy notices keep
@@ -517,7 +528,11 @@ leads and often guessed market and event type.
   null when it equals the form's count (a different guest number stays). The
   new row gets "Coconuts requested (form): N" and "Budget (form): <choice>"
   right after the subject line (HC App reads the subject from line 1; Sales
-  hides the dollar amounts). orders.coconuts_qty is NEVER set from a form
+  hides the dollar amounts). This wording differs from the design (section
+  3 said "Website form: 20 coconuts requested" and "Budget (website form):
+  ..."); a recorded change, not a slip. Nothing reads these lines (no match
+  in this worker, hc-app 3fb8598 public or Jarvis, checked 2026-10-07), so
+  change the words only together with any future reader. orders.coconuts_qty is NEVER set from a form
   (the 056 facts path shows the request on the deal). The suppressed path
   still appends today's note only, customer_reply / vendor / noise are
   untouched, and any failure keeps the model's fields. One log line per

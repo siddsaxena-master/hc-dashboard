@@ -288,10 +288,13 @@ await check('market: unknown text maps to nothing and is not returned by the par
   assert.equal(parsedField('delivery_market', 'Hamptons (NY)'), undefined);
 });
 
+// 'Hotel / hospitality' is other until Sidd decides (review 2026-10-07): HC
+// App reads event_type hospitality as a venue account (Sales type venue and
+// the reusable house-stamp path), and no website lead carried it before.
 const EVENT_OPTIONS = [
   ['Wedding', 'wedding'],
   ['Corporate / brand activation', 'corporate'],
-  ['Hotel / hospitality', 'hospitality'],
+  ['Hotel / hospitality', 'other'],
   ['Festival / large event', 'other'],
   ['Private party', 'other'],
   ['Other', 'other'],
@@ -306,6 +309,8 @@ await check('every live event_type option maps onto the insert allowlist', () =>
   }
   assert.equal(websiteFormEventType('WEDDING'), 'wedding');
   assert.equal(websiteFormEventType('corporate/brand-activation'), 'corporate');
+  assert.equal(websiteFormEventType('hotel/hospitality'), 'other');
+  for (const [option] of EVENT_OPTIONS) assert.notEqual(websiteFormEventType(option), 'hospitality', option);
 });
 
 await check('event_type: unknown text maps to nothing', () => {
