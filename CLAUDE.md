@@ -643,17 +643,26 @@ every other la time was read and printed in New York time.
   touches every email and the form map has a Jarvis twin), Claudia's chat
   prompt VALID MARKETS (already lacks vegas), the Live Activity
   marketLabel (shift markets only, App.js parity), town hint lists.
-- Known gap outside the worker: migration 042 hc_decide_proposed_time
-  picks the Accept day with a vegas-only Pacific rule, so an la time
-  between 9 PM and midnight Pacific lands on the next New York date (038
-  then refuses it as a moved date). Needs a new migration. HC Field
+- Gap this branch OPENS (review 2026-10-26): migration 042
+  hc_decide_proposed_time picks the Accept day with a vegas-only Pacific
+  rule (every other market, la included, on the New York clock). On
+  d7af6c5 the worker also parsed an la proposal on the New York clock, so
+  the two agreed and Accept worked. Now la is parsed Pacific, so a
+  proposed time from 9 PM to midnight Pacific lands on the next New York
+  date and 038 refuses it as a moved date. It fails safe: 042 reports
+  'refused' (decided_via date_moved), writes no date and no window, and
+  Sidd sets the time by hand. Any time before 9 PM Pacific accepts
+  normally. Needs a new migration giving la the Pacific rule; pinned in
+  test-proposal-scan.mjs section 27 (flip its 9:30 PM day then). HC Field
   (lib/leave-by.js) and HC App need la in their own releases.
 - Ship order: this branch ships together with or before Jarvis PR 194.
   Deploy only after a fresh `npx --no-install wrangler deployments list`
   shows ceb54e96 (code d7af6c5) live; write that id down as the undo.
 - Tests: test-departure-plan.mjs section 16, test-departure-scan.mjs 9b
-  and 12b, test-reconfirmation.mjs 3b, and one la refusal case in
-  test-team-invite.mjs (a pin, it passes on the old code too).
+  and 12b, test-reconfirmation.mjs 3b, test-proposal-scan.mjs 27 (the 042
+  gap above; fails on the old code, which stored 2 PM as New York time),
+  and one la refusal case in test-team-invite.mjs (a pin, it passes on
+  the old code too).
 
 ## Current uncommitted state (as of 2026-07-07)
 

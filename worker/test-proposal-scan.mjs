@@ -9,6 +9,7 @@
 // only inside the PDF, the order on file saying 3:30/4 PM.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { runProposalScan, runStillWaitingScan, runDeparturePlanScan, proposalTexts, linkedNoTimeReason, addressProposalsOn, addressPlaceWords, extractArrivalTimes, reconfirmAnswerFirstText } from './worker.js';
 
 let passed = 0;
@@ -1231,6 +1232,43 @@ const addressPosts = (h) => h.queuePosts().filter((q) => q.payload.body.kind ===
     assert.ok(h.queuePosts().every((q) => q.payload.body.kind !== 'time_change'), 'no second Time change? banner');
   } finally { h.restore(); }
   pass('the reply\'s own words first: a 2pm at the top beats a 1:15 typed in the bullet; a second reply on the thread (Outlook From: block, Gmail wrote: line) never re-proposes the first reply\'s 1:15 PM: "2pm instead" proposes 2:00 PM and retires the 1:15 row as newer_email, "Perfect, thank you!" proposes nothing and leaves it pending');
+}
+
+// ── 27. An la job's proposal is Pacific, and 042's Accept day ───────
+// A pin of a gap this branch OPENS (fix/la-market-clock, review
+// 2026-10-26). la now parses on the Pacific clock, but migration 042
+// hc_decide_proposed_time picks the Accept day with a vegas-only Pacific
+// rule: every other market, la included, is read in America/New_York. So a
+// 9 PM to midnight Pacific time on an la job lands on the next New York
+// date, and 038 refuses that as a moved date: 042 reports 'refused' and
+// writes no date (rehearsal/run-042-order-time-proposals-pglite.mjs, "a
+// proposal on another day is refused by 038 and reported, never
+// applied"). Before this branch la parsed on the New York clock, which
+// agreed with 042, so Accept worked. Flip the 9:30 PM day to the job day
+// when a new migration teaches 042 la.
+{
+  const m042 = readFileSync(new URL('../migrations/042_order_time_proposals.sql', import.meta.url), 'utf8');
+  assert.match(m042, /= 'vegas'\s+then 'America\/Los_Angeles' else 'America\/New_York' end;/, '042 still reads every market but vegas on the New York clock');
+  const acceptDay = (iso) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
+  const LA_ID = '77777777-7777-4777-8777-777777777777';
+  const laOrder = { ...ORDER, id: LA_ID, client_name: 'Fake Vista', market: 'la', venue: 'Fake Studio', delivery_notes: '1 Fake Lane, Los Angeles, CA 90036' };
+  // [what the email says, label, stored UTC (Pacific), 042's Accept day]
+  for (const [said, label, utc, day] of [
+    ['2pm', '2:00 PM', '2026-09-12T21:00:00.000Z', '2026-09-12'],
+    ['8:45pm', '8:45 PM', '2026-09-13T03:45:00.000Z', '2026-09-12'],
+    ['9:30pm', '9:30 PM', '2026-09-13T04:30:00.000Z', '2026-09-13'],
+  ]) {
+    const h = harness({ intakes: [intakeRow({ id: 81001, order_id: LA_ID, orders: laOrder, raw_text: 'Hamptons Coconuts delivery arrival ' + said + ' Saturday' })] });
+    try {
+      const counts = await at('2026-09-10T17:20:00Z', () => runProposalScan(ENV));
+      assert.equal(counts.proposed, 1, said);
+      const p = h.proposals.get(81001);
+      assert.equal(p.proposed_label, label);
+      assert.equal(p.proposed_arrive_at, utc, said + ' is read on the Pacific clock');
+      assert.equal(acceptDay(p.proposed_arrive_at), day, said + ': the day 042 hands to 038');
+    } finally { h.restore(); }
+  }
+  pass('an la proposal is stored on the Pacific clock; 042 (vegas-only Pacific rule) keeps 2 PM and 8:45 PM on Sat Sep 12 but moves 9:30 PM to Sep 13, which 038 refuses: the gap starts with this branch');
 }
 
 console.log(`\nPASS: ${passed} proposal checks. No network, no database, no phone.`);
