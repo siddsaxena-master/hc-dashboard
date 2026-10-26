@@ -612,6 +612,58 @@ leads and often guessed market and event type.
   (Formspree changed its layout or the poller's body type); treat it as a
   bug to fix, not as quiet traffic.
 
+## LA market clock (branch fix/la-market-clock, built 2026-10-26, LOCAL ONLY)
+
+Cut from the live commit d7af6c5 (Claudia ceb54e96). Nothing deployed. The
+why: jarvis-invoice-bot PR 194 files a California ship-to (State box CA)
+as orders.market `la`. Before this branch the worker had no la clock: the
+6 PM day-before push walks `Object.keys(MARKET_TZ)` and never asked for
+la, so an la job got no day-before message at all (owner included), and
+every other la time was read and printed in New York time.
+
+- `MARKET_TZ.la = 'America/Los_Angeles'`, `marketTag('la')` is 'LA' (the
+  old fallback already gave 'LA'; now it is written down), and
+  `marketTimeStr` adds ' PT' for vegas and la (`PACIFIC_MARKETS`).
+- `NO_CREW_MARKETS` (la only): the "no start point" words for la say there
+  is no LA crew and to plan the drive by hand, instead of "clock in there
+  once" (impossible today). Vegas and every other market keep their words.
+- TEAM_MARKETS stays ny, vegas, miami on purpose: there is no LA crew, and
+  migration 043 hc_update_field_worker and the HC Field Team screen accept
+  only those three. LA crew needs a new migration plus Claudia and HC
+  Field releases together. Until then every la banner reaches owners only.
+- Covered with no code change (they read `marketKey`/`marketZone`/
+  `marketHour`): the five-minute departure plan scan (la has no garage
+  and no la shift, so its state is no_origin with one owner-only Cannot
+  plan banner a day), recipients, the lock-screen card, reconfirmation
+  draft hours and send times, proposals and the still-waiting quiet
+  hours, and the 8 AM digest (groups by the stored market, prints LA).
+- Left alone, on purpose: lead-row market lists (ms-graph and Formspree
+  allowlists, both classifier prompts, the website form's "Los Angeles /
+  Orange County / San Diego" option mapped to other; the classifier prompt
+  touches every email and the form map has a Jarvis twin), Claudia's chat
+  prompt VALID MARKETS (already lacks vegas), the Live Activity
+  marketLabel (shift markets only, App.js parity), town hint lists.
+- Gap this branch OPENS (review 2026-10-26): migration 042
+  hc_decide_proposed_time picks the Accept day with a vegas-only Pacific
+  rule (every other market, la included, on the New York clock). On
+  d7af6c5 the worker also parsed an la proposal on the New York clock, so
+  the two agreed and Accept worked. Now la is parsed Pacific, so a
+  proposed time from 9 PM to midnight Pacific lands on the next New York
+  date and 038 refuses it as a moved date. It fails safe: 042 reports
+  'refused' (decided_via date_moved), writes no date and no window, and
+  Sidd sets the time by hand. Any time before 9 PM Pacific accepts
+  normally. Needs a new migration giving la the Pacific rule; pinned in
+  test-proposal-scan.mjs section 27 (flip its 9:30 PM day then). HC Field
+  (lib/leave-by.js) and HC App need la in their own releases.
+- Ship order: this branch ships together with or before Jarvis PR 194.
+  Deploy only after a fresh `npx --no-install wrangler deployments list`
+  shows ceb54e96 (code d7af6c5) live; write that id down as the undo.
+- Tests: test-departure-plan.mjs section 16, test-departure-scan.mjs 9b
+  and 12b, test-reconfirmation.mjs 3b, test-proposal-scan.mjs 27 (the 042
+  gap above; fails on the old code, which stored 2 PM as New York time),
+  and one la refusal case in test-team-invite.mjs (a pin, it passes on
+  the old code too).
+
 ## Current uncommitted state (as of 2026-07-07)
 
 index.html has the one-line pending-payment fix described above staged

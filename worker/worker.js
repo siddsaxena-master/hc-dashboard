@@ -6962,12 +6962,24 @@ export async function deliveryConfirmationQueueId(orderId, checkedAt) {
 // ════════════════════════════════════════════════════════════════════
 
 // Which clock each market runs on. Unknown or blank markets are New York.
+// la (added 2026-10-25) is the market Jarvis files a California ship-to
+// as (jarvis-invoice-bot PR 194). Every per-market loop that walks this
+// table, the 6 PM day-before push among them, covers it from here. No
+// crew can have market la yet (TEAM_MARKETS and migration 043 allow only
+// ny, vegas and miami), so its banners reach the owner only.
 export const MARKET_TZ = {
   ny: 'America/New_York',
   miami: 'America/New_York',
   other: 'America/New_York',
   vegas: 'America/Los_Angeles',
+  la: 'America/Los_Angeles',
 };
+// The markets whose clock times print with ' PT' (Pacific).
+const PACIFIC_MARKETS = new Set(['vegas', 'la']);
+// Markets with a clock but no crew yet: nobody can clock in there, so the
+// "no start point" words say that instead of asking for a clock-in. Take
+// la out of here the day LA crew can exist (with TEAM_MARKETS and 043).
+const NO_CREW_MARKETS = new Set(['la']);
 export function marketKey(market) {
   const key = String(market || '').trim().toLowerCase();
   return key || 'ny';
@@ -6975,10 +6987,10 @@ export function marketKey(market) {
 export function marketZone(market) {
   return MARKET_TZ[marketKey(market)] || ET_ZONE;
 }
-// Short market word for titles: NY, Miami, Vegas.
+// Short market word for titles: NY, Miami, Vegas, LA.
 export function marketTag(market) {
   const key = marketKey(market);
-  return key === 'ny' ? 'NY' : key === 'vegas' ? 'Vegas' : key === 'miami' ? 'Miami' : key.toUpperCase();
+  return key === 'ny' ? 'NY' : key === 'vegas' ? 'Vegas' : key === 'miami' ? 'Miami' : key === 'la' ? 'LA' : key.toUpperCase();
 }
 
 // Wall clock of an instant in a zone, as if it were UTC (for arithmetic).
@@ -7018,10 +7030,10 @@ export function marketHour(iso, market) {
   return new Intl.DateTimeFormat('en-US', { timeZone: marketZone(market), hour: '2-digit', hourCycle: 'h23' })
     .format(new Date(iso)).slice(0, 2);
 }
-// 'h:mm AM' in the market's zone (' PT' appended for Vegas, nothing for ET).
+// 'h:mm AM' in the market's zone (' PT' appended for Vegas and LA, nothing for ET).
 export function marketTimeStr(iso, market) {
   const text = new Date(iso).toLocaleTimeString('en-US', { timeZone: marketZone(market), hour: 'numeric', minute: '2-digit' });
-  return marketKey(market) === 'vegas' ? text + ' PT' : text;
+  return PACIFIC_MARKETS.has(marketKey(market)) ? text + ' PT' : text;
 }
 // The same without a suffix and lowercase for the lock-screen card: '10:55a'.
 function cardTimeStr(ms, market) {
@@ -8171,7 +8183,7 @@ export function departureAlertTexts(plan, order, ctx) {
       else if (p.state === 'no_time') body = w ? `Window reads ${w} and I cannot read a clock time from it. Fix it in Needs you.` : 'No delivery time on file. Set one in Needs you.';
       else if (p.state === 'no_address') body = `Address "${p.dest_address || collapseSpaces(order && order.venue) || 'blank'}" is incomplete (no town or state); fix it on the invoice.`;
       else if (p.state === 'no_route') body = `${providerName(p.route_source)} routing failed (${p.route_error || 'unknown error'}). Leave-by unknown until it works.`;
-      else if (p.state === 'no_origin') body = `No start point in ${mkt} yet; clock in there once.`;
+      else if (p.state === 'no_origin') body = NO_CREW_MARKETS.has(marketKey(market)) ? `No start point in ${mkt}: there is no ${mkt} crew yet, so nobody can clock in there. Plan this drive by hand.` : `No start point in ${mkt} yet; clock in there once.`;
       else body = 'Cannot plan this departure yet.';
       break;
     }
@@ -8229,7 +8241,8 @@ export function dayBeforeLines(market, orders, plans, pendingProposals, unreadLi
     } else if (p.state === 'no_route') {
       manage.push(`• NO DRIVE TIME: ${client} · ${dest} · ${providerName(p.route_source)} routing failed (${p.route_error || 'unknown error'}). Leave-by unknown.`);
     } else if (p.state === 'no_origin') {
-      manage.push(`• NO START POINT: ${client} · ${dest} · nobody has clocked in in ${mkt} yet; clock in there once.`);
+      manage.push(NO_CREW_MARKETS.has(marketKey(market)) ? `• NO START POINT: ${client} · ${dest} · there is no ${mkt} crew yet, so no leave-by; plan this drive by hand.`
+        : `• NO START POINT: ${client} · ${dest} · nobody has clocked in in ${mkt} yet; clock in there once.`);
     } else {
       manage.push(`• ${client} · ${dest} · departure not planned yet.`);
     }
@@ -10301,6 +10314,10 @@ const ASC_API = 'https://api.appstoreconnect.apple.com/v1';
 // overrides it without a deploy.
 const ASC_CREW_GROUP_DEFAULT = '4976ebfe-29f5-47b9-92e7-a314bbb271a1';
 const TEAM_ROLES = new Set(['owner', 'manager', 'team']);
+// la is NOT a team market on purpose (2026-10-25): there is no LA crew
+// yet, and migration 043 hc_update_field_worker plus the HC Field Team
+// screen accept only these three. Adding LA crew needs a new migration
+// and Claudia and HC Field releases together, never this line alone.
 const TEAM_MARKETS = new Set(['ny', 'vegas', 'miami']);
 // Plain email shape: something@something.tld, no spaces, one @.
 const TEAM_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;

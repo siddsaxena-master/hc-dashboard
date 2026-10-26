@@ -213,6 +213,9 @@ const replies = [];
     [{ ...NEW_HIRE, role: 'boss' }, 'role must be owner, manager or team'],
     [{ ...NEW_HIRE, role: undefined }, 'role must be owner, manager or team'],
     [{ ...NEW_HIRE, market: 'boston' }, 'market must be ny, vegas or miami'],
+    // la has a clock (MARKET_TZ) but no crew yet: 043 and the Team screen
+    // accept only ny, vegas and miami, so the invite refuses it too.
+    [{ ...NEW_HIRE, market: 'la' }, 'market must be ny, vegas or miami'],
     [{ ...NEW_HIRE, hourly_rate_cents: 99999 }, 'hourly_rate_cents must be a whole number of cents between 0 and 25000'],
     [{ ...NEW_HIRE, hourly_rate_cents: 12.5 }, 'hourly_rate_cents must be a whole number of cents between 0 and 25000'],
     [{ ...NEW_HIRE, hourly_rate_cents: -1 }, 'hourly_rate_cents must be a whole number of cents between 0 and 25000'],
