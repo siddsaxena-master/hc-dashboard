@@ -389,6 +389,18 @@ const OLD_BODY = [
   assert.equal(reconfirmSendAfter({ deliveryDay: '2026-09-19', daysOut: 0, nowMs: T('2026-09-19T15:00:00Z'), market: 'ny' }), null);
   pass('clock: draft hours 08:00 to 21:00 market time; 10:00 on minus 4 in NY and Vegas across the DST switch; late arrivals +3h with the 17:00 cap on minus 2; nothing automatic on minus 1 or the day');
 }
+// ── 3b. The clock for la (2026-10-25): Pacific like Vegas ───────────
+// Jarvis PR 194 files a California ship-to as market la. Before la was in
+// MARKET_TZ its drafts ran on New York hours (an email drafted at 5 AM in
+// Los Angeles, a minus 4 send at 7 AM Pacific).
+{
+  assert.equal(reconfirmInDraftHours(T('2026-09-14T12:00:00Z'), 'la'), false); // 05:00 PT (08:00 ET)
+  assert.equal(reconfirmInDraftHours(T('2026-09-14T15:00:00Z'), 'la'), true);  // 08:00 PT
+  assert.equal(reconfirmInDraftHours(T('2026-09-15T02:00:00Z'), 'la'), true);  // 19:00 PT (22:00 ET)
+  assert.equal(reconfirmSendAfter({ deliveryDay: '2026-09-19', daysOut: 5, nowMs: T(MON_0805), market: 'la' }), '2026-09-15T17:00:00.000Z'); // 10:00 PT
+  assert.equal(reconfirmEligibility(order({ market: 'la' }), T('2026-09-15T05:30:00Z')).today, '2026-09-14'); // 22:30 PT Monday
+  pass('clock la: draft hours and the minus 4 send at 10:00 are Pacific, and "today" is the Los Angeles date');
+}
 
 // ── 4. Recipients and their holds ───────────────────────────────────
 {

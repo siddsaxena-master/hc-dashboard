@@ -21,6 +21,7 @@ import {
   routeSanity, extractArrivalTimes, windowsConflict, pushBodyByteCap,
   departureAlertTexts, onShiftLine, dayBeforeLines, stripDateShapes,
   DEPARTURE_BUFFER_SECONDS, FERRY_QUEUE_SECONDS, ROUTE_CALLS_PER_TICK_MAX,
+  MARKET_TZ, marketZone, marketTag,
 } from './worker.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -469,5 +470,40 @@ assert.ok(enc.encode(many.teamBody).length <= 1500);
 assert.ok(many.manageBody.includes('15 stops in NY tomorrow') || many.manageBody.includes('… plus'));
 for (const text of [db.manageBody, db.teamBody]) { assert.ok(!text.includes('@')); assert.ok(!text.includes('$')); }
 pass('dayBeforeLines: the manage body byte for byte, the crew body, the alt-time crew line, the 1,500-byte cap');
+
+// ── 16. la, the Los Angeles market (2026-10-25) ─────────────────────
+// Jarvis PR 194 files a California ship-to as market la. Before this the
+// worker had no la clock: an la job's times were read and printed in New
+// York time with no suffix. Made-up client and address.
+assert.equal(MARKET_TZ.la, 'America/Los_Angeles');
+assert.equal(marketZone('la'), 'America/Los_Angeles');
+assert.equal(marketZone(' LA '), 'America/Los_Angeles');
+assert.equal(marketHour('2026-09-12T01:00:00Z', 'la'), '18');
+assert.equal(marketHour('2026-12-12T02:00:00Z', 'la'), '18'); // winter, PST
+assert.equal(marketTimeStr('2026-09-12T19:30:00Z', 'la'), '12:30 PM PT');
+assert.equal(marketTag('la'), 'LA');
+assert.equal(parseArrivalTime('2 PM', '2026-09-12', marketZone('la')).arriveAtUtc, '2026-09-12T21:00:00.000Z');
+// The Pacific suffix stays off the Eastern markets.
+assert.equal(marketTimeStr('2026-09-12T19:30:00Z', 'miami'), '3:30 PM');
+assert.equal(marketTimeStr('2026-09-12T19:30:00Z', 'other'), '3:30 PM');
+const laPlan = { ...PLAN, market: 'la', window_text: '2 PM', origin_label: 'last clock-in spot in LA', arrive_at: '2026-09-12T21:00:00.000Z', leave_by_at: '2026-09-12T19:30:00.000Z', has_ferry: false, drive_seconds: 1800, dest_address: '100 Example Ave, Los Angeles, CA 90001' };
+const laOrder = { id: 'la1', client_name: 'Robin Example', venue: 'Example Hall', coconuts_qty: 40 };
+t = departureAlertTexts(laPlan, laOrder, { market: 'la', stage: 'leave_now', nowMs: T('2026-09-12T19:30:00Z'), onShift: [], unreachable: [] });
+assert.equal(t.body, 'Leave-by 12:30 PM PT is now. Arrive 2:00 PM PT at 100 Example Ave, Los Angeles, CA 90001. 30m. On shift (LA): nobody clocked in.');
+const laDay = dayBeforeLines('la', [laOrder], new Map([['la1', laPlan]]), [], [], [], { day: '2026-09-12' });
+assert.equal(laDay.title, 'Tomorrow Sat Sep 12 (LA): 1 job');
+assert.equal(laDay.manageBody, '• Robin Example · 100 Example Ave, Los Angeles, CA 90001 · arrive 2:00 PM PT (window "2 PM") · leave last clock-in spot in LA by 12:30 PM PT (30m predicted traffic, +1h buffer) · 40 coconuts: brand and box them TODAY (Fri)');
+// No LA crew can exist yet, so "clock in there once" would be impossible
+// advice; la says so instead. ny keeps today's words byte for byte.
+const laNoOrigin = { ...laPlan, state: 'no_origin', leave_by_at: null, origin_label: null };
+assert.equal(departureAlertTexts(laNoOrigin, laOrder, { market: 'la', stage: 'cannot_plan', onShift: [], unreachable: [] }).body,
+  'No start point in LA: there is no LA crew yet, so nobody can clock in there. Plan this drive by hand.');
+assert.equal(dayBeforeLines('la', [laOrder], new Map([['la1', laNoOrigin]]), [], [], [], { day: '2026-09-12' }).manageBody,
+  '• NO START POINT: Robin Example · 100 Example Ave, Los Angeles, CA 90001 · there is no LA crew yet, so no leave-by; plan this drive by hand.');
+assert.equal(departureAlertTexts({ ...PLAN, market: 'vegas', state: 'no_origin' }, ORDER, { market: 'vegas', stage: 'cannot_plan', onShift: [], unreachable: [] }).body,
+  'No start point in Vegas yet; clock in there once.');
+assert.equal(dayBeforeLines('vegas', [ORDER], new Map([[ORDER.id, { ...PLAN, market: 'vegas', state: 'no_origin' }]]), [], [], [], { day: '2026-09-12' }).manageBody,
+  '• NO START POINT: Abigail Canelle · Pridwin Hotel, Shelter Island, NY · nobody has clocked in in Vegas yet; clock in there once.');
+pass('la: Pacific clock (summer and winter), " PT" suffix, title word LA, a 2 PM window read as 2 PM Pacific, day-before and alert texts, honest no-crew start-point words (Vegas words unchanged)');
 
 console.log(`\nPASS: ${passed} departure plan checks. No network, no database.`);

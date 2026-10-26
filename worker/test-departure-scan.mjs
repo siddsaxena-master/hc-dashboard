@@ -312,6 +312,24 @@ const crewShift = { id: 's-crew', worker_name: 'Hashim Nadir', worker_email: 'cr
   assert.ok(q.payload.aps.alert.body.includes('PT'));
   pass('Vegas: starts where Lian clocked in, times print in Pacific, only Lian and the owner are addressed');
 }
+// ── 9b. la (2026-10-25): Pacific clock, owner only, no crew to start from
+// Jarvis PR 194 files a California ship-to as market la. No roster row can
+// hold market la yet, so there is no start point and no manager: the one
+// "Cannot plan" banner goes to the owner alone. Made-up client and address.
+const laOrder = (extra = {}) => pridwinOrder({ id: 'la1', client_name: 'Robin Example', venue: 'Example Hall', delivery_notes: '100 Example Ave, Los Angeles, CA 90001', market: 'la', invoice_fulfillment: null, delivery_request: { date: '2026-09-12', window: '2 PM', status: 'confirmed', source: 'owner', checked_at: 'x' }, coconuts_qty: 40, ...extra });
+{
+  const { h } = await scanAt('2026-09-12T19:30:00Z', APPLE_ENV, { orders: [laOrder()] });
+  const up = h.upserts()[0];
+  assert.equal(up.market, 'la');
+  assert.equal(up.arrive_at, '2026-09-12T21:00:00.000Z', '2 PM on an la job is 2 PM Pacific');
+  assert.equal(up.state, 'no_origin');
+  const q = h.queuePosts();
+  assert.equal(q.length, 1);
+  assert.deepEqual(q[0].payload.tokens, ['owner-token']);
+  assert.equal(q[0].payload.aps.alert.title, 'Cannot plan departure: Example (Sat Sep 12)');
+  assert.equal(q[0].payload.aps.alert.body, 'No start point in LA: there is no LA crew yet, so nobody can clock in there. Plan this drive by hand.');
+  pass('la: a 2 PM window is read as 2 PM Pacific, no start point, one owner-only Cannot plan banner with words that do not ask for an impossible clock-in');
+}
 // ── 10. sendPushToMarket recipients and the payload shape ───────────
 {
   const h = harness({ shifts: [] });
@@ -367,6 +385,33 @@ const crewShift = { id: 's-crew', worker_name: 'Hashim Nadir', worker_email: 'cr
     assert.equal(counts.sent, 0); assert.equal(quiet.queuePosts().length, 0);
   } finally { quiet.restore(); }
   pass('day-before: at 6 PM Eastern one manage body and one crew body; at 4 PM nothing');
+}
+// ── 12b. The day-before message for la at 6 PM Pacific (2026-10-25) ──
+// Before la was in MARKET_TZ the hourly loop never asked for market la, so
+// an la job got no day-before message at all, not even to the owner.
+{
+  const laRow = plannedRow({ order_id: 'la1', market: 'la', state: 'no_origin', window_text: '2 PM', arrive_at: '2026-09-12T21:00:00.000Z',
+    origin_kind: 'none', origin_lat: null, origin_lng: null, origin_label: null, dest_source: 'delivery_notes', dest_address: '100 Example Ave, Los Angeles, CA 90001',
+    leave_by_at: null, drive_seconds: null, has_ferry: false });
+  const h = harness({ orders: [laOrder()], plans: [laRow], shifts: [] });
+  try {
+    // 6:10 PM Pacific on Fri Sep 11 (9:10 PM Eastern: ny's window is open too, and finds no ny job).
+    const counts = await at('2026-09-12T01:10:00Z', () => runDayBeforeDepartureScan(APPLE_ENV));
+    assert.equal(counts.markets, 1); assert.equal(counts.sent, 1);
+    assert.ok(h.calls.some((c) => c.url.includes('orders?') && c.url.includes('market=eq.la')), 'the loop asked for la orders');
+    const posts = h.queuePosts();
+    assert.equal(posts.length, 1, 'owner body only: no la crew exists');
+    assert.deepEqual(posts[0].payload.tokens, ['owner-token']);
+    assert.equal(posts[0].payload.aps.alert.title, 'Tomorrow Sat Sep 12 (LA): 1 job');
+    assert.equal(posts[0].payload.aps.alert.body, '• NO START POINT: Robin Example · 100 Example Ave, Los Angeles, CA 90001 · there is no LA crew yet, so no leave-by; plan this drive by hand.');
+  } finally { h.restore(); }
+  // 6:10 PM Eastern is 3:10 PM Pacific: too early for la.
+  const early = harness({ orders: [laOrder()], plans: [laRow], shifts: [] });
+  try {
+    const counts = await at('2026-09-11T22:10:00Z', () => runDayBeforeDepartureScan(APPLE_ENV));
+    assert.equal(counts.sent, 0); assert.equal(early.queuePosts().length, 0);
+  } finally { early.restore(); }
+  pass('day-before la: at 6 PM Pacific the loop asks for la orders and sends the owner one (LA) body; at 6 PM Eastern nothing');
 }
 // ── 13. The lock-screen card comes from the plan ────────────────────
 {
