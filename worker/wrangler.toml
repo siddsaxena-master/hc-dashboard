@@ -4,7 +4,7 @@ compatibility_date = "2024-01-01"
 
 [triggers]
 crons = [
-  "0 12 * * *",     # 8am ET (12 UTC) — daily Weee box math digest
+  "0 12 * * *",     # 12 UTC daily (8am EDT summer, 7am EST winter): Weee box math digest, payroll on Mondays
   "0 * * * *",      # every hour — reconfirmation scan + post-event debrief scan
   "*/5 * * * *",    # every 5 minutes — intake approval cards (summary + buttons)
 ]

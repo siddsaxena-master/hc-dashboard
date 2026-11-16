@@ -988,7 +988,7 @@ async function handleParseBatch(request, env) {
 // ── SCHEDULED JOBS ──
 
 // Cron schedule (in wrangler.toml [triggers]):
-//   "0 12 * * *"   — daily 8am ET (12 UTC) — Weee box math digest
+//   "0 12 * * *"   : daily 12:00 UTC (8am EDT in summer, 7am EST in winter): Weee box math digest, plus payroll on Mondays
 //   "0 * * * *"    — hourly — reconfirmation scan + post-event debrief scan + intake nags
 //   "*/5 * * * *"  — every 5 minutes — intake approval cards + delivery time confirmations + shift summaries + clock-in pings + stillness watch
 async function runScheduled(event, env, alsoNotify = true) {
@@ -1075,7 +1075,8 @@ async function runScheduled(event, env, alsoNotify = true) {
   }
 }
 
-// Daily 8am ET — compute Weee coconut orders for the next 5 days
+// Daily 8am ET (12:00 UTC, so 7am ET in winter): compute Weee coconut
+// orders for the next 5 days; on Mondays it also carries payroll.
 async function runDailyDigest(env) {
   const today = new Date();
   const horizon = new Date(today.getTime() + 5 * 86400000);
@@ -1160,8 +1161,9 @@ async function runDailyDigest(env) {
     passedLines.forEach(l => lines.push(l));
   }
 
-  // Sunday payroll section (weekday checked in EASTERN time inside the
-  // helper; returns [] on any other day or on any read failure).
+  // Monday (payday) payroll section (weekday checked in EASTERN time
+  // inside the helper; returns [] on any other day or on any read
+  // failure).
   const payrollLines = await buildPayrollDigestLines(env);
   if (payrollLines.length) {
     lines.push('');
@@ -5901,10 +5903,13 @@ async function handleParseFile(request, env) {
 //   pay cents = round-half-up(minutes * hourly_rate_cents / 60)
 
 const ET_ZONE = 'America/New_York';
-// The one knob for the payroll digest cadence. 'Sun' = Sundays only
-// (Sidd initiates payment every Sunday). Change to another short
-// weekday name ('Mon'..'Sun') to move it.
-const PAYROLL_DIGEST_WEEKDAY = 'Sun';
+// The one knob for the payroll digest cadence. 'Mon' = Mondays only
+// (2026-11-16, Sidd: the crew is paid every MONDAY for the Monday to
+// Sunday week that just ended, New York time; this was 'Sun' before).
+// The section names the week due today as the last FINISHED Mon-Sun
+// week before today, so another short weekday name ('Mon'..'Sun')
+// still reads correctly, but keep it on payday.
+const PAYROLL_DIGEST_WEEKDAY = 'Mon';
 // A shift still open after this many hours is a forgotten clock-out.
 // Keep in sync with OPEN_SHIFT_FLAG_HOURS in hc-field-app/App.js.
 const OPEN_SHIFT_FLAG_HOURS = 14;
@@ -6561,63 +6566,126 @@ async function buildShiftSummaryText(env, row, workers) {
   return { text: lines.join('\n'), touched: touched };
 }
 
-// Sunday-only payroll section for the 8am digest. Returns [] on any
-// other ET weekday or on any read failure, so the digest never breaks.
-// Math must match the app's Pay card rule for rule (see comment at the
-// top of this section).
-async function buildPayrollDigestLines(env) {
+// The most unpaid shift rows the payday section reads (oldest first).
+// Hitting it means newer shifts may be missing, so the section says so.
+const PAYROLL_READ_LIMIT = 200;
+
+// The payroll week due today: the last FINISHED Mon-Sun ET week before
+// the week that holds nowMs. On a Monday that is last Monday through
+// yesterday (Sunday). Dates are 'YYYY-MM-DD' ET calendar days; label is
+// what the digest prints ("Mon Nov 9 to Sun Nov 15"). Pure, DST-safe
+// (etWeekStart reads the ET date; the day math is noon-anchored UTC).
+// Exported for worker/test-payroll-digest.mjs.
+export function payrollDueWeek(nowMs) {
+  const thisWeekStart = etWeekStart(new Date(nowMs).toISOString());
+  const start = addCalendarDays(thisWeekStart, -7);
+  const end = addCalendarDays(thisWeekStart, -1);
+  return { start, end, thisWeekStart, label: calendarDayLabel(start) + ' to ' + calendarDayLabel(end) };
+}
+// 'YYYY-MM-DD' plus n calendar days (noon-anchored, so no DST edge).
+function addCalendarDays(day, n) {
+  return new Date(new Date(day + 'T12:00:00Z').getTime() + n * 86400000).toISOString().slice(0, 10);
+}
+// 'YYYY-MM-DD' -> 'Mon Nov 9': the calendar date as written, no zone math.
+const PAYROLL_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const PAYROLL_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function calendarDayLabel(day) {
+  const d = new Date(day + 'T12:00:00Z');
+  return PAYROLL_WEEKDAYS[d.getUTCDay()] + ' ' + PAYROLL_MONTHS[d.getUTCMonth()] + ' ' + d.getUTCDate();
+}
+
+// Payday payroll section for the daily digest, PAYROLL_DIGEST_WEEKDAY
+// only (Monday). Returns [] on any other ET weekday or on any read
+// failure, so the digest never breaks. Math must match the app's Pay card
+// rule for rule (see comment at the top of this section); this function
+// only decides which block a shift is listed in.
+// What it says (2026-11-16, moved from Sunday to Monday payday):
+//   header  the week due today, the last finished Mon-Sun ET week
+//           ("Payroll due today for Mon Nov 9 to Sun Nov 15").
+//   due     every unpaid closed shift that clocked in BEFORE this week,
+//           one line per worker as before: the due week plus any older
+//           unpaid shift (never dropped; the line says how many older
+//           ones it includes). "Total due today" sums only these.
+//   not due unpaid closed shifts that clocked in this week (from Monday
+//           00:00 ET), under "This week, not due yet", outside the total.
+//           Due plus not due equals the old Sunday "Total owed".
+// A shift belongs to the week of its clock-in ET date (a Sunday night
+// shift that ends Monday is in the week that ended Sunday), the same rule
+// as the over-40 banner below. nowMs is for the tests; the digest passes
+// nothing, so it is the real clock.
+export async function buildPayrollDigestLines(env, nowMs = Date.now()) {
   const lines = [];
   try {
-    const todayEt = new Intl.DateTimeFormat('en-US', { timeZone: ET_ZONE, weekday: 'short' }).format(new Date());
+    const todayEt = new Intl.DateTimeFormat('en-US', { timeZone: ET_ZONE, weekday: 'short' }).format(new Date(nowMs));
     if (todayEt !== PAYROLL_DIGEST_WEEKDAY) return lines;
+    const week = payrollDueWeek(nowMs);
 
     const rows = await fetchSb(env, 'shifts?select=id,worker_name,worker_email,clock_in_at,clock_out_at' +
-      '&paid_at=is.null&order=clock_in_at.asc&limit=200');
+      '&paid_at=is.null&order=clock_in_at.asc&limit=' + PAYROLL_READ_LIMIT);
     if (rows === null) return lines;  // read failed: drop only this section
     const workers = await fetchSb(env, 'field_workers?select=email,name,hourly_rate_cents') || [];
 
-    const groups = {};
+    const due = {};     // clocked in before this week: due today
+    const notDue = {};  // clocked in this week: listed, never in the total
     const flags = [];
     let grand = 0;
     rows.forEach(row => {
       if (!row.clock_out_at) {
         // Open shift: flag it once it looks forgotten; never count it.
-        if ((Date.now() - new Date(row.clock_in_at)) / 3600000 >= OPEN_SHIFT_FLAG_HOURS) {
+        if ((nowMs - new Date(row.clock_in_at)) / 3600000 >= OPEN_SHIFT_FLAG_HOURS) {
           flags.push('⚠️ ' + tgSafe(row.worker_name) + ' has a shift open since ' +
             etDayStr(row.clock_in_at) + ' ' + etTimeStr(row.clock_in_at) +
             ' ET - missing clock-out, not counted.');
         }
         return;
       }
+      const day = etDateStr(row.clock_in_at);
+      const thisWeek = day >= week.thisWeekStart;
+      const groups = thisWeek ? notDue : due;
       const key = (row.worker_email || row.worker_name || '?').toLowerCase();
       if (!groups[key]) {
-        groups[key] = { name: row.worker_name, rate: workerRateFor(workers, row), count: 0, mins: 0, cents: 0 };
+        groups[key] = { name: row.worker_name, rate: workerRateFor(workers, row), count: 0, mins: 0, cents: 0, weekMins: 0, older: 0 };
       }
       const g = groups[key];
       g.count += 1;
       const mins = shiftMinutes(row);
       g.mins += mins;
-      // Over-40 flag input: minutes from UNPAID rows whose clock-in falls in
-      // the current Mon-Sun ET week. An approximation on purpose (paid rows
-      // from earlier this week are not re-fetched) - the once-per-crossing
-      // banner is the precise mechanism; this is the Sunday reminder.
-      if (etDateStr(row.clock_in_at) >= etWeekStart(new Date().toISOString())) g.weekMins = (g.weekMins || 0) + mins;
+      if (!thisWeek) {
+        // Over-40 flag input: minutes from UNPAID rows whose clock-in falls
+        // in the week due today. An approximation on purpose (rows already
+        // marked paid are not re-fetched): the once-per-crossing banner is
+        // the precise mechanism; this is the payday reminder.
+        if (day >= week.start) g.weekMins += mins;
+        else g.older += 1;
+      }
       if (g.rate != null) {
         const c = payCents(mins, g.rate);
         g.cents += c;
-        grand += c;
+        if (!thisWeek) grand += c;
       }
     });
 
-    const list = Object.values(groups);
-    if (!list.length && !flags.length) return lines;
-    lines.push('💵 Payroll - unpaid shifts');
-    list.forEach(g => {
-      lines.push('  • ' + tgSafe(g.name) + ' - ' + g.count + ' shift' + (g.count === 1 ? '' : 's') +
-        ' · ' + fmtHm(g.mins) + (g.rate != null ? ' · ' + usd(g.cents) : ' · rate not set') +
-        ((g.weekMins || 0) >= 2400 ? ' · over 40h this week' : ''));
+    const dueList = Object.values(due);
+    const notDueList = Object.values(notDue);
+    if (!dueList.length && !notDueList.length && !flags.length) return lines;
+    const workerLine = (g) => '  • ' + tgSafe(g.name) + ' - ' + g.count + ' shift' + (g.count === 1 ? '' : 's') +
+      ' · ' + fmtHm(g.mins) + (g.rate != null ? ' · ' + usd(g.cents) : ' · rate not set');
+    lines.push('💵 Payroll due today for ' + week.label);
+    dueList.forEach(g => {
+      lines.push(workerLine(g) +
+        (g.weekMins >= 2400 ? ' · over 40h last week' : '') +
+        (g.older ? ' · includes ' + g.older + ' older shift' + (g.older === 1 ? '' : 's') +
+          ' from before ' + calendarDayLabel(week.start) : ''));
     });
-    if (list.length) lines.push('  Total owed: ' + usd(grand));
+    lines.push(dueList.length ? '  Total due today: ' + usd(grand) : '  No closed unpaid shifts are due today.');
+    if (notDueList.length) {
+      lines.push('  This week, not due yet:');
+      notDueList.forEach(g => lines.push(workerLine(g)));
+    }
+    if (rows.length >= PAYROLL_READ_LIMIT) {
+      lines.push('⚠️ Read ' + PAYROLL_READ_LIMIT + ' unpaid shifts, the most it reads (oldest first). ' +
+        'Newer shifts may be missing, so the total may be short.');
+    }
     flags.forEach(f => lines.push(f));
   } catch (e) {
     console.error('payroll digest lines error:', e);
@@ -6777,7 +6845,8 @@ export function clockOutBodies(mins, rate, touchedCoconuts) {
 
 // The Monday 00:00 ET start of the week containing the given instant,
 // as a 'YYYY-MM-DD' ET date string. Weeks run Monday through Sunday
-// (matches how Sidd schedules; the Sunday payroll digest closes them).
+// (matches how Sidd schedules; the Monday payroll digest pays the week
+// that ended the day before, see payrollDueWeek).
 function etWeekStart(iso) {
   const day = etDateStr(iso); // ET calendar day of the instant
   const wd = new Date(day + 'T12:00:00Z').getUTCDay(); // fake-noon: weekday of that DATE

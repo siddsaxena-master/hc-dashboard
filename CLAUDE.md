@@ -612,6 +612,62 @@ leads and often guessed market and event type.
   (Formspree changed its layout or the poller's body type); treat it as a
   bug to fix, not as quiet traffic.
 
+## Payroll digest on Monday payday (built 2026-11-16, LOCAL ONLY)
+
+Branch `feat/payroll-digest-monday`, cut from d7af6c5 (the code of live
+ceb54e96 and of the secret-only version 0a0aee3f on top of it; NEVER main).
+Nothing deployed. The why: Sidd pays the crew every MONDAY for the Monday to
+Sunday week that just ended (New York time), and the payroll section only
+came on Sundays.
+
+- The section rides the daily `0 12 * * *` digest (12:00 UTC: 8am EDT in
+  summer, 7am EST in winter) and shows only when the New York weekday is
+  `PAYROLL_DIGEST_WEEKDAY` ('Mon'; it was 'Sun').
+- `payrollDueWeek(nowMs)` names the week due today: the last FINISHED Mon-Sun
+  ET week (on a Monday, last Monday through yesterday). Header: "Payroll due
+  today for Mon Nov 9 to Sun Nov 15".
+- A shift belongs to the week of its clock-in ET date (a Sunday night shift
+  that ends Monday is in the week that ended Sunday), the same rule as the
+  over-40 banner. Every unpaid closed shift that clocked in before this week
+  is due today, one line per worker as before: older unpaid shifts are never
+  dropped and the line says "includes N older shifts from before <Mon>".
+  "Total due today" sums only those. Shifts that clocked in this week (from
+  Monday 00:00 ET) are listed under "This week, not due yet" and left out of
+  the total; due plus not due equals the old Sunday "Total owed". The over-40
+  flag ("over 40h last week") counts the due week only. Reading the 200-row
+  limit adds a line that the total may be short. Open-shift flags unchanged.
+- Pay math untouched (shiftMinutes, payCents, fmtHm, usd byte for byte), still
+  equal to HC Field App.js payMins / payCents / fmtHm / moneyCents. App.js
+  line 1366 still says "Sunday payroll digest" in a comment (hc-field-app,
+  comment only, change it with the next app edit).
+- Tests: `node worker/test-payroll-digest.mjs` (10 checks, fake network: the
+  week label at both DST edges at 12:00 and 13:00 UTC, Monday yes and Sunday
+  no by New York weekday, the full section, midnight shifts at both DST edges,
+  totals equal to the old Sunday math, App.js parity, soft failure, the read
+  limit line, the real cron path, source pins). It reads
+  ../hc-field-app/App.js like test-payroll-payment-safety. There are now 29
+  worker test files (30 with test-dashboard-client-security.mjs). 9 of 9
+  planted bugs caught.
+- Ship (its own OK, claim the OPERATOR BOARD hc-dashboard line first):
+  1. From `worker/`, `npx --no-install wrangler deployments list` must show
+     0a0aee3f-afaa-4a19-8b1a-75c51ddd2907 at 100% (Secret Change on
+     ceb54e96 = d7af6c5). WRITE DOWN the live id; it is the undo target. If
+     it is anything else, merge that live branch in and rerun all 30 test
+     files on an LF export before deploying.
+  2. `cd worker && npx --no-install wrangler deploy` from this branch, at a
+     quiet minute outside 11:45 to 12:15 UTC and not at :00. No secret
+     changes. Check the new version is 100% and one */5 tick is Ok in
+     `npx wrangler tail`.
+  3. Move the lineage forward: fast-forward fix/claudia-chat-order-writes-switch
+     (d7af6c5) to the deployed commit (`git merge --ff-only`, never a rebase
+     or force push) and push THAT branch, never main. Record the new live id
+     on the OPERATOR BOARD line.
+  Live proof: the next Sunday digest has no payroll section and the next
+  Monday digest (12:00 UTC) starts the section with "Payroll due today for".
+  Undo: `npx --no-install wrangler rollback 0a0aee3f-afaa-4a19-8b1a-75c51ddd2907`
+  (payroll goes back to Sundays; rolling back past another deploy also
+  removes that deploy; 0a0aee3f is above the 657f45c0 floor).
+
 ## Current uncommitted state (as of 2026-07-07)
 
 index.html has the one-line pending-payment fix described above staged
