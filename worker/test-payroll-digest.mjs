@@ -192,6 +192,96 @@ const MAIN_ROWS = [
   pass('section: nothing due but this week listed; silent when nothing is unpaid or only a fresh open shift');
 }
 
+// -- 3c. Open shifts on payday: one from the week due today is never silent --
+// A still-running shift that clocked in before this week belongs to the
+// week due today. It is never counted, so the section must say so even
+// when it is younger than the 14-hour forgotten mark.
+const stillIn = (name, day, time) =>
+  new RegExp('^\u26A0\uFE0F ' + name + ' is still clocked in since ' + day + ' ' + time.replace(' ', '\\s') + " ET - not in today's total\\.$");
+{
+  // Mon Nov 16 2026 at 12:00 UTC (7am EST). Quinn clocked in Sun Nov 15 at
+  // 6 PM EST and is still in (13 hours): the only unpaid row, so before
+  // this fix the whole section vanished.
+  const quinnOpen = shift(QUINN, '2026-11-15T23:00:00Z', null);
+  const alone = (await digestAt('2026-11-16T12:00:00Z', { shifts: [quinnOpen] })).lines;
+  assert.equal(alone.length, 3, JSON.stringify(alone));
+  assert.deepEqual(alone.slice(0, 2), ['\u{1F4B5} Payroll due today for Mon Nov 9 to Sun Nov 15', '  No closed unpaid shifts are due today.']);
+  assert.match(alone[2], stillIn('Quinn Example', 'Sun, Nov 15', '6:00 PM'));
+  // An hour later (8am EST) it is 14 hours old: the forgotten clock-out
+  // words take over, still flagged once.
+  const later = (await digestAt('2026-11-16T13:00:00Z', { shifts: [quinnOpen] })).lines;
+  assert.equal(later.length, 3, JSON.stringify(later));
+  assert.match(later[2], openFlag('Quinn Example', 'Sun, Nov 15', '6:00 PM'));
+  // Beside a closed due-week shift and a normal shift running since this
+  // Monday 5 AM EST: the total is unchanged, Quinn is flagged, Erin is not.
+  const mixed = (await digestAt('2026-11-16T12:00:00Z', { shifts: [
+    shift(PAT, '2026-11-10T13:00:00Z', '2026-11-10T21:00:00Z'),
+    quinnOpen,
+    shift(ERIN, '2026-11-16T10:00:00Z', null),
+  ] })).lines;
+  assert.equal(mixed.length, 4, JSON.stringify(mixed));
+  assert.deepEqual(mixed.slice(0, 3), [
+    '\u{1F4B5} Payroll due today for Mon Nov 9 to Sun Nov 15',
+    '  \u2022 Pat Example - 1 shift \u00B7 8:00 \u00B7 $80.00',
+    '  Total due today: $80.00',
+  ]);
+  assert.match(mixed[3], stillIn('Quinn Example', 'Sun, Nov 15', '6:00 PM'));
+}
+{
+  // Mon Mar 15 2027 at 12:00 UTC (8am EDT, DST began Sun Mar 14). Pat
+  // clocked in Sun Mar 14 at 11:30 PM EDT (due week: flagged); Quinn
+  // clocked in Mon Mar 15 at 12:30 AM EDT (this week: silent). Reading the
+  // UTC date would put Pat in this week and drop him without a word.
+  const lines = (await digestAt('2027-03-15T12:00:00Z', { shifts: [
+    shift(PAT, '2027-03-15T03:30:00Z', null),
+    shift(QUINN, '2027-03-15T04:30:00Z', null),
+  ] })).lines;
+  assert.equal(lines.length, 3, JSON.stringify(lines));
+  assert.deepEqual(lines.slice(0, 2), ['\u{1F4B5} Payroll due today for Mon Mar 8 to Sun Mar 14', '  No closed unpaid shifts are due today.']);
+  assert.match(lines[2], stillIn('Pat Example', 'Sun, Mar 14', '11:30 PM'));
+  pass('open shifts: a due-week shift still clocked in on payday is flagged as not in the total (alone it still shows the section), the 14-hour words take over at 14 hours, this week\'s running shift stays silent, judged by the New York date');
+}
+
+// -- 3d. Exact edges: 14 hours open, 40 hours in the due week ---------
+{
+  // Mon Nov 16 2026 at 20:00 UTC (3pm EST). Two shifts running since this
+  // Monday: Quinn since 1:00 AM EST (exactly 14:00, forgotten), Pat since
+  // 1:01 AM EST (13:59, a normal shift). Only Quinn is flagged.
+  const lines = (await digestAt('2026-11-16T20:00:00Z', { shifts: [
+    shift(QUINN, '2026-11-16T06:00:00Z', null),
+    shift(PAT, '2026-11-16T06:01:00Z', null),
+  ] })).lines;
+  assert.equal(lines.length, 3, JSON.stringify(lines));
+  assert.match(lines[2], openFlag('Quinn Example', 'Mon, Nov 16', '1:00 AM'));
+  // At 12:00 UTC: due-week shifts open exactly 14:00 (Sun 5:00 PM EST) and
+  // 13:59 (Sun 5:01 PM EST). The first gets the forgotten words, the second
+  // the not-in-the-total words.
+  const edge = (await digestAt('2026-11-16T12:00:00Z', { shifts: [
+    shift(QUINN, '2026-11-15T22:00:00Z', null),
+    shift(PAT, '2026-11-15T22:01:00Z', null),
+  ] })).lines;
+  assert.equal(edge.length, 4, JSON.stringify(edge));
+  assert.match(edge[2], openFlag('Quinn Example', 'Sun, Nov 15', '5:00 PM'));
+  assert.match(edge[3], stillIn('Pat Example', 'Sun, Nov 15', '5:01 PM'));
+}
+{
+  // Due week Mon Nov 9 to Sun Nov 15: Pat works exactly 40:00 (5 x 8h,
+  // flagged), Quinn works 39:59 (4 x 8h and one 7:59, not flagged).
+  const rows = [];
+  for (let d = 9; d <= 13; d++) {
+    const day = '2026-11-' + String(d).padStart(2, '0');
+    rows.push(shift(PAT, day + 'T13:00:00Z', day + 'T21:00:00Z'));
+    rows.push(shift(QUINN, day + 'T14:00:00Z', day + (d === 13 ? 'T21:59:00Z' : 'T22:00:00Z')));
+  }
+  assert.deepEqual((await digestAt('2026-11-16T12:00:00Z', { shifts: rows })).lines, [
+    '\u{1F4B5} Payroll due today for Mon Nov 9 to Sun Nov 15',
+    '  \u2022 Pat Example - 5 shifts \u00B7 40:00 \u00B7 $400.00 \u00B7 over 40h last week',
+    '  \u2022 Quinn Example - 5 shifts \u00B7 39:59 \u00B7 $399.83',
+    '  Total due today: $799.83',
+  ]);
+  pass('edges: an open shift is forgotten at exactly 14:00 and not at 13:59; over 40 shows at exactly 40:00 in the due week and not at 39:59');
+}
+
 // ── 4. DST edges: which week a shift right at midnight belongs to ────
 {
   // Mon Nov 2 2026 (EST since Sun Nov 1). Pat clocked in Sun Nov 1 at

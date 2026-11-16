@@ -6609,6 +6609,10 @@ function calendarDayLabel(day) {
 //   not due unpaid closed shifts that clocked in this week (from Monday
 //           00:00 ET), under "This week, not due yet", outside the total.
 //           Due plus not due equals the old Sunday "Total owed".
+//   open    never counted. Flagged once open OPEN_SHIFT_FLAG_HOURS (a
+//           forgotten clock-out), and also whenever it clocked in before
+//           this week ("still clocked in since ... not in today's total"),
+//           so a shift of the week due today is never left out silently.
 // A shift belongs to the week of its clock-in ET date (a Sunday night
 // shift that ends Monday is in the week that ended Sunday), the same rule
 // as the over-40 banner below. nowMs is for the tests; the digest passes
@@ -6631,11 +6635,19 @@ export async function buildPayrollDigestLines(env, nowMs = Date.now()) {
     let grand = 0;
     rows.forEach(row => {
       if (!row.clock_out_at) {
-        // Open shift: flag it once it looks forgotten; never count it.
+        // Open shift: never counted. Flag it once it looks forgotten.
         if ((nowMs - new Date(row.clock_in_at)) / 3600000 >= OPEN_SHIFT_FLAG_HOURS) {
           flags.push('⚠️ ' + tgSafe(row.worker_name) + ' has a shift open since ' +
             etDayStr(row.clock_in_at) + ' ' + etTimeStr(row.clock_in_at) +
             ' ET - missing clock-out, not counted.');
+        } else if (etDateStr(row.clock_in_at) < week.thisWeekStart) {
+          // Younger than the forgotten mark but clocked in before this
+          // week (a Sunday evening shift still running at 7am Monday): it
+          // belongs to the week due today, so say it is left out of the
+          // total instead of dropping it without a word.
+          flags.push('\u26A0\uFE0F ' + tgSafe(row.worker_name) + ' is still clocked in since ' +
+            etDayStr(row.clock_in_at) + ' ' + etTimeStr(row.clock_in_at) +
+            " ET - not in today's total.");
         }
         return;
       }

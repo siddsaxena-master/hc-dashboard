@@ -635,19 +635,31 @@ came on Sundays.
   Monday 00:00 ET) are listed under "This week, not due yet" and left out of
   the total; due plus not due equals the old Sunday "Total owed". The over-40
   flag ("over 40h last week") counts the due week only. Reading the 200-row
-  limit adds a line that the total may be short. Open-shift flags unchanged.
+  limit adds a line that the total may be short.
+- Open shifts are never counted. The 14-hour forgotten clock-out flag is
+  unchanged. A shift still clocked in that started before this week (say
+  Sunday 6pm, still running at 7am Monday, under 14 hours) belongs to the
+  week due today, so it gets its own line: "still clocked in since ... ET -
+  not in today's total" (review fix 2026-11-16). Alone, it still shows the
+  section. Once closed it is paid next Monday as an older shift.
+- Known gap, Sidd's call (not changed): "Total due today" counts every closed
+  unpaid shift, including ones HC Field holds for time review (under 1
+  minute or over 24 hours, App.js payShiftTimeIssue) and leaves out of
+  "Mark week paid". The old Sunday "Total owed" did the same.
 - Pay math untouched (shiftMinutes, payCents, fmtHm, usd byte for byte), still
   equal to HC Field App.js payMins / payCents / fmtHm / moneyCents. App.js
   line 1366 still says "Sunday payroll digest" in a comment (hc-field-app,
   comment only, change it with the next app edit).
-- Tests: `node worker/test-payroll-digest.mjs` (10 checks, fake network: the
+- Tests: `node worker/test-payroll-digest.mjs` (12 checks, fake network: the
   week label at both DST edges at 12:00 and 13:00 UTC, Monday yes and Sunday
-  no by New York weekday, the full section, midnight shifts at both DST edges,
-  totals equal to the old Sunday math, App.js parity, soft failure, the read
-  limit line, the real cron path, source pins). It reads
-  ../hc-field-app/App.js like test-payroll-payment-safety. There are now 29
-  worker test files (30 with test-dashboard-client-security.mjs). 9 of 9
-  planted bugs caught.
+  no by New York weekday, the full section, the open due-week shift flag,
+  the exact 14:00 and 13:59 open edges and 40:00 and 39:59 over-40 edges,
+  midnight shifts at both DST edges, totals equal to the old Sunday math,
+  App.js parity, soft failure, the read limit line, the real cron path,
+  source pins). It reads ../hc-field-app/App.js like
+  test-payroll-payment-safety. There are now 29 worker test files (30 with
+  test-dashboard-client-security.mjs). 18 of 18 planted bugs caught after
+  the review fixes.
 - Ship (its own OK, claim the OPERATOR BOARD hc-dashboard line first):
   1. From `worker/`, `npx --no-install wrangler deployments list` must show
      0a0aee3f-afaa-4a19-8b1a-75c51ddd2907 at 100% (Secret Change on
