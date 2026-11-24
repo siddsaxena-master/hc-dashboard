@@ -707,7 +707,9 @@ worker knew an extra day belongs to a job.
   `reconfirmEligibility` refuses an extra day ('extra day of a job', even one
   holding its own fee invoice) and a day whose day 1 was removed ('day of a
   removed job'). A ready or held draft made for a day before it was linked
-  expires. Day 1 of a job with two or more live days gets the family wording
+  expires. Day 1 of a job with two or more live BOOKED days (stage
+  invoiced, deposit_paid or paid_full; review fix 2026-11-24: a linked lead
+  still quoted is never told to the client as booked) gets the family wording
   (`reconfirmFamilyTemplate`): one bullet per day ("Tuesday, December 1: 300
   coconuts, arriving 10:00 AM"; an extra day's time is only its own
   owner-confirmed time), then Drop off, "Count: 700 custom branded coconuts
@@ -721,26 +723,75 @@ worker knew an extra day belongs to a job.
 - `facts.source.family_days` (order id, day, count, request status and
   window per day) is compared with keys sorted (jsonb reorders keys), so a
   recount, a moved, added or cancelled day, or a day linked after the email
-  went out flips a sent row to changed with the note "job days changed". The
-  droplet compares only its own keys and ignores family_days, so between two
-  hourly scans a change to an EXTRA day is not caught at send time (day 1's
-  own fields still are). Jarvis's reconfirm_sender can add it later.
-- Holds: count_missing when ANY listed day has no count; multi_day when
-  Jarvis's calendar check (072 `hc_calendar_findings`) keeps an OPEN
+  went out flips a sent row to changed with the note "job days changed".
+- SEND-TIME GAP (review fix 2026-11-24, finding 3). The droplet's send-time
+  compare (Jarvis reconfirm_sender, origin/main 644cc9e: `SOURCE_KEYS`,
+  `diff_source`) re-reads day 1's order ONLY and ignores family_days. So
+  after a preview, an edit to an EXTRA day followed by a Send now within
+  the hour sends the OLD day list to the client; the worker flips the row to
+  changed only after the send. PRECONDITION before Send now on any family
+  email: Jarvis reconfirm_sender must re-read the members named in
+  `facts.source.family_days` (their order ids) and compare each day's date,
+  coconuts_qty, delivery_request status and window, and requeue on any
+  difference (a Jarvis change, its own switch and review; not built). Until
+  it ships, the OWNER RULE (tell Sidd with the first family preview): after
+  editing any day of a job, wait for the fresh preview push before Send now.
+  The next hourly tick rewrites the ready row and pushes a fresh preview
+  (pinned in test-job-families.mjs, review fix 3). One-day jobs are safe as
+  before: the droplet catches a day 1 change and requeues.
+- Holds: count_missing when ANY listed day has no count. multi_day (owner
+  words "coconuts by day not confirmed against the invoice") in three ways:
+  (a) Jarvis's calendar check (072 `hc_calendar_findings`) keeps an OPEN
   count_differs, days_differ, days_undated, day_not_on_invoice or day_link
-  finding on day 1, an extra day or day 1's invoice. The findings table is
-  read only when a multi-day job is in view; 404 (072 not live) holds
-  nothing; any other failure makes the multi-day jobs wait an hour untouched
-  (one-day jobs carry on). A failed family read stops the whole hour.
+  finding on day 1, an extra day or day 1's invoice. Read every hour for
+  EVERY day 1 in view (one GET with their ids and invoice ids), one-day jobs
+  included: a job whose second day is NOT linked yet is a one-day job in
+  the app, and day_link (on the unlinked day, naming day 1's invoice) or
+  count_differs on day 1 is the only thing that can see it (review fix,
+  finding 1). A failed findings read makes the multi-day jobs wait an hour
+  untouched; one-day jobs carry on (fail open). (b) FAIL CLOSED (review
+  fix, finding 2, option b chosen): a job that is already multi-day holds
+  until a calendar check run in the last 36 hours (072 `hc_calendar_runs`,
+  quiet or on) fully checked its day 1 (its id in checked_orders or its
+  invoice in checked_invoices). Order rows store no invoice coconut count,
+  so nothing else can tell day 1 put back at the whole invoice (700) next
+  to its 200 and 200 days. Before 072 (404), before Jarvis release B runs
+  the check, or when the check stops, every multi-day job's email holds,
+  and a row still held on delivery day minus 1 expires as before. INTERIM
+  RULE (design 14g) until the check runs in quiet mode: Sidd confirms the
+  days and counts with those clients himself (the Las Vegas expo 300 / 200
+  / 200 = 700, the Javits show 450 / 450 = 900); this worker shipping does
+  NOT lift that rule. A failed run read makes the multi-day jobs wait an hour. (c) a live
+  day of the job not at a booked stage, or two live days on one calendar
+  day (review fix, finding 5). A failed family read stops the whole hour.
 - CONTRACT GAP, 072 must widen the hold check: `order_reconfirmations_hold_reasons_check`
   (044, widened by 045) does not admit `multi_day`, and 072 as built does
   not widen it. Until it does, a write carrying multi_day is refused (23514)
   and the worker writes it once more with `date_unverified` instead, so the
-  email still holds (owner words "delivery date unverified"). Fix in 072 the
-  045 way: drop and re-add the check under its name with the same ten words
-  plus multi_day, preflight that the 045 list is there, rollback refuses
-  while any row holds multi_day. HC Field build 44 should add HOLD_WORDS and
-  HOLD_FIX for multi_day (build 43 shows "multi day").
+  email still holds (the app row shows "delivery date unverified"; the held
+  push carries the multi_day words). While the calendar tables answer 404,
+  a row already holding that fallback list is treated as unchanged, so it
+  is not rewritten (refused, then the fallback) every hour (review fix,
+  finding 6). Once 072 is live the next tick writes multi_day itself, once.
+  So the widening is a PRECONDITION of 072's apply and of the calendar check
+  going quiet: fix it in 072 the 045 way (drop and re-add the check under
+  its name with the same ten words plus multi_day, preflight that the 045
+  list is there, rollback refuses while any row holds multi_day). A 072
+  without it brings back the double write every hour. HC Field build 44
+  should add HOLD_WORDS and HOLD_FIX for multi_day (build 43 shows "multi
+  day").
+- Times in a reply about a multi-day job (review fix, finding 4): the
+  family email asks what time to arrive EACH day, but the proposal scan
+  (`runProposalScan`) knows one order, the intake's linked one. When that
+  order is a live day of a job with two or more live days (one family read
+  per tick, only when an email has a clock time), or the email replies to a
+  family body (`reconfirmIsFamilyBody`), no Time change? row is made (it
+  would move that day's alarm, through alt_arrive_at, to the first time
+  found). Instead ONE owner card per email in the Coordinator email shape
+  (kind linked_no_time, the same mark on the intake row): "Times for a job
+  that runs several days. Nothing was changed: open it in Outlook, then set
+  each day in its delivery sheet in Calendar." A failed family read makes
+  the email wait a tick. One-day jobs propose exactly as before.
 - Day P&L (clock-out summary, `buildShiftSummaryText`, now exported): an
   extra day adds $0 even with a typed total (its coconuts still count on its
   own day), day 1 adds its own total plus its read, live, not voided add-on
@@ -760,23 +811,33 @@ worker knew an extra day belongs to a job.
   (4925893) and is NOT in this lineage. When it merges, its job list
   (`coconutPlanTick` jobs from `readCoconutInputs`) must drop rows where
   `familyLeavesPrep(fam, order)` is true, with `loadJobFamilies` over the
-  orders it read. Each row already counts on its own prep day.
-- Subrequests: the hourly reconfirmation scan gains one read (two with a
-  multi-day job in view); each clock-out summary gains up to two (only when
-  that day has orders); the 8am digest one.
-- No new switch: with no linked days in production (0 on 2026-11-24) nothing
-  changes until the fast lane or Jarvis links days, and RECONFIRM_MODE
-  preview keeps every draft behind Sidd's Send now.
-- Tests: `node worker/test-job-families.mjs` (21 checks: the vectors file
+  orders it read. Each row already counts on its own prep day. TRIPWIRE
+  (review fix, finding 7): test-job-families.mjs fails when worker.js
+  defines `readCoconutInputs` or `coconutPlanTick` but the body of
+  `readCoconutInputs` does not call both `loadJobFamilies(` and
+  `familyLeavesPrep(`; put the filter there.
+- Subrequests: the hourly reconfirmation scan gains the family read, one
+  findings read (every hour now) and, with a multi-day job in view, one run
+  read; the 5-minute proposal scan gains one family read, only in a tick
+  where a linked email has a clock time; each clock-out summary gains up to
+  two (only when that day has orders); the 8am digest one.
+- No new switch: with no linked days in production (0 on 2026-11-24)
+  one-day jobs draft as before (plus the findings hold, which is empty
+  until the calendar check runs), multi-day jobs hold until the check
+  vouches for them (fail closed above), and RECONFIRM_MODE preview keeps
+  every draft behind Sidd's Send now.
+- Tests: `node worker/test-job-families.mjs` (28 checks: the vectors file
   pinned by sha256 7d931307... and marked -text in .gitattributes, all 14
   family_cases with every key and sum, the finding_words lint plus the
   worker's new words, the scan against a fake network for a three-day and a
-  two-day job, the multi_day hold and its 23514 fallback, change detection,
-  the time before 072, the Day P&L and the cron path of the 8am digest).
-  15 of 16 planted bugs caught (the 16th, skipping the family-read guard,
-  crashes into the same fail-closed outcome). There are now 30 worker test
-  files (31 with test-dashboard-client-security.mjs), all passing on an LF
-  export.
+  two-day job, the multi_day hold (findings, the fail-closed run rule,
+  booked and same-day checks) and its 23514 fallback without the hourly
+  rewrite, change detection and the fresh preview after an extra-day edit,
+  the time before 072, the proposal scan's family card, the Day P&L, the
+  cron path of the 8am digest and the coconut guard tripwire). The
+  2026-11-24 review fixes: each new check failed on the code before its fix
+  (repro and planted reverts in the PR). There are now 30 worker test files
+  (31 with test-dashboard-client-security.mjs), all passing on an LF export.
 - Ship (its own OK, claim the OPERATOR BOARD hc-dashboard line first):
   1. From `worker/`, `npx --no-install wrangler deployments list` must show
      7cb17234 (code 69e1922) at 100 percent. WRITE DOWN the live id; it is
@@ -789,8 +850,10 @@ worker knew an extra day belongs to a job.
      commit (`git merge --ff-only`, never a rebase or force push), push THAT
      branch, never main, and record the new live id on the OPERATOR BOARD.
   Live proof: the next hourly tick logs `reconfirmation scan: {...}` with
-  failed 0; after the fast lane, day 1's preview lists every day and no
-  order_reconfirmations row exists for an extra day.
+  failed 0; after the fast lane, day 1's draft lists every day and stays
+  held (multi_day; before 072 the app row says "delivery date unverified")
+  until the calendar check vouches for it, and no order_reconfirmations row
+  exists for an extra day.
   Undo: `npx --no-install wrangler rollback <the id written down>`. After an
   undo, a draft made by this version keeps its family words until the old
   worker rewrites it (the old worker sees no family_days and rewrites a

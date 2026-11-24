@@ -1558,10 +1558,11 @@ export function reconfirmHolds(facts, ctx = {}) {
   if (famDays ? famDays.some((x) => !x.count) : !f.derived.count) reasons.push('count_missing');
   if (!f.derived.address) reasons.push('address_missing');
   if (!f.derived.cracking_words) reasons.push('cracking_unknown');
-  // The family's coconuts by day disagree with the invoice: Jarvis's
-  // calendar check (migration 072 findings) holds an open count_differs,
-  // days_differ, days_undated, day_not_on_invoice or day_link finding on
-  // this job. The email waits until Sidd fixes the days or calls it fine.
+  // The job's coconuts by day are not confirmed against the invoice: an
+  // open calendar check finding (migration 072) says they differ, or a
+  // multi-day job has no recent calendar check run vouching for it, or one
+  // of its days is not booked or shares a day (runReconfirmationScan). The
+  // email waits until Sidd fixes the days or the check vouches for them.
   if (ctx.multiDay) reasons.push('multi_day');
   if (ctx.pendingProposal) reasons.push('pending_time_proposal');
   // An Address? row that is undecided, or accepted but not yet written to
@@ -1783,6 +1784,13 @@ function reconfirmFamilyTemplate(f, opts = {}) {
   return { subject: subject.slice(0, 200), body: lines.join('\n').slice(0, 6000) };
 }
 
+// True for a body the family template made (its Count bullet ends "over
+// N days"): the proposal scan never turns a time in a reply to it into a
+// Time change? row on one day.
+export function reconfirmIsFamilyBody(body) {
+  return String(body || '').split('\n').some((l) => l.startsWith(RECONFIRM_BULLET + 'Count: ') && / over \d+ days( \(picture below\))?$/.test(l));
+}
+
 // ── push words (owner only; never an email, phone or dollar) ────────
 const RECONFIRM_REASON_WORDS = {
   count_missing: 'coconut count missing',
@@ -1795,7 +1803,7 @@ const RECONFIRM_REASON_WORDS = {
   too_many_emails: 'more than 4 email addresses',
   date_unverified: 'delivery date unverified',
   owner_hold: 'held by you',
-  multi_day: 'the coconuts by day disagree with the invoice',
+  multi_day: 'coconuts by day not confirmed against the invoice',
 };
 export function reconfirmReasonWords(reasons) {
   return (reasons || []).map((r) => RECONFIRM_REASON_WORDS[r] || String(r).replace(/_/g, ' ')).join(', ');
@@ -2233,6 +2241,13 @@ const RECONFIRM_LIVE_STATUSES = ['ready', 'held', 'released', 'claimed', 'sent',
 // that mean a job's coconuts by day disagree with its invoice. An open one
 // on a multi-day job holds day 1's email as multi_day.
 const RECONFIRM_MULTI_DAY_CODES = ['count_differs', 'days_differ', 'days_undated', 'day_not_on_invoice', 'day_link'];
+// The stages a day of a job must be at before its email may list it (a
+// linked lead still quoted is not a booked day).
+const RECONFIRM_FAMILY_BOOKED = ['invoiced', 'deposit_paid', 'paid_full'];
+// A multi-day job's email waits for a calendar check run this recent that
+// fully checked its day 1 (the check runs twice a day; 36 hours rides out
+// one missed run).
+const RECONFIRM_CALENDAR_RUN_FRESH_MS = 36 * 3600000;
 const RECONFIRM_TABLE = 'order_reconfirmations';
 // Guarded PATCH: the filter names the status the row must still have, so
 // an owner tap or the droplet's claim in the meantime always wins.
@@ -2386,46 +2401,108 @@ export async function runReconfirmationScan(env) {
       const m = famById.get(o.id);
       if (m && famId(m.job_day_origin) && !famId(o.job_day_origin)) o.job_day_origin = m.job_day_origin;
     }
-    // The live days of a day 1 that has at least one live extra day, day 1
-    // first; null for a one-day job and for an extra day.
-    const familyDaysOf = (o) => {
-      if (famId(o.parent_order_id)) return null;
-      const f = familyRowFacts(fam, o);
-      if (!f || !f.day_m || f.day_m < 2) return null;
-      return fam.orders.filter((m) => (m.id === o.id || m.parent_order_id === o.id) && (familyRowFacts(fam, m) || {}).day_n)
-        .sort((a, b) => familyRowFacts(fam, a).day_n - familyRowFacts(fam, b).day_n);
+    // A day 1 with at least one live extra day: { days, problem }, where
+    // days are the live days at a BOOKED stage (invoiced, deposit_paid,
+    // paid_full), day 1 first, the only days its email may list, and
+    // problem is true when a live day is not booked (a linked lead still
+    // quoted) or two live days share a calendar day. Null for a one-day job
+    // and for an extra day. Worked out once per order.
+    const familyMemo = new Map();
+    const familyOf = (o) => {
+      if (familyMemo.has(o.id)) return familyMemo.get(o.id);
+      let out = null;
+      const f = famId(o.parent_order_id) ? null : familyRowFacts(fam, o);
+      if (f && f.day_m && f.day_m >= 2) {
+        const live = fam.orders.filter((m) => (m.id === o.id || m.parent_order_id === o.id) && (familyRowFacts(fam, m) || {}).day_n)
+          .sort((a, b) => familyRowFacts(fam, a).day_n - familyRowFacts(fam, b).day_n);
+        const days = live.filter((m) => RECONFIRM_FAMILY_BOOKED.includes(String(m.stage || '')));
+        const dayList = live.map(familyDayOf);
+        out = { days, problem: days.length !== live.length || new Set(dayList).size !== dayList.length };
+      }
+      familyMemo.set(o.id, out);
+      return out;
     };
-    // multi_day: Jarvis's calendar check (migration 072) holds an open
-    // finding that this job's coconuts by day disagree with its invoice.
-    // Read only when a multi-day job is in view. Before 072 the table
-    // answers 404 and nothing holds; any other failure makes the multi-day
-    // jobs wait an hour (fail closed), one-day jobs carry on.
-    const familyHeads = [...byId.values()].filter((o) => familyDaysOf(o));
+    // The days one email lists (two or more booked days), else null.
+    const familyDaysOf = (o) => {
+      const f = familyOf(o);
+      return f && f.days.length >= 2 ? f.days : null;
+    };
+    // multi_day holds day 1's email (its words: "coconuts by day not
+    // confirmed against the invoice"). Three ways:
+    // (a) Jarvis's calendar check (migration 072) keeps an open
+    //     count_differs, days_differ, days_undated, day_not_on_invoice or
+    //     day_link finding on day 1, on one of its extra days, or on day 1's
+    //     invoice (a day_link on a day that is NOT linked yet names day 1's
+    //     invoice). Read for EVERY day 1 in view, one-day jobs included: the
+    //     unlinked second day of a two-day job is exactly what it catches.
+    //     Any read failure other than 404 makes the multi-day jobs wait an
+    //     hour untouched; a one-day job carries on (fail open).
+    // (b) FAIL CLOSED for a job that is already multi-day: its email holds
+    //     until a calendar check run in the last 36 hours fully checked its
+    //     day 1 (hc_calendar_runs.checked_orders or checked_invoices). Order
+    //     rows store no invoice coconut count, so nothing else can tell a
+    //     day 1 put back at the whole invoice count next to its extra days.
+    //     Before 072 (404) every multi-day job holds; the owner confirms
+    //     with the client himself (design 14g).
+    // (c) a live day not at a booked stage, or two live days on one day.
+    const dayOnes = [...byId.values()].filter((o) => !famId(o.parent_order_id) && !famId(o.job_day_origin));
+    const familyHeads = dayOnes.filter((o) => familyOf(o));
     const multiDaySet = new Set();
     let familyHeadsBlocked = false;
-    if (familyHeads.length) {
+    // Before migration 072 the calendar tables answer 404, and the hold
+    // check on order_reconfirmations does not admit multi_day yet (the
+    // write falls back to date_unverified, see patchReconfirmation).
+    let calendarTablesMissing = false;
+    if (dayOnes.length) {
       const memberToHead = new Map();
       const qboToHead = new Map();
-      for (const h of familyHeads) {
+      for (const h of dayOnes) {
         memberToHead.set(h.id, h.id);
         for (const m of fam.orders) if (m.parent_order_id === h.id) memberToHead.set(m.id, h.id);
         const q = famId(h.external_invoice_id);
         if (q && /^[1-9][0-9]{0,19}$/.test(q)) qboToHead.set(q, h.id);
       }
-      const parts = ['order_id.in.(' + [...memberToHead.keys()].join(',') + ')'];
-      if (qboToHead.size) parts.push('qbo_id.in.(' + [...qboToHead.keys()].join(',') + ')');
-      const r = await familyGet(env, 'hc_calendar_findings?select=order_id,qbo_id,code&status=eq.open&code=in.(' +
-        RECONFIRM_MULTI_DAY_CODES.join(',') + ')&or=(' + parts.join(',') + ')&order=id.asc&limit=1000');
-      if (r.ok) {
-        for (const x of r.rows) {
-          const h = memberToHead.get(x.order_id) || qboToHead.get(String(x.qbo_id == null ? '' : x.qbo_id));
-          if (h) multiDaySet.add(h);
+      const ids = [...memberToHead.keys()].filter((id) => UUID_RE.test(String(id)));
+      const qbos = [...qboToHead.keys()];
+      // Normally one GET; 60 order ids (and up to 60 invoice ids) a GET.
+      for (let i = 0; i < Math.max(ids.length, qbos.length); i += 60) {
+        const parts = [];
+        if (ids.slice(i, i + 60).length) parts.push('order_id.in.(' + ids.slice(i, i + 60).join(',') + ')');
+        if (qbos.slice(i, i + 60).length) parts.push('qbo_id.in.(' + qbos.slice(i, i + 60).join(',') + ')');
+        const r = await familyGet(env, 'hc_calendar_findings?select=order_id,qbo_id,code&status=eq.open&code=in.(' +
+          RECONFIRM_MULTI_DAY_CODES.join(',') + ')&or=(' + parts.join(',') + ')&order=id.asc&limit=1000');
+        if (r.ok) {
+          for (const x of r.rows) {
+            const h = memberToHead.get(x.order_id) || qboToHead.get(String(x.qbo_id == null ? '' : x.qbo_id));
+            if (h) multiDaySet.add(h);
+          }
+          continue;
         }
-      } else if (r.status !== 404) {
+        if (r.status === 404) { calendarTablesMissing = true; break; }
         familyHeadsBlocked = true;
         console.error('reconfirmation scan: calendar findings read failed (' + r.status + '), multi-day jobs wait an hour');
+        break;
       }
     }
+    if (familyHeads.length && !familyHeadsBlocked) {
+      const since = new Date(nowMs - RECONFIRM_CALENDAR_RUN_FRESH_MS).toISOString();
+      const r = await familyGet(env, 'hc_calendar_runs?select=id,finished_at,checked_orders,checked_invoices&finished_at=gte.' + since + '&order=id.desc&limit=20');
+      if (r.ok) {
+        for (const h of familyHeads) {
+          const q = famId(h.external_invoice_id);
+          const checked = r.rows.some((run) => (Array.isArray(run.checked_orders) && run.checked_orders.map(String).includes(String(h.id)))
+            || (!!q && Array.isArray(run.checked_invoices) && run.checked_invoices.map(String).includes(q)));
+          if (!checked) multiDaySet.add(h.id);
+        }
+      } else if (r.status === 404) {
+        calendarTablesMissing = true;
+        for (const h of familyHeads) multiDaySet.add(h.id);
+      } else {
+        familyHeadsBlocked = true;
+        console.error('reconfirmation scan: calendar run read failed (' + r.status + '), multi-day jobs wait an hour');
+      }
+    }
+    for (const h of familyHeads) if (familyOf(h).problem) multiDaySet.add(h.id);
     // Undecided Time change? proposals hold a draft until the owner decides.
     const candidateIds = [...byId.keys()];
     const pending = candidateIds.length
@@ -2541,10 +2618,10 @@ export async function runReconfirmationScan(env) {
             continue;
           }
           const ownerHeld = row.status === 'held' && (row.hold_reasons || []).includes('owner_hold');
-          // A multi-day job whose calendar findings could not be read
-          // waits an hour untouched (no rewrite, no release).
+          // A multi-day job whose calendar findings or runs could not be
+          // read waits an hour untouched (no rewrite, no release).
           const familyDays = familyDaysOf(o);
-          if (familyDays && familyHeadsBlocked) { counts.skipped++; continue; }
+          if (familyOf(o) && familyHeadsBlocked) { counts.skipped++; continue; }
           // The facts are recomputed BEFORE anything else happens to the
           // row: a hold that was fixed lifts, a stale body (the droplet's
           // 'facts changed at send time' requeue included) is rewritten,
@@ -2554,7 +2631,16 @@ export async function runReconfirmationScan(env) {
           const wantHeld = draft.holds.length > 0;
           const wasHeld = row.status === 'held';
           const reasonsNow = ownerHeld ? ['owner_hold', ...draft.holds] : draft.holds;
-          const reasonsChanged = JSON.stringify(reasonsNow) !== JSON.stringify(row.hold_reasons || []);
+          // Before 072 the hold check refuses multi_day, so the row holds
+          // the fallback list (multi_day written as date_unverified). That
+          // stored list IS today's list: comparing it to multi_day would
+          // rewrite the row (refused, then the fallback) every hour. Once
+          // 072 is live (the calendar tables answer) the next tick writes
+          // multi_day itself, once; 072 must widen the check by then.
+          const storedReasons = row.hold_reasons || [];
+          const storedAsFallback = calendarTablesMissing && reasonsNow.includes('multi_day')
+            && JSON.stringify(reconfirmWithoutMultiDay({ hold_reasons: reasonsNow }).hold_reasons) === JSON.stringify(storedReasons);
+          const reasonsChanged = JSON.stringify(reasonsNow) !== JSON.stringify(storedReasons) && !storedAsFallback;
           const testToChanged = factText(row.test_to) !== testTo;
           // The text the template makes now against the text on the row: a
           // template change shipped in the worker (new wording) reaches the
@@ -2709,7 +2795,7 @@ export async function runReconfirmationScan(env) {
         if (emailedOrders.has(o.id)) { counts.skipped++; continue; }
         if (!reconfirmInDraftHours(nowMs, e.market)) continue;
         const familyDays = familyDaysOf(o);
-        if (familyDays && familyHeadsBlocked) { counts.skipped++; continue; }
+        if (familyOf(o) && familyHeadsBlocked) { counts.skipped++; continue; }
         counts.seen++;
         const draft = reconfirmDraft(o, { deliveryDay: e.deliveryDay, pendingProposal: pendingSet.has(o.id), pendingAddressProposal: pendingAddressSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(o.id), today: e.today, familyDays, multiDay: multiDaySet.has(o.id) });
         const held = draft.holds.length > 0;
@@ -9641,6 +9727,9 @@ export function proposalTexts(kind, order, ctx) {
     const why = c.why === 'no_text_layer' ? 'PDF attached, NOT readable (no text layer). Open it in Outlook.'
       : c.why === 'reader_missing' ? 'PDF reader not installed, NOT read. Open it in Outlook.'
       : c.why === 'pdf_no_time' ? 'PDF read, no arrival time found. Open it in Outlook, then set the time in Calendar if it changed.'
+      // A job that runs several days (calendar families): the times may be
+      // for different days, so nothing is proposed or changed.
+      : c.why === 'family_times' ? 'Times for a job that runs several days. Nothing was changed: open it in Outlook, then set each day in its delivery sheet in Calendar.'
       : 'No attachment; no clock time in the email. Open it in Outlook.';
     return { title: `Coordinator email: ${tag}${venue ? ' / ' + venue : ''}, ${day}`, body: why, managerBody: null };
   }
@@ -10098,7 +10187,7 @@ export async function runArtworkFollowUps(env, counts, nowMs, nowIso) {
 async function fetchProposalIntakes(env, since) {
   const select = (withReplayColumns) => 'intake_messages?select=id,subject,raw_text,order_id,conversation_id,created_at,error_detail' +
     (withReplayColumns ? ',replayed_at,address_scanned_at' : '') + ',' +
-    'orders!inner(id,client_name,client_email,market,venue,delivery_notes,delivery_at_utc,delivery_request,stage,invoice_fulfillment,external_invoice_id,event_start_at)' +
+    'orders!inner(id,client_name,client_email,market,venue,delivery_notes,delivery_at_utc,delivery_request,stage,invoice_fulfillment,external_invoice_id,event_start_at,parent_order_id)' +
     '&status=eq.pending_review&order_id=not.is.null&classified_at=not.is.null' +
     '&orders.delivery_at_utc=gte.' + since + 'T00:00:00Z&order=created_at.desc&limit=50';
   try {
@@ -10120,7 +10209,7 @@ async function fetchProposalIntakes(env, since) {
   }
 }
 export async function runProposalScan(env) {
-  const counts = { seen: 0, proposed: 0, noTime: 0, agree: 0, stale: 0, skipped: 0, failed: 0, replayed: 0, address: null, artwork: null };
+  const counts = { seen: 0, proposed: 0, noTime: 0, familyTimes: 0, agree: 0, stale: 0, skipped: 0, failed: 0, replayed: 0, address: null, artwork: null };
   const addressOn = addressProposalsOn(env);
   const artworkOn = artworkProposalsOn(env);
   // geocoded counts Apple calls this tick: more than one per email across
@@ -10146,6 +10235,13 @@ export async function runProposalScan(env) {
       // thread or reply link names a sent row; every other email is read
       // as before.
       const sentBodies = await reconfirmSentBodies(env, rows.map((r) => r.order_id));
+      // Job families (calendar accuracy): read once, and only when an email
+      // with a clock time needs it. Null when the read failed.
+      let familyRead;
+      const familyForRows = async () => {
+        if (familyRead === undefined) familyRead = await loadJobFamilies(env, rows.map((r) => r.orders).filter(Boolean));
+        return familyRead;
+      };
       for (const row of rows.slice().reverse()) {
         counts.seen++;
         try {
@@ -10202,6 +10298,40 @@ export async function runProposalScan(env) {
               }
               counts.noTime++;
               return 'none';
+            }
+            // A job that runs several days: each day has its own time
+            // (contract 4c), but this scan knows ONE order, and the email
+            // ("Wednesday 8:00 AM and Thursday 9:00 AM", or a time typed
+            // into a quoted day bullet) may name times for other days. A
+            // Time change? row would move the linked day's alarm to the
+            // first time found. So no proposal: one owner card per email
+            // ("set each day in its delivery sheet"), the linked_no_time
+            // shape and mark. Multi-day means the linked order is a live
+            // day of a job with two or more live days, or the email is a
+            // reply to a multi-day reconfirmation. A failed family read
+            // makes the email wait for the next tick (it is not marked).
+            const familyBody = reconfirmIsFamilyBody(sentBody);
+            const famNow = familyBody ? null : await familyForRows();
+            if (!familyBody && !famNow) {
+              counts.skipped++;
+              console.error('proposal scan: job family read failed, intake #' + row.id + ' waits a tick');
+              return 'none';
+            }
+            const famRow = famNow ? familyRowFacts(famNow, o) : null;
+            if (familyBody || (famRow && famRow.day_m >= 2)) {
+              if (replayed) { counts.familyTimes++; return 'family'; }
+              if (String(row.error_detail || '').startsWith(LINKED_NO_TIME_MARK)) { counts.skipped++; return 'family'; }
+              const texts = proposalTexts('linked_no_time', o, { day, why: 'family_times' });
+              const id = await derivedQueueId('hc-linked-v1', String(row.id));
+              const sent = await sendPushToMarket(env, market, texts.title, texts.body, { recipients: 'manage', queueId: id, collapseId: 'link-' + row.id, threadId: 'link-' + row.id, kind: 'linked_no_time', orderId: o.id, day, data: { intake_id: row.id } });
+              if (sent.queued) {
+                await webhookFetch(env.SUPABASE_URL + '/rest/v1/intake_messages?id=eq.' + row.id + '&status=eq.pending_review', {
+                  method: 'PATCH', headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+                  body: JSON.stringify({ error_detail: LINKED_NO_TIME_MARK + nowIso }),
+                }, 15000);
+              }
+              counts.familyTimes++;
+              return 'family';
             }
             const best = times[0];
             const conflicts = !onFileParsed || !onFileParsed.ok || windowsConflict({ hh: best.hh, mm: best.mm }, { hh: onFileParsed.hh, mm: onFileParsed.mm });
