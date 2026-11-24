@@ -1,0 +1,610 @@
+{
+  "name": "family-rules-cases",
+  "version": 1,
+  "contract": "CALENDAR-ACCURACY-DESIGN.md section 13 (calendar accuracy, migration 072)",
+  "how_to_use": [
+    "Every package copies this file byte for byte into its tests and pins its sha256; a copy that differs fails the test run.",
+    "HC Field (lib/job-family.js, lib/calendar-check.js), HC App (index.html family rule) and the Claudia worker (Day P&L, reconfirmation, coconut guard) must pass family_cases and finding_words.",
+    "Jarvis must pass family_cases (its Python copy of the rule), day_reader_cases (job_days.invoice_days), count_rule_cases (supabase_sync.sync_job_days and the family count rule), attach_cases (qbo_link_watch) and close_cases (calendar_check).",
+    "Every name, email, id and amount here is synthetic. Never add a real client."
+  ],
+  "formats": {
+    "money": "US dollars with a comma and two decimals, from cents: 113794 -> $1,137.94",
+    "day": "weekday short, month short, day: 2026-12-01 -> Tue Dec 1",
+    "day_prefix": "Day N of M, only when the row is a live family member and M >= 2",
+    "badge_join": "parts joined with a comma and a space"
+  },
+  "money_words": {
+    "invoice_sent": "Invoice sent",
+    "deposit_paid": "Deposit paid",
+    "paid": "Paid",
+    "cancelled": "Cancelled",
+    "job_cancelled": "Job cancelled",
+    "orphan_day": "Day of a removed job"
+  },
+  "rules": {
+    "family": "head = the order the extra days point at (orders.parent_order_id); live members = head and children whose stage is not cancelled and cancelled_at is null; N of M = position among live members sorted by delivery day then id.",
+    "money_state": "a child with no own invoice takes the head's state; any other row uses its own stage: invoiced -> invoice_sent, deposit_paid -> deposit_paid, paid_full -> paid, cancelled -> cancelled. A child whose head is cancelled -> job_cancelled. A row with job_day_origin set and no parent -> orphan_day.",
+    "open_part": "', $X open' where X = sum of open_cents of the head's attachments that are live (not detached), not voided and read (open_cents not null), when X > 0. Shown on the head and on every live child, owner only.",
+    "revenue_cents": "head or lone: own total_cents (null = 0) + total_cents of live, not voided, read attachments. Child with no own invoice: 0. Child with its own invoice: its own total. A row whose own stage is cancelled, or job_cancelled, or orphan_day: 0.",
+    "collected_cents": "head or lone: deposit_cents + balance_cents (money RECEIVED, null = 0) + (total_cents - open_cents) of live, not voided, read attachments. Child with no own invoice: 0. A row whose own stage is cancelled keeps what it received (kept deposits, today's Home rule); job_cancelled and orphan_day: 0.",
+    "pending_cents": "head or lone, stage not cancelled: max(0, total_cents - received) + open_cents of live, not voided, read attachments. Child with no own invoice: 0. Cancelled: 0.",
+    "coconuts": "each row its own coconuts_qty (null = 0); never the whole invoice on the head of a family.",
+    "in_prep": "own stage in invoiced, deposit_paid, paid_full; not cancelled; and not job_cancelled or orphan_day.",
+    "crew": "crew_badge_prefix = Day N of M or null; crew_stage = the stage code the app's existing crew word is made from (the head's stage for a child with no own invoice); crew_addon_lines = line_names of live, not voided attachments, no amounts; crew never sees money words or amounts."
+  },
+  "family_cases": [
+    {
+      "id": "F01",
+      "about": "lone paid order, no family",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000101", "stage": "paid_full", "delivery_day": "2026-12-05", "parent_order_id": null, "external_invoice_id": "9101", "job_day_origin": null, "total_cents": 100000, "deposit_cents": 0, "balance_cents": 100000, "coconuts_qty": 100, "cancelled": false}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000000101": {"day_n": null, "day_m": null, "money_state": "paid", "owner_badge": "Paid", "crew_badge_prefix": null, "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 100000, "collected_cents": 100000, "pending_cents": 0, "coconuts": 100, "in_prep": true, "findings": []}
+      },
+      "family": null
+    },
+    {
+      "id": "F02",
+      "about": "lone invoiced order, nothing received: reads Invoice sent",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000201", "stage": "invoiced", "delivery_day": "2026-11-28", "parent_order_id": null, "external_invoice_id": "9201", "job_day_origin": null, "total_cents": 85804, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 40, "cancelled": false}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000000201": {"day_n": null, "day_m": null, "money_state": "invoice_sent", "owner_badge": "Invoice sent", "crew_badge_prefix": null, "crew_stage": "invoiced", "crew_addon_lines": [], "revenue_cents": 85804, "collected_cents": 0, "pending_cents": 85804, "coconuts": 40, "in_prep": true, "findings": []}
+      },
+      "family": null
+    },
+    {
+      "id": "F03",
+      "about": "two-day job, one undated invoice on day 1, day 2 linked by the owner (paid in full)",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000301", "stage": "paid_full", "delivery_day": "2026-11-30", "parent_order_id": null, "external_invoice_id": "9301", "job_day_origin": null, "total_cents": 470000, "deposit_cents": 0, "balance_cents": 470000, "coconuts_qty": 450, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000000302", "stage": "invoiced", "delivery_day": "2026-12-01", "parent_order_id": "00000000-0000-4000-8000-000000000301", "external_invoice_id": null, "job_day_origin": "owner", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 450, "cancelled": false}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000000301": {"day_n": 1, "day_m": 2, "money_state": "paid", "owner_badge": "Day 1 of 2, Paid", "crew_badge_prefix": "Day 1 of 2", "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 470000, "collected_cents": 470000, "pending_cents": 0, "coconuts": 450, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000000302": {"day_n": 2, "day_m": 2, "money_state": "paid", "owner_badge": "Day 2 of 2, Paid", "crew_badge_prefix": "Day 2 of 2", "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 450, "in_prep": true, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000000301", "live_days": 2, "coconuts": 900, "revenue_cents": 470000, "collected_cents": 470000, "pending_cents": 0}
+    },
+    {
+      "id": "F04",
+      "about": "three-day job, paid main invoice, an attached add-on (cart rental) still open",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000401", "stage": "paid_full", "delivery_day": "2026-12-01", "parent_order_id": null, "external_invoice_id": "9401", "job_day_origin": null, "total_cents": 986429, "deposit_cents": 0, "balance_cents": 986429, "coconuts_qty": 300, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000000402", "stage": "invoiced", "delivery_day": "2026-12-02", "parent_order_id": "00000000-0000-4000-8000-000000000401", "external_invoice_id": null, "job_day_origin": "owner", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 200, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000000403", "stage": "invoiced", "delivery_day": "2026-12-03", "parent_order_id": "00000000-0000-4000-8000-000000000401", "external_invoice_id": null, "job_day_origin": "owner", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 200, "cancelled": false}
+      ],
+      "attachments": [
+        {"head_order_id": "00000000-0000-4000-8000-000000000401", "qbo_id": "9402", "role": "addon", "total_cents": 113794, "open_cents": 113794, "voided": false, "detached": false, "line_names": ["Coconut Cart Rental"]}
+      ],
+      "expect": {
+        "00000000-0000-4000-8000-000000000401": {"day_n": 1, "day_m": 3, "money_state": "paid", "owner_badge": "Day 1 of 3, Paid, $1,137.94 open", "crew_badge_prefix": "Day 1 of 3", "crew_stage": "paid_full", "crew_addon_lines": ["Coconut Cart Rental"], "revenue_cents": 1100223, "collected_cents": 986429, "pending_cents": 113794, "coconuts": 300, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000000402": {"day_n": 2, "day_m": 3, "money_state": "paid", "owner_badge": "Day 2 of 3, Paid, $1,137.94 open", "crew_badge_prefix": "Day 2 of 3", "crew_stage": "paid_full", "crew_addon_lines": ["Coconut Cart Rental"], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 200, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000000403": {"day_n": 3, "day_m": 3, "money_state": "paid", "owner_badge": "Day 3 of 3, Paid, $1,137.94 open", "crew_badge_prefix": "Day 3 of 3", "crew_stage": "paid_full", "crew_addon_lines": ["Coconut Cart Rental"], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 200, "in_prep": true, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000000401", "live_days": 3, "coconuts": 700, "revenue_cents": 1100223, "collected_cents": 986429, "pending_cents": 113794}
+    },
+    {
+      "id": "F05",
+      "about": "F04 after the add-on is paid",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000501", "stage": "paid_full", "delivery_day": "2026-12-01", "parent_order_id": null, "external_invoice_id": "9501", "job_day_origin": null, "total_cents": 986429, "deposit_cents": 0, "balance_cents": 986429, "coconuts_qty": 300, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000000502", "stage": "invoiced", "delivery_day": "2026-12-02", "parent_order_id": "00000000-0000-4000-8000-000000000501", "external_invoice_id": null, "job_day_origin": "jarvis", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 200, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000000503", "stage": "invoiced", "delivery_day": "2026-12-03", "parent_order_id": "00000000-0000-4000-8000-000000000501", "external_invoice_id": null, "job_day_origin": "jarvis", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 200, "cancelled": false}
+      ],
+      "attachments": [
+        {"head_order_id": "00000000-0000-4000-8000-000000000501", "qbo_id": "9502", "role": "addon", "total_cents": 113794, "open_cents": 0, "voided": false, "detached": false, "line_names": ["Coconut Cart Rental"]}
+      ],
+      "expect": {
+        "00000000-0000-4000-8000-000000000501": {"day_n": 1, "day_m": 3, "money_state": "paid", "owner_badge": "Day 1 of 3, Paid", "crew_badge_prefix": "Day 1 of 3", "crew_stage": "paid_full", "crew_addon_lines": ["Coconut Cart Rental"], "revenue_cents": 1100223, "collected_cents": 1100223, "pending_cents": 0, "coconuts": 300, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000000502": {"day_n": 2, "day_m": 3, "money_state": "paid", "owner_badge": "Day 2 of 3, Paid", "crew_badge_prefix": "Day 2 of 3", "crew_stage": "paid_full", "crew_addon_lines": ["Coconut Cart Rental"], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 200, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000000503": {"day_n": 3, "day_m": 3, "money_state": "paid", "owner_badge": "Day 3 of 3, Paid", "crew_badge_prefix": "Day 3 of 3", "crew_stage": "paid_full", "crew_addon_lines": ["Coconut Cart Rental"], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 200, "in_prep": true, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000000501", "live_days": 3, "coconuts": 700, "revenue_cents": 1100223, "collected_cents": 1100223, "pending_cents": 0}
+    },
+    {
+      "id": "F06",
+      "about": "a voided attachment and a detached attachment count nowhere",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000601", "stage": "paid_full", "delivery_day": "2026-12-10", "parent_order_id": null, "external_invoice_id": "9601", "job_day_origin": null, "total_cents": 200000, "deposit_cents": 0, "balance_cents": 200000, "coconuts_qty": 150, "cancelled": false}
+      ],
+      "attachments": [
+        {"head_order_id": "00000000-0000-4000-8000-000000000601", "qbo_id": "9602", "role": "addon", "total_cents": 30000, "open_cents": 30000, "voided": true, "detached": false, "line_names": ["Cooler Rental"]},
+        {"head_order_id": "00000000-0000-4000-8000-000000000601", "qbo_id": "9603", "role": "fee", "total_cents": 5000, "open_cents": 5000, "voided": false, "detached": true, "line_names": ["Card fee"]}
+      ],
+      "expect": {
+        "00000000-0000-4000-8000-000000000601": {"day_n": null, "day_m": null, "money_state": "paid", "owner_badge": "Paid", "crew_badge_prefix": null, "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 200000, "collected_cents": 200000, "pending_cents": 0, "coconuts": 150, "in_prep": true, "findings": []}
+      },
+      "family": null
+    },
+    {
+      "id": "F07",
+      "about": "head with a deposit: the extra day reads Deposit paid",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000701", "stage": "deposit_paid", "delivery_day": "2026-12-12", "parent_order_id": null, "external_invoice_id": "9701", "job_day_origin": null, "total_cents": 300000, "deposit_cents": 150000, "balance_cents": null, "coconuts_qty": 200, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000000702", "stage": "invoiced", "delivery_day": "2026-12-13", "parent_order_id": "00000000-0000-4000-8000-000000000701", "external_invoice_id": null, "job_day_origin": "owner", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 100, "cancelled": false}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000000701": {"day_n": 1, "day_m": 2, "money_state": "deposit_paid", "owner_badge": "Day 1 of 2, Deposit paid", "crew_badge_prefix": "Day 1 of 2", "crew_stage": "deposit_paid", "crew_addon_lines": [], "revenue_cents": 300000, "collected_cents": 150000, "pending_cents": 150000, "coconuts": 200, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000000702": {"day_n": 2, "day_m": 2, "money_state": "deposit_paid", "owner_badge": "Day 2 of 2, Deposit paid", "crew_badge_prefix": "Day 2 of 2", "crew_stage": "deposit_paid", "crew_addon_lines": [], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 100, "in_prep": true, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000000701", "live_days": 2, "coconuts": 300, "revenue_cents": 300000, "collected_cents": 150000, "pending_cents": 150000}
+    },
+    {
+      "id": "F08",
+      "about": "head invoiced with nothing received: the extra day reads Invoice sent",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000801", "stage": "invoiced", "delivery_day": "2026-12-14", "parent_order_id": null, "external_invoice_id": "9801", "job_day_origin": null, "total_cents": 120000, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 80, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000000802", "stage": "invoiced", "delivery_day": "2026-12-15", "parent_order_id": "00000000-0000-4000-8000-000000000801", "external_invoice_id": null, "job_day_origin": "owner", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 80, "cancelled": false}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000000801": {"day_n": 1, "day_m": 2, "money_state": "invoice_sent", "owner_badge": "Day 1 of 2, Invoice sent", "crew_badge_prefix": "Day 1 of 2", "crew_stage": "invoiced", "crew_addon_lines": [], "revenue_cents": 120000, "collected_cents": 0, "pending_cents": 120000, "coconuts": 80, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000000802": {"day_n": 2, "day_m": 2, "money_state": "invoice_sent", "owner_badge": "Day 2 of 2, Invoice sent", "crew_badge_prefix": "Day 2 of 2", "crew_stage": "invoiced", "crew_addon_lines": [], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 80, "in_prep": true, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000000801", "live_days": 2, "coconuts": 160, "revenue_cents": 120000, "collected_cents": 0, "pending_cents": 120000}
+    },
+    {
+      "id": "F09",
+      "about": "the head was cancelled (invoice voided): the extra day reads Job cancelled, leaves prep and raises a finding",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000000901", "stage": "cancelled", "delivery_day": "2026-12-16", "parent_order_id": null, "external_invoice_id": "9901", "job_day_origin": null, "total_cents": 90000, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 60, "cancelled": true},
+        {"id": "00000000-0000-4000-8000-000000000902", "stage": "invoiced", "delivery_day": "2026-12-17", "parent_order_id": "00000000-0000-4000-8000-000000000901", "external_invoice_id": null, "job_day_origin": "jarvis", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 60, "cancelled": false}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000000901": {"day_n": null, "day_m": null, "money_state": "cancelled", "owner_badge": "Cancelled", "crew_badge_prefix": null, "crew_stage": "cancelled", "crew_addon_lines": [], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 60, "in_prep": false, "findings": []},
+        "00000000-0000-4000-8000-000000000902": {"day_n": null, "day_m": null, "money_state": "job_cancelled", "owner_badge": "Job cancelled", "crew_badge_prefix": null, "crew_stage": "cancelled", "crew_addon_lines": [], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 60, "in_prep": false, "findings": ["day_of_cancelled_job"]}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000000901", "live_days": 0, "coconuts": 0, "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0}
+    },
+    {
+      "id": "F10",
+      "about": "one extra day was cancelled: M counts live days only",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000001001", "stage": "paid_full", "delivery_day": "2026-12-18", "parent_order_id": null, "external_invoice_id": "9911", "job_day_origin": null, "total_cents": 500000, "deposit_cents": 0, "balance_cents": 500000, "coconuts_qty": 200, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000001002", "stage": "invoiced", "delivery_day": "2026-12-19", "parent_order_id": "00000000-0000-4000-8000-000000001001", "external_invoice_id": null, "job_day_origin": "jarvis", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 200, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000001003", "stage": "cancelled", "delivery_day": "2026-12-20", "parent_order_id": "00000000-0000-4000-8000-000000001001", "external_invoice_id": null, "job_day_origin": "jarvis", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 100, "cancelled": true}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000001001": {"day_n": 1, "day_m": 2, "money_state": "paid", "owner_badge": "Day 1 of 2, Paid", "crew_badge_prefix": "Day 1 of 2", "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 500000, "collected_cents": 500000, "pending_cents": 0, "coconuts": 200, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000001002": {"day_n": 2, "day_m": 2, "money_state": "paid", "owner_badge": "Day 2 of 2, Paid", "crew_badge_prefix": "Day 2 of 2", "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 200, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000001003": {"day_n": null, "day_m": null, "money_state": "cancelled", "owner_badge": "Cancelled", "crew_badge_prefix": null, "crew_stage": "cancelled", "crew_addon_lines": [], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 100, "in_prep": false, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000001001", "live_days": 2, "coconuts": 400, "revenue_cents": 500000, "collected_cents": 500000, "pending_cents": 0}
+    },
+    {
+      "id": "F11",
+      "about": "a rare extra day that holds its own fee invoice keeps its own money and adds Day N of M",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000001101", "stage": "paid_full", "delivery_day": "2026-12-21", "parent_order_id": null, "external_invoice_id": "9921", "job_day_origin": null, "total_cents": 400000, "deposit_cents": 0, "balance_cents": 400000, "coconuts_qty": 300, "cancelled": false},
+        {"id": "00000000-0000-4000-8000-000000001102", "stage": "paid_full", "delivery_day": "2026-12-22", "parent_order_id": "00000000-0000-4000-8000-000000001101", "external_invoice_id": "9922", "job_day_origin": "owner", "total_cents": 15000, "deposit_cents": 0, "balance_cents": 15000, "coconuts_qty": 0, "cancelled": false}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000001101": {"day_n": 1, "day_m": 2, "money_state": "paid", "owner_badge": "Day 1 of 2, Paid", "crew_badge_prefix": "Day 1 of 2", "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 400000, "collected_cents": 400000, "pending_cents": 0, "coconuts": 300, "in_prep": true, "findings": []},
+        "00000000-0000-4000-8000-000000001102": {"day_n": 2, "day_m": 2, "money_state": "paid", "owner_badge": "Day 2 of 2, Paid", "crew_badge_prefix": "Day 2 of 2", "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 15000, "collected_cents": 15000, "pending_cents": 0, "coconuts": 0, "in_prep": true, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000001101", "live_days": 2, "coconuts": 300, "revenue_cents": 415000, "collected_cents": 415000, "pending_cents": 0}
+    },
+    {
+      "id": "F12",
+      "about": "one-day job with an open add-on: no day prefix, open part shown, crew sees the line name",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000001201", "stage": "paid_full", "delivery_day": "2026-12-23", "parent_order_id": null, "external_invoice_id": "9931", "job_day_origin": null, "total_cents": 250000, "deposit_cents": 0, "balance_cents": 250000, "coconuts_qty": 120, "cancelled": false}
+      ],
+      "attachments": [
+        {"head_order_id": "00000000-0000-4000-8000-000000001201", "qbo_id": "9932", "role": "addon", "total_cents": 40000, "open_cents": 40000, "voided": false, "detached": false, "line_names": ["Event Staffing"]}
+      ],
+      "expect": {
+        "00000000-0000-4000-8000-000000001201": {"day_n": null, "day_m": null, "money_state": "paid", "owner_badge": "Paid, $400.00 open", "crew_badge_prefix": null, "crew_stage": "paid_full", "crew_addon_lines": ["Event Staffing"], "revenue_cents": 290000, "collected_cents": 250000, "pending_cents": 40000, "coconuts": 120, "in_prep": true, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000001201", "live_days": 1, "coconuts": 120, "revenue_cents": 290000, "collected_cents": 250000, "pending_cents": 40000}
+    },
+    {
+      "id": "F13",
+      "about": "an attachment Jarvis has not read yet (totals null) counts 0 until the read",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000001301", "stage": "paid_full", "delivery_day": "2026-12-24", "parent_order_id": null, "external_invoice_id": "9941", "job_day_origin": null, "total_cents": 250000, "deposit_cents": 0, "balance_cents": 250000, "coconuts_qty": 90, "cancelled": false}
+      ],
+      "attachments": [
+        {"head_order_id": "00000000-0000-4000-8000-000000001301", "qbo_id": "9942", "role": "addon", "total_cents": null, "open_cents": null, "voided": false, "detached": false, "line_names": []}
+      ],
+      "expect": {
+        "00000000-0000-4000-8000-000000001301": {"day_n": null, "day_m": null, "money_state": "paid", "owner_badge": "Paid", "crew_badge_prefix": null, "crew_stage": "paid_full", "crew_addon_lines": [], "revenue_cents": 250000, "collected_cents": 250000, "pending_cents": 0, "coconuts": 90, "in_prep": true, "findings": []}
+      },
+      "family": {"head": "00000000-0000-4000-8000-000000001301", "live_days": 1, "coconuts": 90, "revenue_cents": 250000, "collected_cents": 250000, "pending_cents": 0}
+    },
+    {
+      "id": "F14",
+      "about": "an extra day whose head was deleted (link set to null by the foreign key): orphan, out of prep, finding",
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000001401", "stage": "invoiced", "delivery_day": "2026-12-26", "parent_order_id": null, "external_invoice_id": null, "job_day_origin": "jarvis", "total_cents": null, "deposit_cents": 0, "balance_cents": null, "coconuts_qty": 200, "cancelled": false}
+      ],
+      "attachments": [],
+      "expect": {
+        "00000000-0000-4000-8000-000000001401": {"day_n": null, "day_m": null, "money_state": "orphan_day", "owner_badge": "Day of a removed job", "crew_badge_prefix": null, "crew_stage": "invoiced", "crew_addon_lines": [], "revenue_cents": 0, "collected_cents": 0, "pending_cents": 0, "coconuts": 200, "in_prep": false, "findings": ["day_of_cancelled_job"]}
+      },
+      "family": null
+    }
+  ],
+  "day_reader_cases": [
+    {
+      "id": "D01",
+      "about": "three coconut lines with their own service dates (set by the connector)",
+      "ship_date": "2026-12-01",
+      "lines": [
+        {"kind": "coconut", "qty": 300, "description": "300 coconuts, Tue Dec 1", "service_date": "2026-12-01"},
+        {"kind": "coconut", "qty": 200, "description": "200 coconuts, Wed Dec 2", "service_date": "2026-12-02"},
+        {"kind": "coconut", "qty": 200, "description": "200 coconuts, Thu Dec 3", "service_date": "2026-12-03"},
+        {"kind": "staffing", "qty": 8, "description": "Attendant 10 AM to 5 PM, Tue Dec 1", "service_date": "2026-12-01"}
+      ],
+      "expect": {"split": true, "days": [["2026-12-01", 300], ["2026-12-02", 200], ["2026-12-03", 200]], "finding": null}
+    },
+    {
+      "id": "D02",
+      "about": "the same invoice after a Jarvis edit: every service date became the ship date; dated descriptions still split it",
+      "ship_date": "2026-12-01",
+      "lines": [
+        {"kind": "coconut", "qty": 300, "description": "300 coconuts, Tue Dec 1", "service_date": "2026-12-01"},
+        {"kind": "coconut", "qty": 200, "description": "200 coconuts, Wed Dec 2", "service_date": "2026-12-01"},
+        {"kind": "coconut", "qty": 200, "description": "200 coconuts, Thu Dec 3", "service_date": "2026-12-01"}
+      ],
+      "expect": {"split": true, "days": [["2026-12-01", 300], ["2026-12-02", 200], ["2026-12-03", 200]], "finding": null}
+    },
+    {
+      "id": "D03",
+      "about": "after a Jarvis edit with undated descriptions: service dates all equal the ship date and carry no day, so no split",
+      "ship_date": "2026-12-01",
+      "lines": [
+        {"kind": "coconut", "qty": 200, "description": "200 white diamond coconuts", "service_date": "2026-12-01"},
+        {"kind": "coconut", "qty": 300, "description": "300 white diamond coconuts", "service_date": "2026-12-01"},
+        {"kind": "coconut", "qty": 200, "description": "200 white diamond coconuts", "service_date": "2026-12-01"}
+      ],
+      "expect": {"split": false, "days": null, "finding": "days_undated"}
+    },
+    {
+      "id": "D04",
+      "about": "undated descriptions but distinct service dates (a connector edit): the service dates decide",
+      "ship_date": "2026-12-01",
+      "lines": [
+        {"kind": "coconut", "qty": 200, "description": "200 white diamond coconuts", "service_date": "2026-12-01"},
+        {"kind": "coconut", "qty": 300, "description": "300 white diamond coconuts", "service_date": "2026-12-02"},
+        {"kind": "coconut", "qty": 200, "description": "200 white diamond coconuts", "service_date": "2026-12-03"}
+      ],
+      "expect": {"split": true, "days": [["2026-12-01", 200], ["2026-12-02", 300], ["2026-12-03", 200]], "finding": null}
+    },
+    {
+      "id": "D05",
+      "about": "one coconut line naming two event days is ONE delivery: never split",
+      "ship_date": "2026-11-25",
+      "lines": [
+        {"kind": "coconut", "qty": 80, "description": "35 for Wednesday 11/25 (3 PM) and 45 for Friday 11/27", "service_date": "2026-11-25"},
+        {"kind": "delivery", "qty": 1, "description": "Delivery", "service_date": "2026-11-25"}
+      ],
+      "expect": {"split": false, "days": [["2026-11-25", 80]], "finding": null}
+    },
+    {
+      "id": "D06",
+      "about": "one undated line and no ship date: no day at all",
+      "ship_date": null,
+      "lines": [
+        {"kind": "coconut", "qty": 900, "description": "900 custom branded coconuts", "service_date": null}
+      ],
+      "expect": {"split": false, "days": null, "finding": "no_ship_date"}
+    },
+    {
+      "id": "D07",
+      "about": "one undated line with a ship date: one day",
+      "ship_date": "2026-11-30",
+      "lines": [
+        {"kind": "coconut", "qty": 900, "description": "900 custom branded coconuts", "service_date": "2026-11-30"}
+      ],
+      "expect": {"split": false, "days": [["2026-11-30", 900]], "finding": null}
+    },
+    {
+      "id": "D08",
+      "about": "two coconut lines where one line names two days and its service date is only the ship date: cannot split",
+      "ship_date": "2026-12-01",
+      "lines": [
+        {"kind": "coconut", "qty": 200, "description": "100 on Dec 1 and 100 on Dec 2", "service_date": "2026-12-01"},
+        {"kind": "coconut", "qty": 100, "description": "100 on Dec 3", "service_date": "2026-12-01"}
+      ],
+      "expect": {"split": false, "days": null, "finding": "days_undated"}
+    },
+    {
+      "id": "D09",
+      "about": "two coconut lines on the same day are one day (summed)",
+      "ship_date": "2026-12-01",
+      "lines": [
+        {"kind": "coconut", "qty": 100, "description": "100 white coconuts, Dec 1", "service_date": "2026-12-01"},
+        {"kind": "coconut", "qty": 50, "description": "50 branded coconuts, Dec 1", "service_date": "2026-12-01"}
+      ],
+      "expect": {"split": false, "days": [["2026-12-01", 150]], "finding": null}
+    },
+    {
+      "id": "D10",
+      "about": "a description date takes the year nearest the ship date (New Year)",
+      "ship_date": "2026-12-31",
+      "lines": [
+        {"kind": "coconut", "qty": 150, "description": "150 coconuts Thu Dec 31", "service_date": "2026-12-31"},
+        {"kind": "coconut", "qty": 150, "description": "150 coconuts Fri Jan 1", "service_date": "2026-12-31"}
+      ],
+      "expect": {"split": true, "days": [["2026-12-31", 150], ["2027-01-01", 150]], "finding": null}
+    },
+    {
+      "id": "D11",
+      "about": "the date shapes the reader accepts",
+      "ship_date": "2026-12-02",
+      "lines": [
+        {"kind": "coconut", "qty": 100, "description": "100 coconuts on 12/2", "service_date": "2026-12-02"},
+        {"kind": "coconut", "qty": 100, "description": "100 coconuts on December 3", "service_date": "2026-12-02"},
+        {"kind": "coconut", "qty": 100, "description": "100 coconuts on 2026-12-04", "service_date": "2026-12-02"}
+      ],
+      "expect": {"split": true, "days": [["2026-12-02", 100], ["2026-12-03", 100], ["2026-12-04", 100]], "finding": null}
+    },
+    {
+      "id": "D12",
+      "about": "a dated description wins over a service date that disagrees",
+      "ship_date": "2026-12-01",
+      "lines": [
+        {"kind": "coconut", "qty": 300, "description": "300 coconuts, Tue Dec 1", "service_date": "2026-12-02"},
+        {"kind": "coconut", "qty": 200, "description": "200 coconuts, Wed Dec 2", "service_date": "2026-12-01"}
+      ],
+      "expect": {"split": true, "days": [["2026-12-01", 300], ["2026-12-02", 200]], "finding": null}
+    }
+  ],
+  "count_rule_cases": [
+    {
+      "id": "C01",
+      "about": "undated two-day family already consistent: nothing to write",
+      "switch": "off", "keep_count": false,
+      "invoice": {"count": 900, "total_cents": 470000, "days": null},
+      "head": {"day": "2026-11-30", "count": 450, "total_cents": 470000},
+      "extra_days": [{"day": "2026-12-01", "count": 450, "origin": "owner", "job_day_of": null}],
+      "expect": {"creates": [], "adopts": [], "writes": [], "findings": []}
+    },
+    {
+      "id": "C02",
+      "about": "an old re-sync left the whole invoice count on day 1: the rule writes invoice minus extra days",
+      "switch": "off", "keep_count": false,
+      "invoice": {"count": 900, "total_cents": 470000, "days": null},
+      "head": {"day": "2026-11-30", "count": 900, "total_cents": 470000},
+      "extra_days": [{"day": "2026-12-01", "count": 450, "origin": "owner", "job_day_of": null}],
+      "expect": {"creates": [], "adopts": [], "writes": [["head", 450]], "findings": []}
+    },
+    {
+      "id": "C03",
+      "about": "the owner changed day 1 on purpose (totals agree): keep it, raise count_differs",
+      "switch": "on", "keep_count": false,
+      "invoice": {"count": 900, "total_cents": 470000, "days": null},
+      "head": {"day": "2026-11-30", "count": 400, "total_cents": 470000},
+      "extra_days": [{"day": "2026-12-01", "count": 450, "origin": "owner", "job_day_of": null}],
+      "expect": {"creates": [], "adopts": [], "writes": [], "findings": ["count_differs"]}
+    },
+    {
+      "id": "C04",
+      "about": "families on, dated invoice, no extra days yet: create them and lower day 1",
+      "switch": "on", "keep_count": false,
+      "invoice": {"count": 700, "total_cents": 986429, "days": [["2026-12-01", 300], ["2026-12-02", 200], ["2026-12-03", 200]]},
+      "head": {"day": "2026-12-01", "count": 700, "total_cents": 986429},
+      "extra_days": [],
+      "expect": {"creates": [["2026-12-02", 200], ["2026-12-03", 200]], "adopts": [], "writes": [["head", 300]], "findings": []}
+    },
+    {
+      "id": "C05",
+      "about": "the same in report mode: nothing written, the report lists what on would do",
+      "switch": "report", "keep_count": false,
+      "invoice": {"count": 700, "total_cents": 986429, "days": [["2026-12-01", 300], ["2026-12-02", 200], ["2026-12-03", 200]]},
+      "head": {"day": "2026-12-01", "count": 700, "total_cents": 986429},
+      "extra_days": [],
+      "expect": {"creates": [], "adopts": [], "writes": [], "findings": ["days_differ"],
+                 "report": [["create_day", "2026-12-02", 200], ["create_day", "2026-12-03", 200], ["set_count", "head", 300]]}
+    },
+    {
+      "id": "C06",
+      "about": "hand-made extra days (fast lane) that match the dated invoice: adopted, origin kept, no count writes",
+      "switch": "on", "keep_count": false,
+      "invoice": {"count": 700, "total_cents": 986429, "days": [["2026-12-01", 300], ["2026-12-02", 200], ["2026-12-03", 200]]},
+      "head": {"day": "2026-12-01", "count": 300, "total_cents": 986429},
+      "extra_days": [{"day": "2026-12-02", "count": 200, "origin": "owner", "job_day_of": null}, {"day": "2026-12-03", "count": 200, "origin": "owner", "job_day_of": null}],
+      "expect": {"creates": [], "adopts": ["2026-12-02", "2026-12-03"], "writes": [], "findings": []}
+    },
+    {
+      "id": "C07",
+      "about": "hand-made days follow the client plan but the invoice still has days 1 and 2 swapped (totals agree): adopt, no writes, days_differ",
+      "switch": "on", "keep_count": false,
+      "invoice": {"count": 700, "total_cents": 986429, "days": [["2026-12-01", 200], ["2026-12-02", 300], ["2026-12-03", 200]]},
+      "head": {"day": "2026-12-01", "count": 300, "total_cents": 986429},
+      "extra_days": [{"day": "2026-12-02", "count": 200, "origin": "owner", "job_day_of": null}, {"day": "2026-12-03", "count": 200, "origin": "owner", "job_day_of": null}],
+      "expect": {"creates": [], "adopts": ["2026-12-02", "2026-12-03"], "writes": [], "findings": ["days_differ"]}
+    },
+    {
+      "id": "C08",
+      "about": "families off, a Jarvis edit changed the total and day 3's line: existing days follow the dated lines, nothing is created",
+      "switch": "off", "keep_count": false,
+      "invoice": {"count": 720, "total_cents": 1014429, "days": [["2026-12-01", 300], ["2026-12-02", 200], ["2026-12-03", 220]]},
+      "head": {"day": "2026-12-01", "count": 300, "total_cents": 986429},
+      "extra_days": [{"day": "2026-12-02", "count": 200, "origin": "jarvis", "job_day_of": "9401"}, {"day": "2026-12-03", "count": 200, "origin": "jarvis", "job_day_of": "9401"}],
+      "expect": {"creates": [], "adopts": [], "writes": [["2026-12-03", 220]], "findings": []}
+    },
+    {
+      "id": "C09",
+      "about": "undated family where the extra days hold more than the invoice: keep everything, raise count_differs",
+      "switch": "on", "keep_count": false,
+      "invoice": {"count": 300, "total_cents": 150000, "days": null},
+      "head": {"day": "2026-12-05", "count": 300, "total_cents": 150000},
+      "extra_days": [{"day": "2026-12-06", "count": 450, "origin": "owner", "job_day_of": null}],
+      "expect": {"creates": [], "adopts": [], "writes": [], "findings": ["count_differs"]}
+    },
+    {
+      "id": "C10",
+      "about": "keep_count (the change watch, totals agree): never writes counts, only findings",
+      "switch": "on", "keep_count": true,
+      "invoice": {"count": 900, "total_cents": 470000, "days": null},
+      "head": {"day": "2026-11-30", "count": 900, "total_cents": 470000},
+      "extra_days": [{"day": "2026-12-01", "count": 450, "origin": "owner", "job_day_of": null}],
+      "expect": {"creates": [], "adopts": [], "writes": [], "findings": ["count_differs"]}
+    },
+    {
+      "id": "C11",
+      "about": "a lone order (no extra days) keeps today's behavior: an edit writes the invoice count",
+      "switch": "on", "keep_count": false,
+      "invoice": {"count": 120, "total_cents": 96000, "days": null},
+      "head": {"day": "2026-12-07", "count": 100, "total_cents": 80000},
+      "extra_days": [],
+      "expect": {"creates": [], "adopts": [], "writes": [["head", 120]], "findings": []}
+    }
+  ],
+  "attach_cases": [
+    {
+      "id": "A01",
+      "about": "add-on (no coconuts), same email, ship date on the head's day: attach to the head",
+      "switch": "on",
+      "invoice": {"qbo_id": "9951", "coconuts": false, "fee_only": false, "email": "client-a@example.test", "ship_date": "2026-12-01", "txn_date": "2026-11-20"},
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000005101", "email": "client-a@example.test", "stage": "paid_full", "day": "2026-12-01", "external_invoice_id": "9950", "parent_order_id": null}
+      ],
+      "attached_live": [],
+      "expect": {"action": "attach", "head": "00000000-0000-4000-8000-000000005101", "role": "addon"}
+    },
+    {
+      "id": "A02",
+      "about": "add-on dated on an extra day: matched through that day's head",
+      "switch": "on",
+      "invoice": {"qbo_id": "9953", "coconuts": false, "fee_only": false, "email": "client-a@example.test", "ship_date": "2026-12-02", "txn_date": "2026-11-20"},
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000005201", "email": "client-a@example.test", "stage": "paid_full", "day": "2026-12-01", "external_invoice_id": "9952", "parent_order_id": null},
+        {"id": "00000000-0000-4000-8000-000000005202", "email": "client-a@example.test", "stage": "invoiced", "day": "2026-12-02", "external_invoice_id": null, "parent_order_id": "00000000-0000-4000-8000-000000005201"}
+      ],
+      "attached_live": [],
+      "expect": {"action": "attach", "head": "00000000-0000-4000-8000-000000005201", "role": "addon"}
+    },
+    {
+      "id": "A03",
+      "about": "fee-only invoice with exactly one booked order of that customer within 14 days of its date: attach as fee",
+      "switch": "on",
+      "invoice": {"qbo_id": "9955", "coconuts": false, "fee_only": true, "email": "client-b@example.test", "ship_date": null, "txn_date": "2026-11-20"},
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000005301", "email": "client-b@example.test", "stage": "paid_full", "day": "2026-11-28", "external_invoice_id": "9954", "parent_order_id": null}
+      ],
+      "attached_live": [],
+      "expect": {"action": "attach", "head": "00000000-0000-4000-8000-000000005301", "role": "fee"}
+    },
+    {
+      "id": "A04",
+      "about": "fee-only invoice for a weekly client with two booked orders in the window: never guess",
+      "switch": "on",
+      "invoice": {"qbo_id": "9958", "coconuts": false, "fee_only": true, "email": "client-c@example.test", "ship_date": null, "txn_date": "2026-11-20"},
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000005401", "email": "client-c@example.test", "stage": "paid_full", "day": "2026-11-19", "external_invoice_id": "9956", "parent_order_id": null},
+        {"id": "00000000-0000-4000-8000-000000005402", "email": "client-c@example.test", "stage": "invoiced", "day": "2026-11-26", "external_invoice_id": "9957", "parent_order_id": null}
+      ],
+      "attached_live": [],
+      "expect": {"action": "unlinked_invoice", "head": null, "role": null}
+    },
+    {
+      "id": "A05",
+      "about": "an invoice already attached is never merged onto a new open lead of the same email",
+      "switch": "on",
+      "invoice": {"qbo_id": "9960", "coconuts": false, "fee_only": false, "email": "client-a@example.test", "ship_date": "2026-12-01", "txn_date": "2026-11-20"},
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000005501", "email": "client-a@example.test", "stage": "paid_full", "day": "2026-12-01", "external_invoice_id": "9959", "parent_order_id": null},
+        {"id": "00000000-0000-4000-8000-000000005502", "email": "client-a@example.test", "stage": "inquiry", "day": "2027-03-10", "external_invoice_id": null, "parent_order_id": null}
+      ],
+      "attached_live": ["9960"],
+      "expect": {"action": "skip", "head": null, "role": null}
+    },
+    {
+      "id": "A06",
+      "about": "families off: the add-on stays held exactly as today, nothing attached",
+      "switch": "off",
+      "invoice": {"qbo_id": "9962", "coconuts": false, "fee_only": false, "email": "client-a@example.test", "ship_date": "2026-12-01", "txn_date": "2026-11-20"},
+      "orders": [
+        {"id": "00000000-0000-4000-8000-000000005601", "email": "client-a@example.test", "stage": "paid_full", "day": "2026-12-01", "external_invoice_id": "9961", "parent_order_id": null}
+      ],
+      "attached_live": [],
+      "expect": {"action": "hold", "head": null, "role": null}
+    }
+  ],
+  "close_cases": [
+    {
+      "id": "P01",
+      "about": "a complete run closes an open finding it did not see again",
+      "run": {"complete": true, "checked_orders": ["00000000-0000-4000-8000-000000006101"], "checked_invoices": []},
+      "before": [{"key": "no_time:order:00000000-0000-4000-8000-000000006101", "status": "open", "fingerprint": "f1", "order_id": "00000000-0000-4000-8000-000000006101", "qbo_id": null}],
+      "seen": [],
+      "expect": {"after": {"no_time:order:00000000-0000-4000-8000-000000006101": "closed"}, "push_allowed": true}
+    },
+    {
+      "id": "P02",
+      "about": "a run cut short leaves findings on subjects it never checked open, and sends no push",
+      "run": {"complete": false, "checked_orders": [], "checked_invoices": []},
+      "before": [{"key": "no_time:order:00000000-0000-4000-8000-000000006201", "status": "open", "fingerprint": "f1", "order_id": "00000000-0000-4000-8000-000000006201", "qbo_id": null}],
+      "seen": [{"key": "count_missing:order:00000000-0000-4000-8000-000000006202", "fingerprint": "f9", "order_id": "00000000-0000-4000-8000-000000006202", "qbo_id": null, "job_day": "2026-12-01"}],
+      "expect": {"after": {"no_time:order:00000000-0000-4000-8000-000000006201": "open", "count_missing:order:00000000-0000-4000-8000-000000006202": "open"}, "push_allowed": false}
+    },
+    {
+      "id": "P03",
+      "about": "a run cut short still closes a finding on a subject it fully checked, but sends no push",
+      "run": {"complete": false, "checked_orders": ["00000000-0000-4000-8000-000000006301"], "checked_invoices": []},
+      "before": [{"key": "no_time:order:00000000-0000-4000-8000-000000006301", "status": "open", "fingerprint": "f1", "order_id": "00000000-0000-4000-8000-000000006301", "qbo_id": null}],
+      "seen": [],
+      "expect": {"after": {"no_time:order:00000000-0000-4000-8000-000000006301": "closed"}, "push_allowed": false}
+    },
+    {
+      "id": "P04",
+      "about": "a dismissed finding stays dismissed while its facts are the same and reopens when they change",
+      "run": {"complete": true, "checked_orders": ["00000000-0000-4000-8000-000000006401", "00000000-0000-4000-8000-000000006402"], "checked_invoices": []},
+      "before": [
+        {"key": "cut_review:order:00000000-0000-4000-8000-000000006401", "status": "dismissed", "fingerprint": "f1", "order_id": "00000000-0000-4000-8000-000000006401", "qbo_id": null},
+        {"key": "cut_review:order:00000000-0000-4000-8000-000000006402", "status": "dismissed", "fingerprint": "f1", "order_id": "00000000-0000-4000-8000-000000006402", "qbo_id": null}
+      ],
+      "seen": [
+        {"key": "cut_review:order:00000000-0000-4000-8000-000000006401", "fingerprint": "f1", "order_id": "00000000-0000-4000-8000-000000006401", "qbo_id": null, "job_day": "2026-12-05"},
+        {"key": "cut_review:order:00000000-0000-4000-8000-000000006402", "fingerprint": "f2", "order_id": "00000000-0000-4000-8000-000000006402", "qbo_id": null, "job_day": "2026-12-05"}
+      ],
+      "expect": {"after": {"cut_review:order:00000000-0000-4000-8000-000000006401": "dismissed", "cut_review:order:00000000-0000-4000-8000-000000006402": "open"}, "push_allowed": true}
+    }
+  ],
+  "finding_words": {
+    "rules": [
+      "Row title: {client}, {day}. Row line: the words below. Never an email address, a phone number or a dollar sign (lib/needs-you.js rule); amounts appear only on the card sheet.",
+      "Every row has ONE action button (below) and one way to say it is fine (the second label, stored with the facts fingerprint; still_on is shown on the card).",
+      "{when} is 'today', 'tomorrow' or 'in N days' (New York day for ny, the market's own day otherwise)."
+    ],
+    "codes": {
+      "day_link":              {"words": "No invoice on this day. It looks like day {n} of the {head_day} job (#{doc}).", "button": "Link as day {n}", "calls": "hc_order_day_link action link", "fine": "Separate job"},
+      "days_differ":           {"words": "#{doc} and the calendar disagree on the coconuts by day.", "button": "Open card", "calls": "opens the card day editor", "fine": "Not a problem"},
+      "day_not_on_invoice":    {"words": "{day} is no longer on #{doc}.", "button": "Remove this day", "calls": "hc_order_day_link action cancel_day", "fine": "Keep the day"},
+      "days_undated":          {"words": "#{doc} has {k} coconut lines with no day on each line, so the calendar cannot split it.", "button": "Copy Jarvis words", "calls": "copies: put the day in each coconut line on invoice {doc} (Nevada ship-to: Open card instead, edit through Claude)", "fine": "Not a problem"},
+      "day_of_cancelled_job":  {"words": "This is an extra day of a job that was cancelled. It is left out of prep.", "button": "Remove this day", "calls": "hc_order_day_link action cancel_day", "fine": "Keep the day"},
+      "addon_open":            {"words": "#{doc} for this job is still open.", "button": "Got a check?", "calls": "the Got a check? sheet, then hc_ar_request record_payment", "fine": "Not a problem"},
+      "unlinked_invoice":      {"words": "#{doc} is on no job in the calendar.", "button": "Attach to a job", "calls": "job picker, then hc_order_invoice_attach action attach", "fine": "Not a job"},
+      "unpaid_soon":           {"words": "Nothing received yet, and the job is {when}.", "button": "Got a check?", "calls": "the Got a check? sheet, then hc_ar_request record_payment", "fine": "Still on"},
+      "money_drift":           {"words": "The app's money for #{doc} differs from QuickBooks.", "button": "Re-sync", "calls": "hc_ar_request resync", "fine": "Not a problem"},
+      "no_ship_date":          {"words": "#{doc} has no ship date, so the job is on no day.", "button": "Copy Jarvis words", "calls": "copies: change ship date on {doc} to {day} (a head with extra days or a Nevada ship-to: Open card instead)", "fine": "Not a problem"},
+      "day_differs":           {"words": "The app says {day}; #{doc} says {invoice_day}.", "button": "Re-sync", "calls": "hc_ar_request resync", "fine": "Not a problem"},
+      "count_missing":         {"words": "No coconut count, and the job is {when}.", "button": "Re-sync", "calls": "hc_ar_request resync", "fine": "Not a problem"},
+      "count_differs":         {"words": "The calendar has {count} coconuts for this job; #{doc} has {invoice_count}.", "button": "Open card", "calls": "opens the card count editor", "fine": "Not a problem"},
+      "read_stale":            {"words": "The app's copy of #{doc} is older than the invoice.", "button": "Re-sync", "calls": "hc_ar_request resync", "fine": "Not a problem"},
+      "no_time":               {"words": "No delivery time, and the job is {when}.", "button": "Set time", "calls": "opens the delivery time sheet", "fine": "Not a problem"},
+      "cut_review":            {"words": "The cut needs your check before prep.", "button": "Open card", "calls": "opens the card", "fine": "Not a problem"},
+      "address_placeholder":   {"words": "The delivery address has no real street.", "button": "Copy Jarvis words", "calls": "copies: change the delivery address on {doc} to <street, city, state, ZIP> (Nevada ship-to: Open card instead)", "fine": "Not a problem"},
+      "stamp_not_needed":      {"words": "The invoice says unbranded, but the stamp still reads not ordered.", "button": "Not needed", "calls": "hc_crm_set_stamp not_needed", "fine": "Not a problem"},
+      "stamp_unknown":         {"words": "Branded job, no stamp recorded, and the job is {when}.", "button": "Set stamp", "calls": "sheet Ordered / Client sends die / Not needed, then hc_crm_set_stamp", "fine": "Not a problem"},
+      "logo_missing":          {"words": "Branded job, no logo file, and the job is {when}.", "button": "Open card", "calls": "opens the card logo section", "fine": "Not a problem"},
+      "past_lead":             {"words": "This lead's day passed {k} days ago.", "button": "Pass", "calls": "reason sheet, then hc_mark_order_passed", "fine": "Not a problem"},
+      "lead_date_vs_estimate": {"words": "The lead says {day}; estimate #{doc} says {estimate_day}.", "button": "Open in HC App", "calls": "opens the deal in HC App", "fine": "Not a problem"},
+      "market_check":          {"words": "The ship-to state is {state}, which is not the {market} crew's area.", "button": "Open card", "calls": "opens the card", "fine": "Not a problem"}
+    }
+  }
+}
