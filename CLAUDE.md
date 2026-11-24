@@ -680,6 +680,122 @@ came on Sundays.
   (payroll goes back to Sundays; rolling back past another deploy also
   removes that deploy; 0a0aee3f is above the 657f45c0 floor).
 
+## Job families: one reconfirmation per job, Day P&L and buy lines (built 2026-11-24, LOCAL ONLY)
+
+Branch `feat/claudia-job-families`, cut from the live lineage 69e1922 (the code
+of live Claudia 7cb17234; NEVER main). Contract: the calendar accuracy design
+(workspace handoff-2026-10-15/calendar-accuracy-2026-11-23/
+CALENDAR-ACCURACY-DESIGN.md, section 13 and step 8) and its vectors
+family-rules-cases.json. Nothing deployed. The why: a job that runs several
+days (a three-day expo, a two-day trade show) is one QuickBooks invoice on
+day 1 plus extra day cards that point at it with `orders.parent_order_id`.
+Before this, day 1's reconfirmation listed day 1 only, and nothing in the
+worker knew an extra day belongs to a job.
+
+- The rule lives in ONE pure function, `familyFacts(orders, attachments)`
+  (the JOB FAMILIES block after the reconfirmation block). It reproduces all
+  14 shared vectors (day N of M, the money word, the crew stage, revenue,
+  collected, pending, coconuts, in prep, the day_of_cancelled_job finding).
+  `loadJobFamilies(env, rows, opts)` reads every member of the families the
+  rows belong to (one `or=(id.in.(...),parent_order_id.in.(...))` read per
+  60 heads) and, with `attachments: true`, the live `order_invoices` rows.
+  It only reads. Before migration 072: `orders.job_day_origin` answers 400
+  (the read retries without it) and `order_invoices` answers 404 (no add-on
+  invoices). Any other failure answers null and each caller says what it
+  does.
+- Reconfirmation (contract 13b rule 9): one email per job, from day 1.
+  `reconfirmEligibility` refuses an extra day ('extra day of a job', even one
+  holding its own fee invoice) and a day whose day 1 was removed ('day of a
+  removed job'). A ready or held draft made for a day before it was linked
+  expires. Day 1 of a job with two or more live days gets the family wording
+  (`reconfirmFamilyTemplate`): one bullet per day ("Tuesday, December 1: 300
+  coconuts, arriving 10:00 AM"; an extra day's time is only its own
+  owner-confirmed time), then Drop off, "Count: 700 custom branded coconuts
+  over 3 days (picture below)", Cracking and the contacts; reply-by is three
+  days before the FIRST day. It keeps every droplet rule (Label: value
+  bullets, "(picture below)" on the Count bullet only, the "We brand and box"
+  paragraph, the approved bold phrases). A one-day job keeps the approved
+  email byte for byte. NEW CUSTOMER WORDS: Sidd sees them first on the
+  preview (RECONFIRM_MODE stays preview); tell him to read the first family
+  preview before any Send now.
+- `facts.source.family_days` (order id, day, count, request status and
+  window per day) is compared with keys sorted (jsonb reorders keys), so a
+  recount, a moved, added or cancelled day, or a day linked after the email
+  went out flips a sent row to changed with the note "job days changed". The
+  droplet compares only its own keys and ignores family_days, so between two
+  hourly scans a change to an EXTRA day is not caught at send time (day 1's
+  own fields still are). Jarvis's reconfirm_sender can add it later.
+- Holds: count_missing when ANY listed day has no count; multi_day when
+  Jarvis's calendar check (072 `hc_calendar_findings`) keeps an OPEN
+  count_differs, days_differ, days_undated, day_not_on_invoice or day_link
+  finding on day 1, an extra day or day 1's invoice. The findings table is
+  read only when a multi-day job is in view; 404 (072 not live) holds
+  nothing; any other failure makes the multi-day jobs wait an hour untouched
+  (one-day jobs carry on). A failed family read stops the whole hour.
+- CONTRACT GAP, 072 must widen the hold check: `order_reconfirmations_hold_reasons_check`
+  (044, widened by 045) does not admit `multi_day`, and 072 as built does
+  not widen it. Until it does, a write carrying multi_day is refused (23514)
+  and the worker writes it once more with `date_unverified` instead, so the
+  email still holds (owner words "delivery date unverified"). Fix in 072 the
+  045 way: drop and re-add the check under its name with the same ten words
+  plus multi_day, preflight that the 045 list is there, rollback refuses
+  while any row holds multi_day. HC Field build 44 should add HOLD_WORDS and
+  HOLD_FIX for multi_day (build 43 shows "multi day").
+- Day P&L (clock-out summary, `buildShiftSummaryText`, now exported): an
+  extra day adds $0 even with a typed total (its coconuts still count on its
+  own day), day 1 adds its own total plus its read, live, not voided add-on
+  invoices once, and a day of a cancelled or removed job leaves the ship and
+  prep lists (so the coconuts, pace and P&L). Order lines of a multi-day job
+  read "(day 2 of 3)". A failed family read keeps today's math and the
+  Revenue line says "(job links not read)". HC FIELD PARITY: build 44's
+  buildDayPnl must apply the same three rules (revenue = the vectors'
+  revenue_cents per row; job_cancelled and orphan_day rows out of the day's
+  orders and coconuts), and paceInfoFor must leave the same rows out.
+- 8am buy lines (`runDailyDigest`): each day keeps its own count by its own
+  day (as before), lines of a multi-day job read "(day 2 of 3)", and a day of
+  a cancelled or removed job is left out with one line "Left out of the buy
+  lines: N days of a cancelled or removed job (see HC Field)." A failed
+  family read keeps every row (a box too many beats a box short).
+- Coconut guard: the 049 worker scan lives on feature/coconut-guard
+  (4925893) and is NOT in this lineage. When it merges, its job list
+  (`coconutPlanTick` jobs from `readCoconutInputs`) must drop rows where
+  `familyLeavesPrep(fam, order)` is true, with `loadJobFamilies` over the
+  orders it read. Each row already counts on its own prep day.
+- Subrequests: the hourly reconfirmation scan gains one read (two with a
+  multi-day job in view); each clock-out summary gains up to two (only when
+  that day has orders); the 8am digest one.
+- No new switch: with no linked days in production (0 on 2026-11-24) nothing
+  changes until the fast lane or Jarvis links days, and RECONFIRM_MODE
+  preview keeps every draft behind Sidd's Send now.
+- Tests: `node worker/test-job-families.mjs` (21 checks: the vectors file
+  pinned by sha256 7d931307... and marked -text in .gitattributes, all 14
+  family_cases with every key and sum, the finding_words lint plus the
+  worker's new words, the scan against a fake network for a three-day and a
+  two-day job, the multi_day hold and its 23514 fallback, change detection,
+  the time before 072, the Day P&L and the cron path of the 8am digest).
+  15 of 16 planted bugs caught (the 16th, skipping the family-read guard,
+  crashes into the same fail-closed outcome). There are now 30 worker test
+  files (31 with test-dashboard-client-security.mjs), all passing on an LF
+  export.
+- Ship (its own OK, claim the OPERATOR BOARD hc-dashboard line first):
+  1. From `worker/`, `npx --no-install wrangler deployments list` must show
+     7cb17234 (code 69e1922) at 100 percent. WRITE DOWN the live id; it is
+     the undo target. If it is anything else, merge that live branch in and
+     rerun all 31 test files on an LF export first.
+  2. `cd worker && npx --no-install wrangler deploy` from this branch, at a
+     quiet minute outside 11:45 to 12:15 UTC and not at :00. No secret
+     changes. Check the new version is 100 percent and one */5 tick is Ok.
+  3. Fast-forward fix/claudia-chat-order-writes-switch to the deployed
+     commit (`git merge --ff-only`, never a rebase or force push), push THAT
+     branch, never main, and record the new live id on the OPERATOR BOARD.
+  Live proof: the next hourly tick logs `reconfirmation scan: {...}` with
+  failed 0; after the fast lane, day 1's preview lists every day and no
+  order_reconfirmations row exists for an extra day.
+  Undo: `npx --no-install wrangler rollback <the id written down>`. After an
+  undo, a draft made by this version keeps its family words until the old
+  worker rewrites it (the old worker sees no family_days and rewrites a
+  ready row the next hour).
+
 ## Current uncommitted state (as of 2026-07-07)
 
 index.html has the one-line pending-payment fix described above staged

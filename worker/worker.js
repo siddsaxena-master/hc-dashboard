@@ -1085,7 +1085,7 @@ async function runDailyDigest(env) {
 
   const resp = await fetch(
     env.SUPABASE_URL +
-      '/rest/v1/orders?select=client_name,event_start_at,coconuts_qty,market,delivery_at_utc,venue,delivery_notes' +
+      '/rest/v1/orders?select=id,parent_order_id,external_invoice_id,stage,cancelled_at,client_name,event_start_at,coconuts_qty,market,delivery_at_utc,venue,delivery_notes' +
       '&event_start_at=gte.' + todayStr +
       '&event_start_at=lte.' + horizonStr +
       '&stage=in.(deposit_paid,invoiced,paid_full)' +
@@ -1093,7 +1093,19 @@ async function runDailyDigest(env) {
     { headers: sbHeaders(env) }
   );
   if (!resp.ok) throw new Error('Daily digest fetch failed: ' + resp.status);
-  const rows = await resp.json();
+  const readRows = await resp.json();
+  // Job families (calendar accuracy, contract 13b rule 7): every day keeps
+  // its own count on its own day, and a day of a cancelled or removed job
+  // leaves the buy lines (said once, as a count). A failed family read
+  // keeps every row: a box too many beats a box short.
+  let fam = null;
+  if (Array.isArray(readRows) && readRows.length) {
+    try { fam = await loadJobFamilies(env, readRows); } catch (e) { fam = null; }
+    if (!fam) console.error('daily digest: job family read failed, buy lines keep every row');
+  }
+  const rowsIn = Array.isArray(readRows) ? readRows : [];
+  const leftOut = fam ? rowsIn.filter((r) => familyLeavesPrep(fam, r)).length : 0;
+  const rows = fam ? rowsIn.filter((r) => !familyLeavesPrep(fam, r)) : rowsIn;
 
   // Group by date and market
   const byDay = {};
@@ -1116,7 +1128,7 @@ async function runDailyDigest(env) {
   if (buyCoco > 0) {
     lines.push('🛒 *ORDER TODAY: ' + Math.ceil(buyCoco / 9) + ' boxes* (' + buyCoco + ' coconuts) for deliveries through ' + buyCutoff + ':');
     buyNow.forEach(r => {
-      if (r.coconuts_qty) lines.push('  • ' + (r.event_start_at || '').slice(0, 10) + ' — ' + (r.client_name || '?') + ' (' + r.coconuts_qty + ')');
+      if (r.coconuts_qty) lines.push('  • ' + (r.event_start_at || '').slice(0, 10) + ' — ' + (r.client_name || '?') + familyDayTag(fam, r) + ' (' + r.coconuts_qty + ')');
     });
     lines.push('');
   }
@@ -1130,11 +1142,14 @@ async function runDailyDigest(env) {
         lines.push('*' + g.date + '* — ' + g.market.toUpperCase() + ' — ' + g.coconuts + ' coconuts (≈ ' + boxes + ' boxes)');
         g.events.forEach(e => {
           const where = e.venue || (e.delivery_notes || '').split(',')[0] || '';
-          lines.push('  • ' + (e.client_name || 'Unnamed') + ' — ' + (e.coconuts_qty || 0) + (where ? ' @ ' + where : ''));
+          lines.push('  • ' + (e.client_name || 'Unnamed') + familyDayTag(fam, e) + ' — ' + (e.coconuts_qty || 0) + (where ? ' @ ' + where : ''));
         });
         lines.push('');
       });
     lines.push('Weee caps per account — split across accounts and confirm fresh stock before ordering.');
+  }
+  if (leftOut) {
+    lines.push('Left out of the buy lines: ' + leftOut + (leftOut === 1 ? ' day' : ' days') + ' of a cancelled or removed job (see HC Field).');
   }
 
   // Order-intake backstop: pending intake cards + email dead-man warning.
@@ -1265,6 +1280,12 @@ export function reconfirmEligibility(order, nowMs) {
   const out = (eligible, reason) => ({ eligible, reason, market, today, deliveryDay, daysOut });
   const stage = String(o.stage || '');
   if (RECONFIRM_CLOSED_STAGES.includes(stage)) return out(false, 'stage ' + stage);
+  // One email per job (calendar families, contract 13b rule 9): an extra
+  // day of a multi-day job never drafts, even one that holds its own fee
+  // invoice; day 1's email lists every day. A day whose day 1 was removed
+  // (job_day_origin set, no parent; migration 072) never drafts either.
+  if (famId(o.parent_order_id)) return out(false, 'extra day of a job');
+  if (famId(o.job_day_origin)) return out(false, 'day of a removed job');
   // A paid stage with nothing recorded is its own reason (the digest tells
   // the owner to check QuickBooks); anything else without money is simply
   // not paid yet.
@@ -1494,6 +1515,37 @@ export function reconfirmFacts(order, ctx = {}) {
     balance_open: source.stage !== 'paid_full' && !!source.external_invoice_url,
     market, zone,
   };
+  // A multi-day job (calendar families): ctx.familyDays holds the live days
+  // of the job, day 1 included, sorted by day (at least two). The email
+  // lists every day with its own count and its own time. Day 1's time is
+  // the one worked out above; an extra day has no invoice, so only its own
+  // owner-confirmed time counts (each day can differ, contract 4c).
+  // family_days rides in facts.source so a change to any day is seen by
+  // the diff below; the droplet compares only its own keys and ignores it.
+  const famDays = Array.isArray(ctx.familyDays) && ctx.familyDays.length >= 2 ? ctx.familyDays : null;
+  if (famDays) {
+    source.family_days = famDays.map((m) => {
+      const mr = m && m.delivery_request && typeof m.delivery_request === 'object' ? m.delivery_request : {};
+      return {
+        order_id: factText(m && m.id), day: familyDayOf(m), coconuts_qty: factNumber(m && m.coconuts_qty),
+        request_status: factText(mr.status), request_window: factText(mr.window),
+      };
+    });
+    derived.family = source.family_days.map((x) => {
+      let words = null;
+      if (x.order_id === factText(o.id)) words = windowWords;
+      else if (x.request_status === 'confirmed' && x.request_window) {
+        const p = parseArrivalTime(x.request_window, x.day, zone);
+        words = p && p.ok && p.kind !== 'assumed' ? p.label : null;
+      }
+      return {
+        order_id: x.order_id, day: x.day, day_words: longDayWords(x.day),
+        count: Number.isInteger(x.coconuts_qty) && x.coconuts_qty > 0 ? x.coconuts_qty : null,
+        window_words: words,
+      };
+    });
+    derived.family_total = derived.family.every((x) => x.count) ? derived.family.reduce((s, x) => s + x.count, 0) : null;
+  }
   return { source, derived };
 }
 // Hard holds. Soft gaps (window, site contact, logo) never appear here:
@@ -1501,9 +1553,16 @@ export function reconfirmFacts(order, ctx = {}) {
 export function reconfirmHolds(facts, ctx = {}) {
   const f = facts || { source: {}, derived: {} };
   const reasons = [];
-  if (!f.derived.count) reasons.push('count_missing');
+  // A multi-day job needs a count on EVERY day it lists.
+  const famDays = Array.isArray(f.derived.family) ? f.derived.family : null;
+  if (famDays ? famDays.some((x) => !x.count) : !f.derived.count) reasons.push('count_missing');
   if (!f.derived.address) reasons.push('address_missing');
   if (!f.derived.cracking_words) reasons.push('cracking_unknown');
+  // The family's coconuts by day disagree with the invoice: Jarvis's
+  // calendar check (migration 072 findings) holds an open count_differs,
+  // days_differ, days_undated, day_not_on_invoice or day_link finding on
+  // this job. The email waits until Sidd fixes the days or calls it fine.
+  if (ctx.multiDay) reasons.push('multi_day');
   if (ctx.pendingProposal) reasons.push('pending_time_proposal');
   // An Address? row that is undecided, or accepted but not yet written to
   // the invoice by Jarvis (queued, applying, failed), holds the draft: it
@@ -1523,8 +1582,24 @@ const RECONFIRM_SOURCE_KEYS = [
   'invoice_fulfillment.address', 'invoice_fulfillment.cracking', 'invoice_fulfillment.cracking_note', 'invoice_fulfillment.delivery_window', 'invoice_fulfillment.read_status',
   'delivery_request.status', 'delivery_request.window', 'delivery_request.contact_name', 'delivery_request.contact_phone', 'delivery_request.location',
   'logo_url', 'logo_asset_status', 'logo_received', 'balance_cents', 'external_invoice_url',
+  // A multi-day job's days (calendar families); absent on a one-day job,
+  // so a one-day row compares exactly as before.
+  'family_days',
 ];
+// JSON with object keys sorted: a jsonb column hands objects back with its
+// own key order, so a plain JSON.stringify would see a change every hour.
+function reconfirmStableJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(reconfirmStableJson).join(',') + ']';
+  if (value && typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map((k) => JSON.stringify(k) + ':' + reconfirmStableJson(value[k])).join(',') + '}';
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
 function reconfirmSourceValue(source, key) {
+  if (key === 'family_days') {
+    const days = source && typeof source === 'object' ? source.family_days : null;
+    return Array.isArray(days) && days.length ? reconfirmStableJson(days) : null;
+  }
   let v = source || {};
   for (const part of key.split('.')) v = v && typeof v === 'object' ? v[part] : undefined;
   if (v == null) return null;
@@ -1554,6 +1629,9 @@ export function reconfirmChangeNote(diff) {
     const day = (v) => String(v || '').slice(0, 10) || 'none';
     notes.push(`date ${day(get('delivery_at_utc').from)} to ${day(get('delivery_at_utc').to)}`);
   }
+  // A day of a multi-day job was added, removed, moved, recounted or got a
+  // new time (or the job became multi-day after the email went out).
+  if (keys.has('family_days')) notes.push('job days changed');
   if (['invoice_fulfillment.address', 'invoice_fulfillment.read_status', 'delivery_notes', 'venue'].some((k) => keys.has(k))) notes.push('address changed');
   if (['crack_type', 'invoice_fulfillment.cracking', 'invoice_fulfillment.cracking_note'].some((k) => keys.has(k))) notes.push('cracking changed');
   if (['delivery_request.status', 'delivery_request.window', 'invoice_fulfillment.delivery_window'].some((k) => keys.has(k))) notes.push('delivery time changed');
@@ -1590,6 +1668,9 @@ export function reconfirmChangeNote(diff) {
 // coconuts. Never an amount, never an email address in the body.
 export function reconfirmTemplate(facts, opts = {}) {
   const f = facts || { source: {}, derived: {} };
+  // A multi-day job gets the family wording below; a one-day job keeps
+  // the approved wording byte for byte.
+  if (f.derived && Array.isArray(f.derived.family) && f.derived.family.length >= 2) return reconfirmFamilyTemplate(f, opts);
   const d = f.derived, s = f.source;
   const day = d.day_words;
   const venueWord = factText(opts.venueWord);
@@ -1644,6 +1725,64 @@ export function reconfirmTemplate(facts, opts = {}) {
   return { subject: subject.slice(0, 200), body: lines.join('\n').slice(0, 6000) };
 }
 
+// The multi-day email (calendar families, contract 13b rule 9): ONE email
+// for the whole job, from day 1, listing every day with its own count and
+// time. It keeps every rule the droplet relies on: bullet lines start with
+// the bullet and a space and read "Label: value" (here a day line's label
+// is the day itself), the Count bullet carries "(picture below)" only when
+// the picture goes with the email, the picture's paragraph still opens
+// "We brand and box", and the approved bold phrases keep their shape ("We
+// are set for <days>.", "reply with any change by <day>.", "what time our
+// driver should arrive"). The reply-by day is three days before the FIRST
+// day (its prep is the first one). Never an amount, never an email.
+// The source stays ASCII: the bullet is built from its code point (U+2022).
+const RECONFIRM_BULLET = String.fromCharCode(0x2022) + ' ';
+function reconfirmFamilyTemplate(f, opts = {}) {
+  const d = f.derived, s = f.source;
+  const days = d.family;
+  const span = `${days[0].day_words} to ${days[days.length - 1].day_words}`;
+  const venueWord = factText(opts.venueWord);
+  const subject = opts.updated
+    ? `Updated details for ${span}`
+    : `Your coconuts for ${span}${venueWord ? ' at ' + venueWord : ''}: quick check`;
+  const cell = factText(opts.ownerCell);
+  const askTime = days.some((x) => !x.window_words);
+  const askContact = !d.contact_words;
+  const branded = !!(opts.picture && typeof opts.picture === 'object');
+  const gate = s.delivery_request && s.delivery_request.location ? s.delivery_request.location : null;
+  const firstDay = days[0].day;
+  const replyByDay = addDays(firstDay, -3);
+  const replyByGap = opts.today && replyByDay ? daysBetween(opts.today, replyByDay) : null;
+  const replyBy = replyByGap != null && replyByGap <= 0 ? 'today' : `by ${longDayWords(replyByDay)}`;
+  const lines = [];
+  lines.push(`Hi ${d.first_name},`);
+  lines.push('');
+  if (askTime && askContact) lines.push('Just sending the final details for reconfirmation. Two things we still need: what time our driver should arrive each day and who they should call on site. Once we have those two items, we are set.');
+  else if (askTime) lines.push('Just sending the final details for reconfirmation. One thing we still need: what time our driver should arrive each day. Once we have that, we are set.');
+  else if (askContact) lines.push('Just sending the final details for reconfirmation. One thing we still need: who our driver should call on site. Once we have a name and cell, we are set.');
+  else lines.push(`Just sending the final details for reconfirmation. We are set for ${span}. Here is what we have on file for each day. Reply confirmed if it all looks right, or reply with any change ${replyBy}.`);
+  lines.push('');
+  for (const x of days) {
+    lines.push(`${RECONFIRM_BULLET}${x.day_words}: ${x.count || ''} coconuts, ${x.window_words ? 'arriving ' + x.window_words : 'arrival time: please tell us'}`);
+  }
+  lines.push(`${RECONFIRM_BULLET}Drop off: ${d.address || ''}${gate ? ', ' + gate : ''}`);
+  lines.push(`${RECONFIRM_BULLET}Count: ${d.family_total || ''} ${branded ? 'custom branded coconuts' : 'coconuts'} over ${days.length} days${branded ? ' (picture below)' : ''}`);
+  lines.push(`${RECONFIRM_BULLET}Cracking: ${d.cracking_words || ''}`);
+  lines.push(`${RECONFIRM_BULLET}On site contact: ${askContact ? 'please send a name and cell' : d.contact_words}`);
+  lines.push(`${RECONFIRM_BULLET}Your contact: Sidd${cell ? ', ' + cell : ''}`);
+  lines.push('');
+  lines.push(`We brand and box the day before each delivery, starting ${longDayWords(addDays(firstDay, -1))}, so changes need to reach us ${replyBy}.`);
+  lines.push('');
+  if (d.balance_open && s.external_invoice_url) {
+    lines.push(`Invoice, if you need it: ${s.external_invoice_url}`);
+    lines.push('');
+  }
+  lines.push('Thanks so much,');
+  lines.push('Sidd');
+  lines.push('Hamptons Coconuts');
+  return { subject: subject.slice(0, 200), body: lines.join('\n').slice(0, 6000) };
+}
+
 // ── push words (owner only; never an email, phone or dollar) ────────
 const RECONFIRM_REASON_WORDS = {
   count_missing: 'coconut count missing',
@@ -1656,6 +1795,7 @@ const RECONFIRM_REASON_WORDS = {
   too_many_emails: 'more than 4 email addresses',
   date_unverified: 'delivery date unverified',
   owner_hold: 'held by you',
+  multi_day: 'the coconuts by day disagree with the invoice',
 };
 export function reconfirmReasonWords(reasons) {
   return (reasons || []).map((r) => RECONFIRM_REASON_WORDS[r] || String(r).replace(/_/g, ' ')).join(', ');
@@ -2087,31 +2227,67 @@ async function fetchSbAll(env, pathQuery) {
   }
   return all;
 }
-const RECONFIRM_ORDER_COLUMNS = 'id,client_name,client_email,client_phone,venue,delivery_notes,delivery_at_utc,stage,market,coconuts_qty,crack_type,invoice_fulfillment,delivery_request,logo_url,logo_asset,logo_received,balance_cents,deposit_cents,external_invoice_id,external_invoice_url,is_recurring';
+const RECONFIRM_ORDER_COLUMNS = 'id,client_name,client_email,client_phone,venue,delivery_notes,delivery_at_utc,stage,market,coconuts_qty,crack_type,invoice_fulfillment,delivery_request,logo_url,logo_asset,logo_received,balance_cents,deposit_cents,external_invoice_id,external_invoice_url,is_recurring,parent_order_id';
 const RECONFIRM_LIVE_STATUSES = ['ready', 'held', 'released', 'claimed', 'sent', 'confirmed', 'changed'];
+// The calendar check codes (072 hc_calendar_findings, design section 13e)
+// that mean a job's coconuts by day disagree with its invoice. An open one
+// on a multi-day job holds day 1's email as multi_day.
+const RECONFIRM_MULTI_DAY_CODES = ['count_differs', 'days_differ', 'days_undated', 'day_not_on_invoice', 'day_link'];
 const RECONFIRM_TABLE = 'order_reconfirmations';
 // Guarded PATCH: the filter names the status the row must still have, so
 // an owner tap or the droplet's claim in the meantime always wins.
+// The hold_reasons check on order_reconfirmations (044, widened by 045)
+// admits a fixed list of words. multi_day (calendar families) needs that
+// check widened the same way; until it is, the database refuses a write
+// that carries multi_day (23514, answered as a 400). The same write then
+// goes once more with multi_day replaced by date_unverified, so the email
+// still HOLDS (a wrong day list never goes out) and the owner reads
+// "delivery date unverified". The log line names codes only.
+function reconfirmMultiDayRefused(status, text, body) {
+  return status === 400 && Array.isArray(body && body.hold_reasons) && body.hold_reasons.includes('multi_day')
+    && /23514|hold_reasons/.test(String(text || ''));
+}
+function reconfirmWithoutMultiDay(body) {
+  return { ...body, hold_reasons: [...new Set(body.hold_reasons.map((r) => (r === 'multi_day' ? 'date_unverified' : r)))] };
+}
 async function patchReconfirmation(env, id, guard, body) {
-  const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + RECONFIRM_TABLE + '?id=eq.' + encodeURIComponent(id) + (guard ? '&' + guard : ''), {
+  const send = (b) => webhookFetch(env.SUPABASE_URL + '/rest/v1/' + RECONFIRM_TABLE + '?id=eq.' + encodeURIComponent(id) + (guard ? '&' + guard : ''), {
     method: 'PATCH',
     headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
-    body: JSON.stringify({ ...body, updated_at: new Date(Date.now()).toISOString() }),
+    body: JSON.stringify({ ...b, updated_at: new Date(Date.now()).toISOString() }),
   }, 15000);
+  let resp = await send(body);
+  if (!resp.ok && body && Array.isArray(body.hold_reasons) && body.hold_reasons.includes('multi_day')) {
+    const text = await resp.text().catch(() => '');
+    if (reconfirmMultiDayRefused(resp.status, text, body)) {
+      console.error('reconfirmation patch: multi_day not admitted by the hold check yet, held as date_unverified:', id);
+      resp = await send(reconfirmWithoutMultiDay(body));
+    }
+  }
   if (!resp.ok) { console.error('reconfirmation patch failed:', id, resp.status); return null; }
   const rows = await resp.json();
   return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 async function insertReconfirmation(env, row) {
-  const resp = await webhookFetch(env.SUPABASE_URL + '/rest/v1/' + RECONFIRM_TABLE, {
+  const send = (b) => webhookFetch(env.SUPABASE_URL + '/rest/v1/' + RECONFIRM_TABLE, {
     method: 'POST',
     headers: sbHeaders(env, { 'Content-Type': 'application/json', 'Prefer': 'return=representation' }),
-    body: JSON.stringify(row),
+    body: JSON.stringify(b),
   }, 15000);
+  let resp = await send(row);
+  let failText = null;
+  if (!resp.ok && resp.status !== 409 && Array.isArray(row.hold_reasons) && row.hold_reasons.includes('multi_day')) {
+    failText = await resp.text().catch(() => '');
+    if (reconfirmMultiDayRefused(resp.status, failText, row)) {
+      console.error('reconfirmation insert: multi_day not admitted by the hold check yet, held as date_unverified:', row.order_id);
+      resp = await send(reconfirmWithoutMultiDay(row));
+      failText = null;
+    }
+  }
   // 409 = a row for this order and day already exists (two ticks raced);
   // the next tick sees it and moves on.
   if (resp.status === 409) return { duplicate: true, row: null };
-  if (!resp.ok) { console.error('reconfirmation insert failed:', row.order_id, resp.status, (await resp.text()).slice(0, 200)); return { duplicate: false, row: null }; }
+  if (!resp.ok) { console.error('reconfirmation insert failed:', row.order_id, resp.status, (failText != null ? failText : await resp.text()).slice(0, 200)); return { duplicate: false, row: null }; }
   const rows = await resp.json();
   return { duplicate: false, row: Array.isArray(rows) && rows[0] ? rows[0] : null };
 }
@@ -2125,10 +2301,10 @@ async function sendReconfirmPush(env, market, kind, ctx, queueId, order, day, ex
 }
 // Everything one row holds that is computed from the order.
 function reconfirmDraft(order, ctx) {
-  const facts = reconfirmFacts(order, { deliveryDay: ctx.deliveryDay });
+  const facts = reconfirmFacts(order, { deliveryDay: ctx.deliveryDay, familyDays: ctx.familyDays });
   const recipients = reconfirmRecipients(order.client_email);
   const picture = reconfirmPicture(order);
-  const holds = reconfirmHolds(facts, { pendingProposal: ctx.pendingProposal, pendingAddressProposal: ctx.pendingAddressProposal, recipients });
+  const holds = reconfirmHolds(facts, { pendingProposal: ctx.pendingProposal, pendingAddressProposal: ctx.pendingAddressProposal, recipients, multiDay: ctx.multiDay });
   const text = reconfirmTemplate(facts, { ownerCell: ctx.ownerCell, venueWord: ctx.venueWord, updated: ctx.updated, picture, today: ctx.today, deliveryDay: ctx.deliveryDay });
   return { facts, recipients, picture, holds, subject: text.subject, body: text.body };
 }
@@ -2194,6 +2370,61 @@ export async function runReconfirmationScan(env) {
     if (missing.length) {
       const extra = await fetchSb(env, 'orders?select=' + RECONFIRM_ORDER_COLUMNS + '&id=in.(' + missing.map((id) => encodeURIComponent('"' + id + '"')).join(',') + ')&limit=' + missing.length);
       for (const o of extra || []) byId.set(o.id, o);
+    }
+    // Job families (calendar accuracy): which orders are extra days, and
+    // the live days of every day 1 (each with its own count and time). A
+    // failed read stops this hour: an email that lists day 1 alone must
+    // never go out for a multi-day job.
+    const fam = await loadJobFamilies(env, [...byId.values()], { columns: 'delivery_request' });
+    if (!fam) {
+      counts.failed++;
+      console.error('reconfirmation scan: job family read failed, nothing done this hour');
+      return counts;
+    }
+    const famById = new Map(fam.orders.map((m) => [m.id, m]));
+    for (const o of byId.values()) {
+      const m = famById.get(o.id);
+      if (m && famId(m.job_day_origin) && !famId(o.job_day_origin)) o.job_day_origin = m.job_day_origin;
+    }
+    // The live days of a day 1 that has at least one live extra day, day 1
+    // first; null for a one-day job and for an extra day.
+    const familyDaysOf = (o) => {
+      if (famId(o.parent_order_id)) return null;
+      const f = familyRowFacts(fam, o);
+      if (!f || !f.day_m || f.day_m < 2) return null;
+      return fam.orders.filter((m) => (m.id === o.id || m.parent_order_id === o.id) && (familyRowFacts(fam, m) || {}).day_n)
+        .sort((a, b) => familyRowFacts(fam, a).day_n - familyRowFacts(fam, b).day_n);
+    };
+    // multi_day: Jarvis's calendar check (migration 072) holds an open
+    // finding that this job's coconuts by day disagree with its invoice.
+    // Read only when a multi-day job is in view. Before 072 the table
+    // answers 404 and nothing holds; any other failure makes the multi-day
+    // jobs wait an hour (fail closed), one-day jobs carry on.
+    const familyHeads = [...byId.values()].filter((o) => familyDaysOf(o));
+    const multiDaySet = new Set();
+    let familyHeadsBlocked = false;
+    if (familyHeads.length) {
+      const memberToHead = new Map();
+      const qboToHead = new Map();
+      for (const h of familyHeads) {
+        memberToHead.set(h.id, h.id);
+        for (const m of fam.orders) if (m.parent_order_id === h.id) memberToHead.set(m.id, h.id);
+        const q = famId(h.external_invoice_id);
+        if (q && /^[1-9][0-9]{0,19}$/.test(q)) qboToHead.set(q, h.id);
+      }
+      const parts = ['order_id.in.(' + [...memberToHead.keys()].join(',') + ')'];
+      if (qboToHead.size) parts.push('qbo_id.in.(' + [...qboToHead.keys()].join(',') + ')');
+      const r = await familyGet(env, 'hc_calendar_findings?select=order_id,qbo_id,code&status=eq.open&code=in.(' +
+        RECONFIRM_MULTI_DAY_CODES.join(',') + ')&or=(' + parts.join(',') + ')&order=id.asc&limit=1000');
+      if (r.ok) {
+        for (const x of r.rows) {
+          const h = memberToHead.get(x.order_id) || qboToHead.get(String(x.qbo_id == null ? '' : x.qbo_id));
+          if (h) multiDaySet.add(h);
+        }
+      } else if (r.status !== 404) {
+        familyHeadsBlocked = true;
+        console.error('reconfirmation scan: calendar findings read failed (' + r.status + '), multi-day jobs wait an hour');
+      }
     }
     // Undecided Time change? proposals hold a draft until the owner decides.
     const candidateIds = [...byId.keys()];
@@ -2285,6 +2516,16 @@ export async function runReconfirmationScan(env) {
         const tag = reconfirmTag(o, null);
         const ctxBase = { rowId: row.id, tag, day: row.delivery_day, market };
         if (row.status === 'ready' || row.status === 'held') {
+          // An extra day of a multi-day job (or a day whose day 1 was
+          // removed) never has its own email: day 1's email lists every
+          // day. A draft made before the day was linked is over.
+          const extraWhy = famId(o.parent_order_id) ? 'extra day of a job: day 1 sends one email for every day'
+            : famId(o.job_day_origin) ? 'day of a removed job' : null;
+          if (extraWhy) {
+            await patchReconfirmation(env, row.id, 'status=in.(ready,held)', { status: 'expired', error_detail: extraWhy });
+            counts.expired++;
+            continue;
+          }
           // The order left the game or its date moved: this row is over.
           if (RECONFIRM_CLOSED_STAGES.includes(String(o.stage || '')) || (orderDay && orderDay !== row.delivery_day)) {
             await patchReconfirmation(env, row.id, 'status=in.(ready,held)', { status: 'expired', error_detail: orderDay && orderDay !== row.delivery_day ? 'date moved to ' + orderDay : 'order stage ' + o.stage });
@@ -2300,11 +2541,15 @@ export async function runReconfirmationScan(env) {
             continue;
           }
           const ownerHeld = row.status === 'held' && (row.hold_reasons || []).includes('owner_hold');
+          // A multi-day job whose calendar findings could not be read
+          // waits an hour untouched (no rewrite, no release).
+          const familyDays = familyDaysOf(o);
+          if (familyDays && familyHeadsBlocked) { counts.skipped++; continue; }
           // The facts are recomputed BEFORE anything else happens to the
           // row: a hold that was fixed lifts, a stale body (the droplet's
           // 'facts changed at send time' requeue included) is rewritten,
           // and only then does the release step below look at it.
-          const draft = reconfirmDraft(o, { deliveryDay: row.delivery_day, pendingProposal: pendingSet.has(o.id), pendingAddressProposal: pendingAddressSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(row.order_id), today });
+          const draft = reconfirmDraft(o, { deliveryDay: row.delivery_day, pendingProposal: pendingSet.has(o.id), pendingAddressProposal: pendingAddressSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(row.order_id), today, familyDays, multiDay: multiDaySet.has(o.id) });
           const diff = reconfirmSourceDiff(row.facts && row.facts.source, draft.facts.source);
           const wantHeld = draft.holds.length > 0;
           const wasHeld = row.status === 'held';
@@ -2419,7 +2664,9 @@ export async function runReconfirmationScan(env) {
         }
         if (row.status === 'sent' || row.status === 'confirmed') {
           if (daysOut < 0) continue;
-          const facts = reconfirmFacts(o, { deliveryDay: row.delivery_day });
+          // family_days makes a change to any day of the job (or the job
+          // becoming multi-day after the email went out) a change here.
+          const facts = reconfirmFacts(o, { deliveryDay: row.delivery_day, familyDays: familyDaysOf(o) });
           const diff = reconfirmSourceDiff(row.facts && row.facts.source, facts.source);
           if (!diff.length) continue;
           // A payment landing is not a detail change: the balance moving,
@@ -2461,8 +2708,10 @@ export async function runReconfirmationScan(env) {
         // that 'changed' row decides whether a second email is drafted.
         if (emailedOrders.has(o.id)) { counts.skipped++; continue; }
         if (!reconfirmInDraftHours(nowMs, e.market)) continue;
+        const familyDays = familyDaysOf(o);
+        if (familyDays && familyHeadsBlocked) { counts.skipped++; continue; }
         counts.seen++;
-        const draft = reconfirmDraft(o, { deliveryDay: e.deliveryDay, pendingProposal: pendingSet.has(o.id), pendingAddressProposal: pendingAddressSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(o.id), today: e.today });
+        const draft = reconfirmDraft(o, { deliveryDay: e.deliveryDay, pendingProposal: pendingSet.has(o.id), pendingAddressProposal: pendingAddressSet.has(o.id), ownerCell, venueWord: venueWords.get(o.id), updated: supersededOrders.has(o.id), today: e.today, familyDays, multiDay: multiDaySet.has(o.id) });
         const held = draft.holds.length > 0;
         const sendAfter = held ? null : reconfirmSendAfter({ deliveryDay: e.deliveryDay, daysOut: e.daysOut, nowMs, market: e.market });
         const inserted = await insertReconfirmation(env, {
@@ -2761,6 +3010,319 @@ export async function buildReconfirmationDigestLines(env) {
 // ════════════════════════════════════════════════════════════════════
 // end of the reconfirmation block
 // ════════════════════════════════════════════════════════════════════
+
+// ====================================================================
+// JOB FAMILIES (calendar accuracy, built 2026-11-24). Contract: the
+// calendar accuracy design, section 13b (the family rules), and its test
+// vectors family-rules-cases.json, copied byte for byte into
+// worker/test-vectors/ and pinned by sha256 in worker/test-job-families.mjs.
+// A job that runs several days is one FAMILY: day 1 (the head) holds the
+// QuickBooks invoice, and every extra day points at it through
+// orders.parent_order_id with no invoice of its own. Extra days add $0 to
+// every total; an add-on invoice attached to the head (order_invoices,
+// migration 072) adds once, on the head's day; each day keeps its own
+// coconut count; a day of a cancelled or removed job leaves prep. HC Field
+// (lib/job-family.js), HC App and Jarvis apply the same vectors, so every
+// screen and robot agrees. This worker uses the rule in three places: the
+// reconfirmation scan (one email per job, from day 1, listing every day),
+// the clock-out Day P&L and the 8am buy lines. Everything here READS;
+// nothing in this block writes an order or any money.
+// ====================================================================
+
+// The owner's money words (vectors money_words), by family state.
+const FAMILY_MONEY_WORDS = {
+  invoice_sent: 'Invoice sent', deposit_paid: 'Deposit paid', paid: 'Paid',
+  cancelled: 'Cancelled', job_cancelled: 'Job cancelled', orphan_day: 'Day of a removed job',
+};
+// A row's own stage as a family state. Other stages (a lead, fulfilled)
+// have no money word in the contract.
+const FAMILY_STAGE_STATE = { invoiced: 'invoice_sent', deposit_paid: 'deposit_paid', paid_full: 'paid', cancelled: 'cancelled' };
+const FAMILY_PREP_STAGES = ['invoiced', 'deposit_paid', 'paid_full'];
+// The states that take a row out of prep, the buy plan and the Day P&L:
+// an extra day whose day 1 was cancelled, and a day whose day 1 is gone.
+const FAMILY_GONE_STATES = ['job_cancelled', 'orphan_day'];
+
+function famId(value) {
+  const s = value == null ? '' : String(value).trim();
+  return s || null;
+}
+// Cents as a number; null and blank are 0 (the contract's "null = 0").
+function famCents(value) {
+  if (value == null || value === '') return 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+// Cancelled when the stage says so or cancelled_at is set (a vector row
+// carries the same fact as cancelled: true).
+function famIsCancelled(o) {
+  return String((o && o.stage) || '') === 'cancelled' || (o && o.cancelled === true)
+    || (o && o.cancelled_at != null && String(o.cancelled_at).trim() !== '');
+}
+// The row's calendar day: the vector's delivery_day, else the date text of
+// delivery_at_utc (a 00:00 UTC marker means that date), else event_start_at.
+export function familyDayOf(o) {
+  const text = String((o && (o.delivery_day || o.delivery_at_utc || o.event_start_at)) || '').trim();
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(text);
+  return m ? m[1] : '';
+}
+// An attachment counts while it is live (not detached) and not voided.
+function famAttachmentLive(a) {
+  return !!a && a.voided !== true && a.detached !== true && (a.detached_at == null || String(a.detached_at).trim() === '');
+}
+// Read means Jarvis has read its QuickBooks total and open balance.
+function famAttachmentRead(a) {
+  return a.total_cents != null && a.total_cents !== '' && a.open_cents != null && a.open_cents !== '';
+}
+// '$1,137.94' from 113794 (vectors formats.money).
+export function familyMoney(cents) {
+  const n = Math.round(famCents(cents));
+  const abs = Math.abs(n);
+  const dollars = String(Math.floor(abs / 100)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (n < 0 ? '-' : '') + '$' + dollars + '.' + String(abs % 100).padStart(2, '0');
+}
+
+// The family rule over a set of order rows (every member of each family
+// must be in the set: loadJobFamilies reads them) and their attachments.
+// Answers { rows: Map(order id -> facts), families: Map(head id -> sums) }.
+// The facts carry exactly the vector keys (day_n, day_m, money_state,
+// owner_badge, crew_badge_prefix, crew_stage, crew_addon_lines,
+// revenue_cents, collected_cents, pending_cents, coconuts, in_prep,
+// findings) plus head_id. Pure; exported for worker/test-job-families.mjs.
+export function familyFacts(orders, attachments) {
+  const list = (Array.isArray(orders) ? orders : []).filter((o) => o && famId(o.id));
+  const byId = new Map(list.map((o) => [famId(o.id), o]));
+  const kids = new Map();
+  for (const o of list) {
+    const pid = famId(o.parent_order_id);
+    if (!pid) continue;
+    if (!kids.has(pid)) kids.set(pid, []);
+    kids.get(pid).push(o);
+  }
+  // Live, not voided attachments by head (read or not: the crew line names
+  // need no read; the money parts below take only the read ones).
+  const atts = new Map();
+  for (const a of Array.isArray(attachments) ? attachments : []) {
+    if (!famAttachmentLive(a)) continue;
+    const hid = famId(a.head_order_id);
+    if (!hid) continue;
+    if (!atts.has(hid)) atts.set(hid, []);
+    atts.get(hid).push(a);
+  }
+  // Live members: the head and its children that are not cancelled, sorted
+  // by day then id. A cancelled (or unread) head has no live members, so
+  // its extra days get no "Day N of M".
+  const sortDays = (a, b) => familyDayOf(a).localeCompare(familyDayOf(b)) || String(famId(a.id)).localeCompare(String(famId(b.id)));
+  const memo = new Map();
+  const liveMembers = (hid) => {
+    if (memo.has(hid)) return memo.get(hid);
+    const head = byId.get(hid);
+    const live = head && !famIsCancelled(head)
+      ? [head, ...(kids.get(hid) || []).filter((k) => !famIsCancelled(k))].sort(sortDays)
+      : [];
+    memo.set(hid, live);
+    return live;
+  };
+
+  const rows = new Map();
+  for (const o of list) {
+    const id = famId(o.id);
+    const pid = famId(o.parent_order_id);
+    const head = pid ? byId.get(pid) || null : null;
+    const ownInvoice = !!famId(o.external_invoice_id);
+    const headId = pid || id;
+    let state;
+    if (famIsCancelled(o)) state = 'cancelled';
+    else if (!pid && famId(o.job_day_origin)) state = 'orphan_day';
+    else if (head && famIsCancelled(head)) state = 'job_cancelled';
+    else if (pid && !ownInvoice && head) state = FAMILY_STAGE_STATE[String(head.stage || '')] || null;
+    else state = FAMILY_STAGE_STATE[String(o.stage || '')] || null;
+    const members = liveMembers(headId);
+    const pos = members.indexOf(o);
+    const dayN = pos >= 0 && members.length >= 2 ? pos + 1 : null;
+    const dayM = dayN ? members.length : null;
+    const headAtts = atts.get(headId) || [];
+    const readAtts = headAtts.filter(famAttachmentRead);
+    const open = readAtts.reduce((s, a) => s + famCents(a.open_cents), 0);
+    const moneyState = state === 'invoice_sent' || state === 'deposit_paid' || state === 'paid';
+    const gone = state === 'cancelled' || FAMILY_GONE_STATES.includes(state);
+    const parts = [];
+    if (dayN) parts.push('Day ' + dayN + ' of ' + dayM);
+    if (state && FAMILY_MONEY_WORDS[state]) parts.push(FAMILY_MONEY_WORDS[state]);
+    if (moneyState && open > 0) parts.push(familyMoney(open) + ' open');
+    // Money RECEIVED (deposit plus balance, payment-stage-truth), never owed.
+    const received = famCents(o.deposit_cents) + famCents(o.balance_cents);
+    const total = famCents(o.total_cents);
+    let revenue, collected, pending;
+    if (gone) {
+      // A row cancelled itself keeps what it received (kept deposits);
+      // a day of a cancelled or removed job, and an extra day with no
+      // invoice, never received anything of its own.
+      revenue = 0; pending = 0;
+      collected = state === 'cancelled' && (!pid || ownInvoice) ? received : 0;
+    } else if (pid && !ownInvoice) {
+      revenue = 0; collected = 0; pending = 0;
+    } else if (pid) {
+      revenue = total; collected = received; pending = Math.max(0, total - received);
+    } else {
+      revenue = total + readAtts.reduce((s, a) => s + famCents(a.total_cents), 0);
+      collected = received + readAtts.reduce((s, a) => s + (famCents(a.total_cents) - famCents(a.open_cents)), 0);
+      pending = Math.max(0, total - received) + open;
+    }
+    const lines = gone ? [] : [...new Set(headAtts.flatMap((a) => (Array.isArray(a.line_names) ? a.line_names : [])
+      .map((x) => String(x == null ? '' : x).trim()).filter(Boolean)))];
+    rows.set(id, {
+      day_n: dayN,
+      day_m: dayM,
+      money_state: state,
+      owner_badge: parts.length ? parts.join(', ') : null,
+      crew_badge_prefix: dayN ? 'Day ' + dayN + ' of ' + dayM : null,
+      crew_stage: famIsCancelled(o) ? 'cancelled' : (pid && !ownInvoice && head ? String(head.stage || '') : String(o.stage || '')),
+      crew_addon_lines: lines,
+      revenue_cents: revenue,
+      collected_cents: collected,
+      pending_cents: pending,
+      coconuts: famCents(o.coconuts_qty),
+      in_prep: FAMILY_PREP_STAGES.includes(String(o.stage || '')) && !famIsCancelled(o) && !FAMILY_GONE_STATES.includes(state),
+      findings: FAMILY_GONE_STATES.includes(state) ? ['day_of_cancelled_job'] : [],
+      head_id: headId,
+    });
+  }
+
+  // One sum per head that has extra days (any state) or a live attachment.
+  const families = new Map();
+  for (const hid of new Set([...kids.keys(), ...atts.keys()])) {
+    if (!byId.has(hid)) continue;
+    const all = [byId.get(hid), ...(kids.get(hid) || [])];
+    const live = liveMembers(hid);
+    const sum = (key) => all.reduce((s, o) => s + ((rows.get(famId(o.id)) || {})[key] || 0), 0);
+    families.set(hid, {
+      head: hid,
+      live_days: live.length,
+      coconuts: live.reduce((s, o) => s + famCents(o.coconuts_qty), 0),
+      revenue_cents: sum('revenue_cents'),
+      collected_cents: sum('collected_cents'),
+      pending_cents: sum('pending_cents'),
+    });
+  }
+  return { rows, families };
+}
+
+// -- reading the families (service key, read only) --
+const FAMILY_ORDER_COLUMNS = 'id,stage,delivery_at_utc,event_start_at,parent_order_id,external_invoice_id,total_cents,deposit_cents,balance_cents,coconuts_qty,cancelled_at';
+const FAMILY_ATTACHMENT_COLUMNS = 'head_order_id,qbo_id,role,total_cents,open_cents,voided,line_names,detached_at';
+// A GET that keeps the status and the error text (fetchSb hides both), so
+// "not there before migration 072" can be told apart from a real failure.
+// Never throws.
+async function familyGet(env, pathQuery) {
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + pathQuery, { headers: sbHeaders(env) });
+    if (!resp.ok) {
+      let text = '';
+      try { text = await resp.text(); } catch (e) { text = ''; }
+      return { ok: false, status: resp.status, rows: null, text: String(text || '').slice(0, 300) };
+    }
+    const rows = await resp.json();
+    return Array.isArray(rows) ? { ok: true, status: resp.status, rows, text: '' } : { ok: false, status: resp.status, rows: null, text: 'not a list' };
+  } catch (e) {
+    return { ok: false, status: 0, rows: null, text: 'exception' };
+  }
+}
+// Paged (PostgREST answers at most 1000 rows); any failed page fails all.
+async function familyGetAll(env, pathQuery) {
+  const all = [];
+  for (let from = 0; ; from += 1000) {
+    const r = await familyGet(env, pathQuery + '&offset=' + from + '&limit=1000');
+    if (!r.ok) return r;
+    all.push(...r.rows);
+    if (r.rows.length < 1000) break;
+  }
+  return { ok: true, status: 200, rows: all, text: '' };
+}
+
+// Reads every member of the families the given rows belong to (the head
+// and all its extra days, any stage, any day), plus, with
+// opts.attachments, the head's live attached invoices (order_invoices).
+// opts.columns adds order columns (comma list). Before migration 072:
+// orders.job_day_origin is missing (read without it, no day reads as a
+// removed job) and order_invoices answers 404 (no attachments). Any other
+// failure answers null and the caller decides (each caller says how).
+// Never writes. Answers { orders, attachments, rows, families,
+// originColumn, attachmentTable }.
+export async function loadJobFamilies(env, rows, opts = {}) {
+  const heads = [...new Set((Array.isArray(rows) ? rows : [])
+    .map((r) => famId(r && r.parent_order_id) || famId(r && r.id))
+    .filter((id) => id && UUID_RE.test(id)))].sort();
+  const out = { orders: [], attachments: [], rows: new Map(), families: new Map(), originColumn: true, attachmentTable: !!opts.attachments };
+  if (!heads.length) return out;
+  const extra = opts.columns ? ',' + opts.columns : '';
+  const seen = new Set();
+  for (let i = 0; i < heads.length; i += 60) {
+    const chunk = heads.slice(i, i + 60).join(',');
+    const filter = '&or=(id.in.(' + chunk + '),parent_order_id.in.(' + chunk + '))&order=id.asc';
+    let r = await familyGetAll(env, 'orders?select=' + FAMILY_ORDER_COLUMNS + extra + (out.originColumn ? ',job_day_origin' : '') + filter);
+    if (!r.ok && out.originColumn && r.status === 400 && r.text.includes('job_day_origin')) {
+      out.originColumn = false;
+      console.log('job families: orders.job_day_origin is not there yet (migration 072), read without it');
+      r = await familyGetAll(env, 'orders?select=' + FAMILY_ORDER_COLUMNS + extra + filter);
+    }
+    if (!r.ok) {
+      console.error('job families: order read failed (' + r.status + ')');
+      return null;
+    }
+    for (const m of r.rows) {
+      if (!m || seen.has(m.id)) continue;
+      seen.add(m.id);
+      out.orders.push(m);
+    }
+  }
+  if (opts.attachments) {
+    for (let i = 0; i < heads.length; i += 60) {
+      const chunk = heads.slice(i, i + 60).join(',');
+      const r = await familyGetAll(env, 'order_invoices?select=' + FAMILY_ATTACHMENT_COLUMNS + '&head_order_id=in.(' + chunk + ')&detached_at=is.null&order=id.asc');
+      if (!r.ok && r.status === 404) {
+        out.attachmentTable = false;
+        console.log('job families: order_invoices is not there yet (migration 072), no add-on invoices');
+        break;
+      }
+      if (!r.ok) {
+        console.error('job families: attachment read failed (' + r.status + ')');
+        return null;
+      }
+      out.attachments.push(...r.rows);
+    }
+  }
+  const facts = familyFacts(out.orders, out.attachments);
+  out.rows = facts.rows;
+  out.families = facts.families;
+  return out;
+}
+// The facts of one row, or null when the family read did not cover it.
+export function familyRowFacts(fam, order) {
+  return fam && fam.rows ? fam.rows.get(famId(order && order.id)) || null : null;
+}
+// True when the family rule takes the row out of prep, the buy plan and
+// the Day P&L: an extra day of a cancelled job, or a day of a removed job.
+// The coconut guard (feature/coconut-guard, not in this lineage yet) must
+// filter its jobs with this same test when it merges.
+export function familyLeavesPrep(fam, order) {
+  const f = familyRowFacts(fam, order);
+  return !!f && FAMILY_GONE_STATES.includes(f.money_state);
+}
+// ' (day 2 of 3)' for a live day of a multi-day job, else ''.
+export function familyDayTag(fam, order) {
+  const f = familyRowFacts(fam, order);
+  return f && f.day_n ? ' (day ' + f.day_n + ' of ' + f.day_m + ')' : '';
+}
+// The row's share of a day's revenue under the $0 rule: an extra day 0,
+// day 1 its own total plus its read add-on invoices. Without family facts
+// (the read failed), today's sum of total_cents.
+export function familyRevenueOf(fam, order) {
+  const f = familyRowFacts(fam, order);
+  return f ? f.revenue_cents : famCents(order && order.total_cents);
+}
+// ====================================================================
+// end of the job families block
+// ====================================================================
 
 // ════════════════════════════════════════════════════════════════════
 // PASSED LEADS (2026-09-19, migration 047). A lead (an order still at
@@ -6345,7 +6907,7 @@ export async function runShiftStatusScan(env) {
   }
 }
 
-async function buildShiftSummaryText(env, row, workers) {
+export async function buildShiftSummaryText(env, row, workers) {
   const mins = shiftMinutes(row);
   const rate = workerRateFor(workers, row);
   const day = etDateStr(row.clock_in_at);   // the shift's ET calendar day (anchored on clock-IN)
@@ -6385,23 +6947,13 @@ async function buildShiftSummaryText(env, row, workers) {
   // and this mirrors App.js loadOrders exactly.
   // or= includes null-market rows, matching the app which counts blank-market
   // orders toward every market (2026-08-03 audit parity fix, applied 08-06).
-  const orders = await fetchSb(env, 'orders?select=client_name,venue,coconuts_qty,stage,market,total_cents' +
+  // The family columns ride along (calendar families, see the Day P&L
+  // block below): each row keeps its own coconuts by its own day.
+  const shipRead = await fetchSb(env, 'orders?select=id,parent_order_id,external_invoice_id,client_name,venue,coconuts_qty,stage,market,total_cents,deposit_cents,balance_cents,delivery_at_utc,cancelled_at' +
     '&or=(market.eq.' + encodeURIComponent(market) + ',market.is.null)' +
     '&stage=in.(invoiced,deposit_paid,paid_full,fulfilled,complete)' +
     '&delivery_at_utc=gte.' + day + 'T00:00:00Z' +
     '&delivery_at_utc=lte.' + day + 'T23:59:59Z') || [];
-  const coco = orders.reduce((s, o) => s + (o.coconuts_qty || 0), 0);
-
-  if (!orders.length) {
-    lines.push('No invoiced orders in ' + market.toUpperCase() + ' on ' + day + '.');
-  } else {
-    lines.push('Orders (' + day + ', ' + market.toUpperCase() + '):');
-    orders.forEach(o => {
-      lines.push('· ' + (o.client_name || '?') + (o.venue ? ' @ ' + o.venue : '') +
-        ' - ' + fmtBoxes(o.coconuts_qty || 0) + ' boxes (' + (o.coconuts_qty || 0) + ' coconuts)');
-    });
-    lines.push('Total: ' + fmtBoxes(coco) + ' boxes (' + coco + ' coconuts)');
-  }
 
   // PREP: coconuts are processed and branded the day BEFORE delivery,
   // so this shift also worked on TOMORROW's confirmed orders. The
@@ -6409,16 +6961,42 @@ async function buildShiftSummaryText(env, row, workers) {
   // delivering tomorrow cannot be fulfilled or complete yet. Same
   // fake-noon UTC-day window convention as the ship query above.
   const prepDay = nextEtDay(day);
-  const prep = await fetchSb(env, 'orders?select=client_name,venue,coconuts_qty,stage,market' +
+  const prepRead = await fetchSb(env, 'orders?select=id,parent_order_id,external_invoice_id,client_name,venue,coconuts_qty,stage,market,delivery_at_utc,cancelled_at' +
     '&or=(market.eq.' + encodeURIComponent(market) + ',market.is.null)' +
     '&stage=in.(invoiced,deposit_paid,paid_full)' +
     '&delivery_at_utc=gte.' + prepDay + 'T00:00:00Z' +
     '&delivery_at_utc=lte.' + prepDay + 'T23:59:59Z') || [];
+
+  // Job families (calendar accuracy, contract 13b): a day of a cancelled or
+  // removed job leaves both lists (and so the coconuts, the pace and the
+  // Day P&L), and an extra day is labelled "(day 2 of 3)". A failed read
+  // keeps both lists as read and the Day P&L says so.
+  let fam = null;
+  if (shipRead.length || prepRead.length) {
+    try { fam = await loadJobFamilies(env, shipRead.concat(prepRead), { attachments: true }); }
+    catch (e) { fam = null; }
+    if (!fam) console.error('shift summary: job family read failed, lists kept as read');
+  }
+  const orders = fam ? shipRead.filter((o) => !familyLeavesPrep(fam, o)) : shipRead;
+  const prep = fam ? prepRead.filter((o) => !familyLeavesPrep(fam, o)) : prepRead;
+  const coco = orders.reduce((s, o) => s + (o.coconuts_qty || 0), 0);
+
+  if (!orders.length) {
+    lines.push('No invoiced orders in ' + market.toUpperCase() + ' on ' + day + '.');
+  } else {
+    lines.push('Orders (' + day + ', ' + market.toUpperCase() + '):');
+    orders.forEach(o => {
+      lines.push('· ' + (o.client_name || '?') + (o.venue ? ' @ ' + o.venue : '') + familyDayTag(fam, o) +
+        ' - ' + fmtBoxes(o.coconuts_qty || 0) + ' boxes (' + (o.coconuts_qty || 0) + ' coconuts)');
+    });
+    lines.push('Total: ' + fmtBoxes(coco) + ' boxes (' + coco + ' coconuts)');
+  }
+
   const prepCoco = prep.reduce((s, o) => s + (o.coconuts_qty || 0), 0);
   if (prep.length) {
     lines.push('Prepping for tomorrow (' + prepDay + '):');
     prep.forEach(o => {
-      lines.push('· ' + (o.client_name || '?') + (o.venue ? ' @ ' + o.venue : '') +
+      lines.push('· ' + (o.client_name || '?') + (o.venue ? ' @ ' + o.venue : '') + familyDayTag(fam, o) +
         ' - ' + fmtBoxes(o.coconuts_qty || 0) + ' boxes (' + (o.coconuts_qty || 0) + ' coconuts)');
     });
     lines.push('Prep total: ' + fmtBoxes(prepCoco) + ' boxes (' + prepCoco + ' coconuts)');
@@ -6527,14 +7105,25 @@ async function buildShiftSummaryText(env, row, workers) {
   //   coconuts = ship-day coconuts x app_config.coconut_cost_cents
   //              (no row / bad value = not set)
   //   profit   = revenue - labor - coconuts
+  // Job families (calendar accuracy, 2026-11-24, family-rules-cases.json
+  // revenue_cents; HC Field build 44 must match rule for rule):
+  //   - an extra day of a multi-day job adds $0 (its coconuts still count
+  //     on its own day); one that holds its own fee invoice adds that total
+  //   - day 1 adds its own total plus the totals of its attached add-on
+  //     invoices (order_invoices, live, not voided, read by Jarvis), once,
+  //     on day 1's day
+  //   - a day of a cancelled or removed job is left out of the ship list
+  //     above, so it adds no revenue, no coconuts and no order
+  //   - when the family read failed: today's sum of total_cents, and the
+  //     Revenue line says "(job links not read)"
   // Built in its own buffer inside its own try/catch: any failure
   // drops ONLY this block, never the summary above it.
   try {
     const p = [];
-    const revenue = orders.reduce((s, o) => s + (o.total_cents || 0), 0);
+    const revenue = orders.reduce((s, o) => s + familyRevenueOf(fam, o), 0);
     p.push('Day P&L (' + day + ', ' + market.toUpperCase() + '):');
     p.push('Revenue: ' + usd(revenue) + ' across ' + orders.length +
-      ' order' + (orders.length === 1 ? '' : 's'));
+      ' order' + (orders.length === 1 ? '' : 's') + (fam || !orders.length ? '' : ' (job links not read)'));
 
     let laborCents = 0;
     const noRate = [];
