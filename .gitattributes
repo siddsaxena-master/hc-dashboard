@@ -2,3 +2,7 @@
 # worker/test-job-families.mjs, so git must never rewrite their line
 # endings (core.autocrlf would turn LF into CRLF on a Windows checkout).
 worker/test-vectors/family-rules-cases.json -text
+
+# The shared crew plan vectors (migration 073) are pinned by sha256 in
+# worker/test-crew-plan.mjs, so they must keep their LF line endings too.
+worker/test-vectors/crew-plan-cases.json -text
