@@ -2,6 +2,12 @@
 // Cloudflare Worker that receives Telegram messages, uses Claude to parse intent,
 // and reads/writes events in Supabase orders (migrated from JSONBin 2026-05-13).
 
+// The automatic crew plan's pure rules (migration 073), no network inside.
+import {
+  planCrew, crewDayAdd, crewWeekStart, crewDayInZone, crewTomorrowSends, crewDayQuestions,
+  crewDayRowCount, crewDigestLine, md5Uuid, CREW_ROUTE_CALLS_MAX, CREW_ROUTE_CACHE_HOURS, CREW_APP_REVIEW_EMAIL,
+} from './crew-plan.js';
+
 const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
 const TG_API = 'https://api.telegram.org/bot';
 
@@ -991,6 +997,7 @@ async function handleParseBatch(request, env) {
 //   "0 12 * * *"   : daily 12:00 UTC (8am EDT in summer, 7am EST in winter): Weee box math digest, plus payroll on Mondays
 //   "0 * * * *"    — hourly — reconfirmation scan + post-event debrief scan + intake nags
 //   "*/5 * * * *"  — every 5 minutes — intake approval cards + delivery time confirmations + shift summaries + clock-in pings + stillness watch
+//   "17 * * * *"   - hourly at :17 - the automatic crew plan (migration 073); off unless CREW_PLAN_MODE is practice or on
 async function runScheduled(event, env, alsoNotify = true) {
   const cron = event.cron;
   try {
@@ -1017,6 +1024,11 @@ async function runScheduled(event, env, alsoNotify = true) {
       try { await runStillWaitingScan(env); }
       catch (e) { if (!hourlyErr) hourlyErr = e; console.error('runStillWaitingScan error:', e); }
       if (hourlyErr) throw hourlyErr;
+    } else if (cron === '17 * * * *') {
+      // The automatic crew plan (migration 073): its own invocation and
+      // request budget, away from :00 and never in the 5-minute chain. Fully
+      // wrapped inside; with CREW_PLAN_MODE unset it reads and writes nothing.
+      await runCrewPlanScan(env);
     } else if (cron === '*/5 * * * *') {
       await runIntakeCardScan(env);
       // CRM mail reader alarm (Step C, needs migration 052): one Telegram
@@ -1174,6 +1186,15 @@ async function runDailyDigest(env) {
   if (passedLines.length) {
     lines.push('');
     passedLines.forEach(l => lines.push(l));
+  }
+
+  // Automatic crew plan (migration 073): one summary line per planned
+  // market (and the practice scorecard), owner Telegram only, never a
+  // decision. With CREW_PLAN_MODE unset it reads nothing and adds nothing.
+  const crewLines = await buildCrewPlanDigestLines(env);
+  if (crewLines.length) {
+    lines.push('');
+    crewLines.forEach(l => lines.push(l));
   }
 
   // Monday (payday) payroll section (weekday checked in EASTERN time
@@ -7951,8 +7972,14 @@ const finite = (v) => typeof v === 'number' && Number.isFinite(v);
 function firstName(name) {
   return collapseSpaces(name).split(' ')[0] || 'the crew';
 }
-export function originFor({ market, openShifts, lastShift }) {
+// site (crew plan, migration 073, design 6.2): the approved deliver trip's
+// start place with confirmed coordinates, only when CREW_PLAN_MODE is on.
+// Left out (every call before 073), the answer is exactly as before.
+export function originFor({ market, openShifts, lastShift, site }) {
   const key = marketKey(market);
+  if (site && finite(site.lat) && finite(site.lng)) {
+    return { kind: 'site', lat: site.lat, lng: site.lng, label: collapseSpaces(site.label).slice(0, 80) || 'the crew plan start', shiftId: null };
+  }
   const base = MARKET_BASES[key];
   if (base) return { kind: 'garage', lat: base.lat, lng: base.lng, label: base.label, shiftId: null };
   const open = (openShifts || [])
@@ -8028,17 +8055,22 @@ export function pickupSeenByGps(recentPoints, base) {
   }
   return false;
 }
-export function movementState({ marketHasGarage, origin, dest, clockInPoint, newestPoint, recentPoints, nowMs, pickupSeenAt, pickupSource, hasOpenShift }) {
+// base (crew plan, migration 073): the approved trip's start place
+// {lat, lng, fence_m} in place of the NJ garage, so parking at the cold
+// storage reads at_origin. Left out, everything is exactly as before.
+export function movementState({ marketHasGarage, origin, dest, clockInPoint, newestPoint, recentPoints, nowMs, pickupSeenAt, pickupSource, hasOpenShift, base }) {
   if (hasOpenShift === false || (!clockInPoint && !newestPoint)) return 'nobody';
   if (!classifyShiftLocationReport(newestPoint, nowMs).fresh) return 'unknown';
   const d = (a, b) => distMeters(a.lat, a.lng, b.lat, b.lng);
   if (dest && finite(dest.lat) && d(newestPoint, dest) <= ARRIVED_RADIUS_M) return 'arrived';
   if (marketHasGarage) {
-    const garage = { lat: GARAGE_LAT, lng: GARAGE_LNG };
+    const useBase = !!base && finite(base.lat) && finite(base.lng);
+    const garage = useBase ? { lat: base.lat, lng: base.lng } : { lat: GARAGE_LAT, lng: GARAGE_LNG };
+    const fence = useBase && finite(base.fence_m) ? base.fence_m : GARAGE_RADIUS_M;
     const claimed = pickupSource === 'claim';
     const pickupSeen = !!pickupSeenAt || claimed || pickupSeenByGps(recentPoints, garage);
     const fromGarage = d(newestPoint, garage);
-    if (fromGarage <= GARAGE_RADIUS_M) return 'at_origin';
+    if (fromGarage <= fence) return 'at_origin';
     if (pickupSeen && fromGarage > DEPART_RADIUS_M) return 'departed';
     if (claimed && clockInPoint && d(newestPoint, clockInPoint) > NO_PICKUP_RADIUS_M) return 'departed';
     if (!pickupSeen && clockInPoint && finite(clockInPoint.lat) && d(newestPoint, clockInPoint) > NO_PICKUP_RADIUS_M) return 'moving_no_pickup';
@@ -9323,6 +9355,12 @@ export async function runDeparturePlanScan(env) {
     if (!orders) return counts;
     const existing = await fetchSb(env, 'order_departures?select=*&plan_date=gte.' + todayEt + '&plan_date=lte.' + dayAfter + '&limit=400') || [];
     const plans = new Map(existing.map((p) => [p.order_id, p]));
+    // Crew plan (migration 073, design 6.2): with CREW_PLAN_MODE on, ONE read
+    // of the approved deliver trips; each gives the trip's destination and,
+    // from a confirmed cold storage, its start place. Unset or practice: no
+    // read at all and every order plans exactly as before (NJ garage, the
+    // invoice address first).
+    const crewTrips = crewPlanMode(env) === 'on' ? await readCrewDepartureTrips(env, todayEt, dayAfter) : null;
     // Undecided proposed times (042): the EARLIEST pending proposal per
     // order drives the alarm until the owner decides. A missing table
     // (042 not applied yet) simply means no proposals.
@@ -9356,14 +9394,23 @@ export async function runDeparturePlanScan(env) {
         if (dr && dr.status === 'confirmed' && String(dr.window || '').trim()) { windowText = String(dr.window).trim(); arriveSource = 'delivery_request'; }
         else if (inv && String(inv.delivery_window || '').trim()) { windowText = String(inv.delivery_window).trim(); arriveSource = 'invoice_window'; }
         const parsed = windowText ? parseArrivalTime(windowText, day, marketZone(market)) : { ok: false, kind: 'none', reason: 'no clock time' };
-        const dest = departureDestination(o);
+        // An approved crew trip (mode on only) names the address the crew
+        // drive to, so leave-by and Navigate agree; null keeps today's rule.
+        const trip = crewTrips ? crewTrips.get(o.id) || null : null;
+        const dest = trip && collapseSpaces(trip.to_address) ? { ...departureDestination({ delivery_notes: trip.to_address }), source: 'crew_plan' } : departureDestination(o);
         const marketHasGarage = !!MARKET_BASES[market];
         if (!marketHasGarage && !lastShiftByMarket.has(market)) {
           const since60 = new Date(nowMs - 60 * 86400000).toISOString();
           const last = await fetchSb(env, 'shifts?select=id,clock_in_lat,clock_in_lng,clock_in_at,worker_email&market=eq.' + encodeURIComponent(market) + '&clock_in_at=gte.' + since60 + '&order=clock_in_at.desc&limit=3');
           lastShiftByMarket.set(market, (last || []).find((s) => !isAppReviewShift(s) && finite(s.clock_in_lat)) || null);
         }
-        const origin = originFor({ market, openShifts, lastShift: lastShiftByMarket.get(market) || null });
+        // A trip that starts at a cold storage with confirmed coordinates
+        // leaves from there; a base start or an unconfirmed place keeps the
+        // garage exactly as today.
+        const siteBase = trip && trip.origin && trip.origin.kind === 'site' && finite(trip.origin.lat) && finite(trip.origin.lng)
+          ? { lat: trip.origin.lat, lng: trip.origin.lng, fence_m: finite(trip.origin.fence_m) ? trip.origin.fence_m : GARAGE_RADIUS_M, label: trip.origin.label }
+          : null;
+        const origin = originFor({ market, openShifts, lastShift: lastShiftByMarket.get(market) || null, site: siteBase });
         const prev = plan || {};
         const row = {
           order_id: o.id, plan_date: day, market,
@@ -9448,16 +9495,19 @@ export async function runDeparturePlanScan(env) {
         let mover = null;
         const onShift = [];
         const clockedInEmails = [];
-        const garage = { lat: GARAGE_LAT, lng: GARAGE_LNG };
+        // The pickup place: the trip's cold storage (crew plan, mode on) or
+        // the NJ garage, as always.
+        const garage = siteBase ? { lat: siteBase.lat, lng: siteBase.lng } : { lat: GARAGE_LAT, lng: GARAGE_LNG };
+        const garageFence = siteBase ? siteBase.fence_m : GARAGE_RADIUS_M;
         const destPoint = finite(row.dest_lat) ? { lat: row.dest_lat, lng: row.dest_lng } : null;
         for (const s of marketShifts) {
           const trail = await shiftTrail(env, s.id, nowMs, trails);
           if (!trail.readOk) continue;
           const clockInPoint = finite(s.clock_in_lat) ? { lat: s.clock_in_lat, lng: s.clock_in_lng } : null;
           const newest = trail.newest || (clockInPoint ? { ...clockInPoint, at: s.clock_in_at } : null);
-          const state = movementState({ marketHasGarage, origin: { lat: origin.lat, lng: origin.lng }, dest: destPoint, clockInPoint, newestPoint: newest, recentPoints: trail.recent, nowMs, pickupSeenAt: prev.pickup_seen_at || null, pickupSource: prev.pickup_source || null, hasOpenShift: true });
+          const state = movementState({ marketHasGarage, origin: { lat: origin.lat, lng: origin.lng }, dest: destPoint, clockInPoint, newestPoint: newest, recentPoints: trail.recent, nowMs, pickupSeenAt: prev.pickup_seen_at || null, pickupSource: prev.pickup_source || null, hasOpenShift: true, base: siteBase });
           const staleMs = newest ? new Date(newest.at).getTime() : null;
-          const entry = { name: s.worker_name, clockInAtIso: s.clock_in_at, atGarage: !!newest && distMeters(newest.lat, newest.lng, garage.lat, garage.lng) <= GARAGE_RADIUS_M };
+          const entry = { name: s.worker_name, clockInAtIso: s.clock_in_at, atGarage: !!newest && distMeters(newest.lat, newest.lng, garage.lat, garage.lng) <= garageFence };
           if (state === 'unknown' && finite(staleMs)) entry.gpsStaleSinceIso = new Date(staleMs).toISOString();
           if (state === 'departed' || state === 'moving_no_pickup') entry.movingSinceIso = newest ? newest.at : s.clock_in_at;
           onShift.push(entry);
@@ -9485,7 +9535,16 @@ export async function runDeparturePlanScan(env) {
           }
         }
         if (movement === 'arrived' && row.state === 'planned') row.state = 'arrived';
-        const saved = await upsertDeparturePlan(env, row);
+        let saved = await upsertDeparturePlan(env, row);
+        if (!saved && row.origin_kind === 'site') {
+          // A refused cold storage start (the 073 origin word missing) must
+          // never cost the job its alarm: save it from the garage instead;
+          // the next tick sees the changed origin and routes again.
+          const g = originFor({ market, openShifts, lastShift: lastShiftByMarket.get(market) || null });
+          Object.assign(row, { origin_kind: g.kind, origin_lat: g.lat, origin_lng: g.lng, origin_label: g.label, origin_shift_id: g.shiftId });
+          console.error('departure scan: the crew plan start was refused for order ' + o.id + ', saved from the garage');
+          saved = await upsertDeparturePlan(env, row);
+        }
         if (!saved) { counts.failed++; continue; }
         if (row.state === 'planned') counts.planned++;
         const mdKey = market + '|' + day;
@@ -12079,4 +12138,481 @@ export async function runDealFactScan(env) {
   } catch (e) {
     console.error('runDealFactScan error:', (e && e.name) || 'error');
   }
+}
+
+// ====================================================================
+// AUTOMATIC CREW PLAN (migration 073, built 2026-11-27, LOCAL ONLY).
+// Sidd, 2026-11-26: "Why do I have to do field team schedule by hand".
+// Every hour at :17 the robot drafts the coming days of crew work (time,
+// task, place, boxes, people, cars) from the booked jobs, the coconut
+// drops on record, days off and the crew list, and saves each CHANGED day
+// through hc_crew_plan_put (073, the only robot write). The rules are pure
+// and live in worker/crew-plan.js. Design: workspace handoff-2026-10-15/
+// crew-schedule-2026-11-27/CREW-SCHEDULE-DESIGN.md (critic edits binding);
+// contract: worker/test-vectors/crew-plan-cases.json.
+//
+// Two switches, the lower one wins:
+//   CREW_PLAN_MODE (worker secret): unset, blank or anything else is OFF:
+//     nothing is read, written or sent, and the departure plan is exactly
+//     as before. 'practice': drafts, owner banners and the owner digest
+//     line. 'on': plus the 6 PM crew banners and the departure plan's start
+//     place and address from the approved plan (design 6.2).
+//   crew_plan_settings.mode (database, runbook paste only): off, practice,
+//     on. crew_plan_settings.notify gates every banner.
+// The robot never changes an approved day (the database keeps a proposal
+// and Sidd taps Use new plan or Keep mine). Helpers are named on rows and
+// never sent anything. Crew never see money, gap flags or supplier words.
+// ====================================================================
+export function crewPlanMode(env) {
+  const v = String((env && env.CREW_PLAN_MODE) || '').trim().toLowerCase();
+  return v === 'practice' || v === 'on' ? v : 'off';
+}
+const CREW_MODE_RANK = { off: 0, practice: 1, on: 2 };
+export function crewEffectiveMode(secretMode, dbMode) {
+  const a = CREW_MODE_RANK[String(secretMode || 'off')] || 0;
+  const b = CREW_MODE_RANK[String(dbMode || 'off')] || 0;
+  return ['off', 'practice', 'on'][Math.min(a, b)];
+}
+const CREW_MARKETS = ['ny', 'vegas', 'miami', 'la'];
+// Puts per run: the rest wait an hour (the free plan allows 50 requests a
+// run; reads, three routes, banners and the log take about 30).
+export const CREW_PUTS_PER_RUN_MAX = 12;
+const CREW_LIB = { parseArrivalTime, leaveByMs, routeSanity, marketZone };
+const CREW_ORDER_COLUMNS = 'id,client_name,company,market,stage,coconuts_qty,delivery_at_utc,event_start_at,venue,delivery_notes,crack_type,stamp_status,logo_received,logo_asset,external_invoice_id,parent_order_id,cancelled_at,invoice_fulfillment,delivery_request';
+const CREW_FAMILY_EXTRA_COLUMNS = 'client_name,company,market,venue,delivery_notes,crack_type,stamp_status,logo_received,logo_asset,invoice_fulfillment,delivery_request';
+
+// One 073 call with the service key: { ok, status, data }. Never throws,
+// never logs a body.
+async function crewRpc(env, name, body) {
+  try {
+    const resp = await webhookFetch(env.SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1/rpc/' + name, {
+      method: 'POST',
+      headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    }, 15000);
+    if (!resp) return { ok: false, status: 0, data: null };
+    if (!resp.ok) return { ok: false, status: resp.status, data: null };
+    const data = await resp.json();
+    return data && typeof data === 'object' && !Array.isArray(data) ? { ok: true, status: resp.status, data } : { ok: false, status: resp.status, data: null };
+  } catch (e) {
+    return { ok: false, status: 0, data: null };
+  }
+}
+
+// The departure scan's one read (mode on only): order id -> approved
+// deliver trip {order_id, market, day, start, to_address, origin}. Null on
+// any failure or when the database mode is not on: the scan then keeps
+// today's rule for every order.
+async function readCrewDepartureTrips(env, fromDay, toDay) {
+  const r = await crewRpc(env, 'hc_crew_departure_origins', { p_from: fromDay, p_to: toDay });
+  if (!r.ok || !r.data || r.data.code !== 'ok' || !Array.isArray(r.data.trips)) {
+    if (!r.ok) console.log('departure scan: hc_crew_departure_origins answered ' + r.status + ', the garage rule stays');
+    return null;
+  }
+  const trips = new Map();
+  for (const t of r.data.trips) if (t && UUID_RE.test(String(t.order_id || ''))) trips.set(String(t.order_id), t);
+  return trips;
+}
+
+// The route cache the robot keeps on its own stored rows (drive_min and
+// route_at; the why line carries "Ferry on the route." and "Route tries:
+// N."). An approved day's drive time is kept as long as its ends are the
+// same; a draft day's is trusted for 24 hours.
+function crewTaskRoutePair(t) {
+  if (t.kind === 'deliver' && t.from_site && t.to_address) return { from_site: t.from_site, to_site: null, to_address: t.to_address };
+  if (t.kind === 'move' && t.from_site && t.to_site) return { from_site: t.from_site, to_site: t.to_site, to_address: null };
+  if (t.kind === 'cart_drop' && t.from_site && t.to_address) return { from_site: t.from_site, to_site: null, to_address: t.to_address };
+  if (t.kind === 'cart_pickup' && t.to_site && t.to_address) return { from_site: t.to_site, to_site: null, to_address: t.to_address };
+  return null;
+}
+export function crewRouteCache(days, nowMs) {
+  const byPair = new Map();
+  for (const d of days || []) {
+    if (!d) continue;
+    const approved = d.status === 'approved' || d.status === 'changed';
+    const tasks = Array.isArray(d.tasks) ? d.tasks : [...(d.approved_tasks || []), ...(d.owner_tasks || [])];
+    for (const t of tasks) {
+      if (!t || t.source !== 'robot') continue;
+      const pair = crewTaskRoutePair(t);
+      if (!pair) continue;
+      const key = pair.from_site + '|' + (pair.to_site || pair.to_address);
+      const why = String(t.why || '');
+      const at = Date.parse(t.route_at);
+      const fresh = approved || (Number.isFinite(at) && nowMs - at < CREW_ROUTE_CACHE_HOURS * 3600000);
+      const cur = byPair.get(key);
+      if (t.drive_min != null && Number.isFinite(Number(t.drive_min)) && fresh) {
+        if (!cur || cur.drive_seconds == null || String(t.route_at || '') > String(cur.at || '')) {
+          byPair.set(key, { ...pair, drive_seconds: Number(t.drive_min) * 60, has_ferry: /Ferry on the route\./.test(why), fail_runs: 0, at: t.route_at || null });
+        }
+      } else if (t.drive_min == null && /Route tries: (\d+)\./.test(why) && !cur) {
+        byPair.set(key, { ...pair, drive_seconds: null, has_ferry: false, fail_runs: Number(/Route tries: (\d+)\./.exec(why)[1]), at: t.route_at || null });
+      }
+    }
+  }
+  return [...byPair.values()];
+}
+
+// Up to CREW_ROUTE_CALLS_MAX router calls for the trips the plan could not
+// time (deliveries first, soonest first). A sane answer is cached; one
+// that ends too far away is kept so the plan says out of area; anything
+// else counts one more failed try.
+async function crewRoutes(env, needs, input, nowMs) {
+  const out = { calls: 0, entries: [] };
+  const nowIso = new Date(nowMs).toISOString();
+  const sites = new Map((input.sites || []).filter((s) => s && s.id).map((s) => [String(s.id).toLowerCase(), s]));
+  const confirmed = (s) => !!s && s.geo_status === 'confirmed' && finite(s.lat) && finite(s.lng);
+  const prior = new Map((input.routes || []).map((r) => [String(r.from_site).toLowerCase() + '|' + (r.to_site ? String(r.to_site).toLowerCase() : String(r.to_address)), r]));
+  for (const need of needs || []) {
+    if (out.calls >= CREW_ROUTE_CALLS_MAX) break;
+    const from = sites.get(need.from_site);
+    if (!confirmed(from)) continue;
+    let destLat = null, destLng = null, destAddress = need.to_address;
+    if (need.to_site) {
+      const to = sites.get(need.to_site);
+      if (!confirmed(to)) continue;
+      destLat = to.lat; destLng = to.lng; destAddress = to.address;
+    }
+    out.calls++;
+    const answer = await computeRoute(env, { originLat: from.lat, originLng: from.lng, destAddress, destLat, destLng, needDirections: true, nowMs });
+    const prev = prior.get(need.key);
+    const entry = { from_site: need.from_site, to_site: need.to_site, to_address: need.to_address, drive_seconds: null, has_ferry: false, meters: null, dest_lat: null, dest_lng: null, fail_runs: ((prev && Number(prev.fail_runs)) || 0) + 1, at: nowIso };
+    if (answer.ok) {
+      const base = [...sites.values()].find((s) => s.kind === 'base' && s.active !== false && confirmed(s) && marketKey(s.market) === marketKey(from.market)) || from;
+      const sane = routeSanity({ meters: answer.meters, driveSeconds: answer.driveSeconds, endLat: answer.destLat, endLng: answer.destLng, originLat: from.lat, originLng: from.lng, marketCenter: { lat: base.lat, lng: base.lng } });
+      if (sane.ok || sane.reason === 'too_far') {
+        Object.assign(entry, { drive_seconds: answer.driveSeconds, has_ferry: !!answer.hasFerry, meters: answer.meters, dest_lat: answer.destLat, dest_lng: answer.destLng, fail_runs: 0 });
+      }
+    }
+    out.entries.push(entry);
+  }
+  return out;
+}
+
+// Every read the robot makes itself (the service key can read these; the
+// definer read hc_crew_plan_inputs covers the rest). Paged past the
+// 1000-row cap; ANY failed read or page answers { error } and the run
+// writes nothing.
+async function crewGather(env, inputs, todayNy) {
+  const lo = crewDayAdd(todayNy, -3), hi = crewDayAdd(todayNy, 10);
+  const window = '&or=(and(delivery_at_utc.gte.' + lo + ',delivery_at_utc.lt.' + hi + '),and(delivery_at_utc.is.null,event_start_at.gte.' + lo + ',event_start_at.lt.' + hi + '))';
+  const primary = await familyGetAll(env, 'orders?select=' + CREW_ORDER_COLUMNS + '&stage=in.(invoiced,deposit_paid,paid_full)' + window + '&order=id.asc');
+  if (!primary.ok) return { error: 'orders read failed (' + primary.status + ')' };
+  let fam = { orders: [] };
+  if (primary.rows.length) {
+    try { fam = await loadJobFamilies(env, primary.rows, { columns: CREW_FAMILY_EXTRA_COLUMNS }); } catch (e) { fam = null; }
+    if (!fam) return { error: 'job family read failed' };
+  }
+  const byId = new Map();
+  for (const o of [...fam.orders, ...primary.rows]) if (o && o.id && !byId.has(o.id)) byId.set(o.id, o);
+  // The orders the stored rows name (and their day 1), any stage, for the
+  // held check: a cancelled job is never in the booked read.
+  const readIds = async (ids) => {
+    for (let i = 0; i < ids.length; i += 60) {
+      const r = await familyGetAll(env, 'orders?select=' + CREW_ORDER_COLUMNS + '&id=in.(' + ids.slice(i, i + 60).join(',') + ')&order=id.asc');
+      if (!r.ok) return false;
+      for (const o of r.rows) if (o && o.id) byId.set(o.id, o);
+    }
+    return true;
+  };
+  const named = new Set();
+  for (const d of inputs.days || []) {
+    for (const t of [...(d.approved_tasks || []), ...(d.owner_tasks || []), ...(Array.isArray(d.tasks) ? d.tasks : [])]) {
+      if (t && UUID_RE.test(String(t.order_id || ''))) named.add(String(t.order_id));
+    }
+  }
+  if (!(await readIds([...named].filter((id) => !byId.has(id)).sort()))) return { error: 'held check read failed' };
+  const heads = [...new Set([...byId.values()].map((o) => o.parent_order_id).filter((id) => id && UUID_RE.test(String(id)) && !byId.has(id)))].sort();
+  if (!(await readIds(heads))) return { error: 'held check read failed' };
+  const orders = [...byId.values()];
+  const ids = orders.map((o) => o.id).filter((id) => UUID_RE.test(String(id))).sort();
+  const headIds = orders.filter((o) => !o.parent_order_id).map((o) => o.id).filter((id) => UUID_RE.test(String(id))).sort();
+  // Attached add-on invoices (072). 404 before 072: none.
+  const attachments = [];
+  for (let i = 0; i < headIds.length; i += 60) {
+    const r = await familyGetAll(env, 'order_invoices?select=head_order_id,qbo_id,doc_number,role,total_cents,open_cents,voided,line_names,detached_at&head_order_id=in.(' + headIds.slice(i, i + 60).join(',') + ')&detached_at=is.null&order=id.asc');
+    if (!r.ok && r.status === 404) break;
+    if (!r.ok) return { error: 'add-on invoice read failed (' + r.status + ')' };
+    attachments.push(...r.rows);
+  }
+  // Coconut drops (049): confirmed by landing day, claims by prep day.
+  const sLo = crewDayAdd(todayNy, -4), sHi = crewDayAdd(todayNy, 10);
+  const supply = await familyGetAll(env, 'coconut_supply_orders?select=id,supplier,delivery_date,delivery_window,market,ship_to_garage,boxes,status,prep_day' +
+    '&or=(and(status.eq.confirmed,delivery_date.gte.' + sLo + ',delivery_date.lte.' + sHi + '),and(status.eq.claimed,prep_day.gte.' + sLo + ',prep_day.lte.' + sHi + '))&order=id.asc');
+  if (!supply.ok) return { error: 'supply read failed (' + supply.status + ')' };
+  // Open calendar findings (072). 404 before 072: none.
+  const findings = [];
+  for (let i = 0; i < ids.length; i += 60) {
+    const r = await familyGetAll(env, 'hc_calendar_findings?select=id,order_id,code,status&status=in.(open,still_on)&order_id=in.(' + ids.slice(i, i + 60).join(',') + ')&order=id.asc');
+    if (!r.ok && r.status === 404) break;
+    if (!r.ok) return { error: 'calendar findings read failed (' + r.status + ')' };
+    findings.push(...r.rows);
+  }
+  // Pending coordinator times (042), the same read the departure scan makes.
+  const proposals = [];
+  for (let i = 0; i < ids.length; i += 60) {
+    const r = await familyGetAll(env, 'order_time_proposals?select=intake_id,order_id,proposed_arrive_at,status&status=eq.pending&order_id=in.(' + ids.slice(i, i + 60).map((id) => encodeURIComponent('"' + id + '"')).join(',') + ')&order=intake_id.asc');
+    if (!r.ok && r.status === 404) break;
+    if (!r.ok) return { error: 'time proposal read failed (' + r.status + ')' };
+    proposals.push(...r.rows);
+  }
+  // The departure plan's own drive times (a garage start reuses them).
+  const departures = await familyGetAll(env, 'order_departures?select=order_id,plan_date,dest_address,drive_seconds,has_ferry,computed_at&plan_date=gte.' + crewDayAdd(todayNy, -1) + '&plan_date=lte.' + crewDayAdd(todayNy, 3) + '&order=order_id.asc');
+  if (!departures.ok) return { error: 'departure read failed (' + departures.status + ')' };
+  return { orders, attachments, supply: supply.rows, findings, proposals, departures: departures.rows };
+}
+
+async function crewRunLog(env, counts) {
+  const p = {};
+  for (const k of ['days_seen', 'written', 'same', 'change_proposed', 'kept', 'stale', 'frozen', 'red', 'amber', 'routes']) p[k] = Number(counts[k]) || 0;
+  p.error = counts.error ? String(counts.error).slice(0, 120) : null;
+  const r = await crewRpc(env, 'hc_crew_run_log', { p_request_key: crypto.randomUUID(), p_counts: p });
+  return r.ok;
+}
+
+// One pending place (an address Sidd typed) geocoded per run, written back
+// ONCE as found or failed. Only Sidd's tap in HC App makes it confirmed;
+// nothing routes from it before that. A network error writes nothing.
+async function crewGeocodeOne(env, sites, nowMs) {
+  if (routeProvider(env) !== 'apple_maps') return false;
+  const s = (sites || []).find((x) => x && x.id && x.active !== false && x.geo_status === 'pending' && collapseSpaces(x.address));
+  if (!s) return false;
+  let geo;
+  try { geo = await appleGet(env, '/geocode', { q: collapseSpaces(s.address), limitToCountries: 'US', lang: 'en-US' }, nowMs); }
+  catch (e) { console.log('crew plan: geocode failed (' + String((e && e.message) || 'error').slice(0, 60) + '), retried next hour'); return false; }
+  const hit = geo && Array.isArray(geo.results) && geo.results[0];
+  const lat = hit && hit.coordinate ? Number(hit.coordinate.latitude) : NaN;
+  const lng = hit && hit.coordinate ? Number(hit.coordinate.longitude) : NaN;
+  const found = finite(lat) && finite(lng);
+  const r = await crewRpc(env, 'hc_crew_site_geo_put', { p_site_id: s.id, p_version: s.version, p_lat: found ? lat : null, p_lng: found ? lng : null, p_status: found ? 'found' : 'failed' });
+  return r.ok;
+}
+
+// The day as Sidd sees it, for the owner nudges: the stored day when the
+// database sends it whole (tasks, gap counts, proposal), else the robot's
+// own draft of it this run.
+function crewOwnerDayState(stored, plan, market, day) {
+  const sd = stored.get(market + '|' + day) || null;
+  if (sd && Array.isArray(sd.tasks)) return sd;
+  const pd = ((plan && plan.days) || []).find((x) => x.market === market && x.day === day) || null;
+  if (sd && sd.status === 'approved') return sd;
+  if (sd && sd.status === 'changed') return { ...sd, proposal: sd.proposal && typeof sd.proposal === 'object' ? sd.proposal : (pd ? { gaps: pd.gaps } : null) };
+  if (pd) return { market, day, status: 'draft', tasks: pd.tasks, red_count: pd.red_count, amber_count: pd.amber_count };
+  return sd;
+}
+
+// The worker's timed banners (design 6.1): crew_tomorrow at 6 PM market
+// time (mode on), the owner's 4 PM "not approved" nudge and the Thursday
+// 6 PM "next week" nudge (practice or on). notify gates all three. Stable
+// queue ids, so a repeat tick is a no-op. Returns what was queued.
+async function crewTimedBanners(env, mode, inputs, plan, ordersById, nowMs) {
+  const sent = [];
+  if (inputs.notify !== true || mode === 'off') return sent;
+  const people = Array.isArray(inputs.people) ? inputs.people : [];
+  const stored = new Map((inputs.days || []).filter((d) => d && d.day).map((d) => [marketKey(d.market) + '|' + String(d.day).slice(0, 10), d]));
+  const thisYear = crewDayInZone(nowMs, ET_ZONE).slice(0, 4);
+  if (mode === 'on') {
+    for (const market of CREW_MARKETS) {
+      // 6 PM market time, inside 18:00 to 21:00 (the :17 ticks at 18, 19, 20).
+      const hour = Number(marketHour(nowMs, market));
+      if (hour < 18 || hour > 20) continue;
+      const tomorrow = crewDayAdd(crewDayInZone(nowMs, marketZone(market)), 1);
+      const sends = crewTomorrowSends(stored.get(market + '|' + tomorrow) || null, people, ordersById, inputs.time_off || [], { never_schedule: inputs.never_schedule || [] }, thisYear);
+      if (!sends.length) continue;
+      const inList = sends.map((s) => encodeURIComponent('"' + s.email + '"')).join(',');
+      const tokenRows = await fetchSb(env, 'push_tokens?select=email,apns_token&email=in.(' + inList + ')') || [];
+      for (const s of sends) {
+        const tokens = [...new Set(tokenRows.filter((t) => String(t.email || '').trim().toLowerCase() === s.email && String(t.apns_token || '').trim()).map((t) => t.apns_token))];
+        if (!tokens.length) continue;
+        // One person: every device of theirs, nobody else (opts.resolved).
+        const resolved = { market, people: tokens.map((t, i) => ({ email: s.email + '#' + i, role: 'team', name: '' })), tokensByEmail: new Map(tokens.map((t, i) => [s.email + '#' + i, t])), reached: [s.email], unreachable: [] };
+        const res = await sendPushToMarket(env, market, s.title, s.body, { resolved, queueId: s.id, collapseId: s.collapse_id, threadId: s.thread_id, kind: 'crew_tomorrow', day: tomorrow });
+        if (res.queued) sent.push({ kind: 'crew_tomorrow', person_id: s.person_id, id: s.id });
+      }
+    }
+  }
+  const nyHour = Number(marketHour(nowMs, 'ny'));
+  const todayNy = crewDayInZone(nowMs, ET_ZONE);
+  const owner = async (body, queueId, collapseId, day) => {
+    const res = await sendPushToMarket(env, 'ny', 'Crew plan', body, { recipients: 'owners', ownersOnly: true, queueId, collapseId, threadId: 'crew-owner', kind: 'crew_owner', day, nowMs });
+    if (res.queued) sent.push({ kind: 'crew_owner', id: queueId, body });
+  };
+  if (nyHour === 16 || nyHour === 17) {
+    const tomorrow = crewDayAdd(todayNy, 1);
+    const open = CREW_MARKETS.map((m) => crewOwnerDayState(stored, plan, m, tomorrow)).some((d) => d && d.status === 'draft' && crewDayRowCount(d) !== 0);
+    if (open) await owner("Tomorrow's crew plan is not approved. Crew get nothing until you approve.", md5Uuid('hc-crew-owner-v1' + tomorrow), 'crew-owner-' + tomorrow, tomorrow);
+  }
+  if (weekdayOf(todayNy) === 'Thu' && (nyHour === 18 || nyHour === 19)) {
+    let daysWithRows = 0, questions = 0;
+    for (let i = 1; i <= 7; i++) {
+      const day = crewDayAdd(todayNy, i);
+      for (const m of CREW_MARKETS) {
+        const d = crewOwnerDayState(stored, plan, m, day);
+        if (!d || crewDayRowCount(d) === 0) continue;
+        daysWithRows++;
+        questions += crewDayQuestions(d) || 0;
+      }
+    }
+    if (daysWithRows) {
+      await owner("Next week's crew plan is ready: " + daysWithRows + (daysWithRows === 1 ? ' day, ' : ' days, ') + questions + (questions === 1 ? ' question.' : ' questions.'),
+        md5Uuid('hc-crew-owner-week-v1' + todayNy), 'crew-owner-week-' + todayNy, todayNy);
+    }
+  }
+  return sent;
+}
+
+// The hourly robot. Never throws. Returns its counts (and logs them).
+export async function runCrewPlanScan(env) {
+  const counts = { mode: 'off', days_seen: 0, written: 0, same: 0, change_proposed: 0, kept: 0, stale: 0, frozen: 0, off: 0, quiet: 0,
+    failed: 0, waiting: 0, red: 0, amber: 0, routes: 0, banners: 0, error: null };
+  const secret = crewPlanMode(env);
+  if (secret === 'off') { console.log('crew plan: CREW_PLAN_MODE is off, nothing read or written'); return counts; }
+  let logged = false;
+  try {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const todayNy = crewDayInZone(nowMs, ET_ZONE);
+    const from = [crewDayAdd(todayNy, -2), crewWeekStart(crewDayAdd(todayNy, -1))].sort()[0];
+    const r = await crewRpc(env, 'hc_crew_plan_inputs', { p_from: from, p_to: crewDayAdd(todayNy, 9) });
+    if (!r.ok) {
+      console.log('crew plan: hc_crew_plan_inputs answered ' + r.status + (r.status === 404 ? ' (migration 073 is not live)' : '') + ', nothing written');
+      return counts;
+    }
+    const inputs = r.data;
+    const mode = inputs.code === 'ok' ? crewEffectiveMode(secret, inputs.mode) : 'off';
+    counts.mode = mode;
+    if (mode === 'off') { console.log('crew plan: the database mode is off, nothing written'); return counts; }
+    const gathered = await crewGather(env, inputs, todayNy);
+    if (gathered.error) {
+      counts.error = gathered.error;
+      console.error('crew plan: ' + gathered.error + ', nothing written this run');
+      logged = true;
+      await crewRunLog(env, counts);
+      console.log('crew plan scan: ' + JSON.stringify(counts));
+      return counts;
+    }
+    const input = {
+      now: nowIso,
+      settings: { mode: inputs.mode, notify: inputs.notify === true, manager_can_approve: inputs.manager_can_approve === true, never_schedule: inputs.never_schedule || [], version: inputs.settings_version },
+      rules: inputs.rules || [], sites: inputs.sites || [], people: inputs.people || [], jobs: inputs.jobs || [], days: inputs.days || [],
+      time_off: inputs.time_off || [], ...gathered, routes: crewRouteCache(inputs.days, nowMs),
+    };
+    let plan = planCrew(input, CREW_LIB);
+    const routed = await crewRoutes(env, plan.routeNeeds, input, nowMs);
+    counts.routes = routed.calls;
+    if (routed.entries.length) {
+      const key = (x) => String(x.from_site).toLowerCase() + '|' + (x.to_site ? String(x.to_site).toLowerCase() : String(x.to_address));
+      const merged = new Map(input.routes.map((x) => [key(x), x]));
+      for (const e of routed.entries) merged.set(key(e), e);
+      input.routes = [...merged.values()];
+      plan = planCrew(input, CREW_LIB);
+    }
+    for (const d of plan.days) {
+      if (d.frozen) continue;
+      counts.days_seen++;
+      counts.red += d.red_count;
+      counts.amber += d.amber_count;
+      if (d.quiet) counts.quiet++;
+    }
+    const puts = plan.days.filter((d) => d.put).sort((a, b) => (a.day + a.market < b.day + b.market ? -1 : a.day + a.market > b.day + b.market ? 1 : 0));
+    let n = 0;
+    for (const d of puts) {
+      if (n >= CREW_PUTS_PER_RUN_MAX) { counts.waiting++; continue; }
+      n++;
+      const res = await crewRpc(env, 'hc_crew_plan_put', {
+        p_request_key: md5Uuid('hc-crew-put-v1' + d.market + d.day + d.inputs_md5 + String(d.version)),
+        p_market: d.market, p_day: d.day, p_inputs_md5: d.inputs_md5, p_expected_version: d.version,
+        p_tasks: d.tasks, p_gaps: d.gaps, p_reasons: d.reasons,
+      });
+      const code = res.ok && res.data && typeof res.data.code === 'string' ? res.data.code : null;
+      if (code && ['written', 'same', 'change_proposed', 'kept', 'stale', 'frozen', 'off'].includes(code)) counts[code]++;
+      else { counts.failed++; console.error('crew plan: put for ' + d.market + ' ' + d.day + ' answered ' + res.status); }
+    }
+    try { await crewGeocodeOne(env, inputs.sites, nowMs); } catch (e) { console.error('crew plan: geocode error'); }
+    try {
+      const ordersById = new Map(gathered.orders.map((o) => [String(o.id).toLowerCase(), o]));
+      const sent = await crewTimedBanners(env, mode, inputs, plan, ordersById, nowMs);
+      counts.banners = sent.length;
+    } catch (e) { console.error('crew plan: banner error:', (e && e.name) || 'error'); }
+    if (counts.failed) counts.error = counts.failed + ' put' + (counts.failed === 1 ? '' : 's') + ' refused';
+    logged = true;
+    await crewRunLog(env, counts);
+  } catch (e) {
+    counts.error = 'scan failed';
+    console.error('runCrewPlanScan error:', (e && e.message) || e);
+    if (!logged && counts.mode !== 'off') { try { await crewRunLog(env, counts); } catch (e2) { /* nothing more to do */ } }
+  }
+  console.log('crew plan scan: ' + JSON.stringify(counts));
+  return counts;
+}
+
+// The 8am digest lines (owner Telegram, a summary only, never a decision):
+// "Crew NY: today Ana + Cy + Ben approved. Tomorrow draft, 2 questions."
+// one per planned market, and in practice the scorecard. [] with the
+// switch off, on any read failure, or when the database mode is off.
+export async function buildCrewPlanDigestLines(env, nowMs = Date.now()) {
+  try {
+    const secret = crewPlanMode(env);
+    if (secret === 'off') return [];
+    const todayNy = crewDayInZone(nowMs, ET_ZONE);
+    const r = await crewRpc(env, 'hc_crew_plan_inputs', { p_from: crewDayAdd(todayNy, -8), p_to: crewDayAdd(todayNy, 2) });
+    if (!r.ok || !r.data || r.data.code !== 'ok') return [];
+    const mode = crewEffectiveMode(secret, r.data.mode);
+    if (mode === 'off') return [];
+    const inputs = r.data;
+    const stored = new Map((inputs.days || []).filter((d) => d && d.day).map((d) => [marketKey(d.market) + '|' + String(d.day).slice(0, 10), d]));
+    const lines = [];
+    for (const m of CREW_MARKETS) {
+      const rule = (inputs.rules || []).find((x) => x && marketKey(x.market) === m && x.key === 'planned');
+      if (!rule || Number(rule.value) !== 1) continue;
+      const today = crewDayInZone(nowMs, marketZone(m));
+      lines.push(tgSafe(crewDigestLine(m, stored.get(m + '|' + today) || null, stored.get(m + '|' + crewDayAdd(today, 1)) || null, inputs.people || [])));
+    }
+    if (mode === 'practice') {
+      const line = await crewScorecardLine(env, inputs, todayNy);
+      if (line) lines.push(tgSafe(line));
+    }
+    return lines;
+  } catch (e) {
+    console.error('crew plan digest error:', (e && e.name) || 'error');
+    return [];
+  }
+}
+// The practice scorecard (design 7.3), counts only, never pay: "Crew plan
+// 7 days: 21 rows drafted, you changed 3, removed 1. Planned 6
+// people-days, clocked 5." Null when the stored drafts are not sent whole
+// or the shift read fails.
+async function crewScorecardLine(env, inputs, todayNy) {
+  const from = crewDayAdd(todayNy, -7), to = crewDayAdd(todayNy, -1);
+  const past = (inputs.days || []).filter((d) => d && String(d.day).slice(0, 10) >= from && String(d.day).slice(0, 10) <= to);
+  if (past.some((d) => d.status === 'draft' && !Array.isArray(d.tasks))) return null;
+  const roster = new Map((inputs.people || []).filter((p) => p && p.kind === 'roster').map((p) => [String(p.person_id).toLowerCase(), p]));
+  let robot = 0, changed = 0, byHand = 0, removed = 0;
+  const planned = new Set();
+  const emails = new Set();
+  for (const d of past) {
+    const tasks = Array.isArray(d.tasks) ? d.tasks : (d.approved_tasks || []);
+    for (const t of tasks) {
+      if (!t) continue;
+      if (t.source === 'robot') robot++; else if (String(t.key || '').startsWith('own:')) byHand++; else changed++;
+      for (const p of t.people || []) {
+        const person = roster.get(String(p && p.person_id).toLowerCase());
+        if (!person) continue;
+        planned.add(String(person.person_id) + '|' + String(d.day).slice(0, 10));
+        if (person.email) emails.add(String(person.email).toLowerCase());
+      }
+    }
+    removed += (d.cancelled_keys || []).length;
+  }
+  const shifts = await fetchSb(env, 'shifts?select=worker_email,clock_in_at&clock_in_at=gte.' + crewDayAdd(from, -1) + 'T00:00:00Z&clock_in_at=lt.' + crewDayAdd(todayNy, 1) + 'T00:00:00Z&order=clock_in_at.asc&limit=1000');
+  if (!shifts) return null;
+  const clocked = new Set();
+  for (const s of shifts) {
+    const email = String((s && s.worker_email) || '').trim().toLowerCase();
+    if (!email || email === CREW_APP_REVIEW_EMAIL || !emails.has(email)) continue;
+    const day = etDateStr(s.clock_in_at);
+    if (day >= from && day <= to) clocked.add(email + '|' + day);
+  }
+  const drafted = robot + changed + removed;
+  return 'Crew plan 7 days: ' + drafted + (drafted === 1 ? ' row' : ' rows') + ' drafted, you changed ' + changed + ', removed ' + removed
+    + (byHand ? ', added ' + byHand + ' by hand' : '') + '. Planned ' + planned.size + ' people-days, clocked ' + clocked.size + '.';
 }

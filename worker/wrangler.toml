@@ -7,7 +7,12 @@ crons = [
   "0 12 * * *",     # 12 UTC daily (8am EDT summer, 7am EST winter): Weee box math digest, payroll on Mondays
   "0 * * * *",      # every hour — reconfirmation scan + post-event debrief scan
   "*/5 * * * *",    # every 5 minutes — intake approval cards (summary + buttons)
+  "17 * * * *",     # every hour at :17: the automatic crew plan (migration 073); off unless CREW_PLAN_MODE
 ]
+# Cron count: 4 lines here. The Cloudflare free plan allows 5 cron triggers
+# per ACCOUNT, so count every worker on the account before a deploy
+# (CLAUDE.md, crew plan section). At the limit, run runCrewPlanScan in the
+# hourly branch in its own try instead (design 4.1).
 
 # Secrets (set via `wrangler secret put <NAME>`):
 # SAFE WEBHOOK ROLLOUT: apply migrations 024 and 027 first. Then configure the
@@ -190,3 +195,17 @@ crons = [
 #   `wrangler secret put DEAL_FACTS`, value on; `wrangler secret delete
 #   DEAL_FACTS` is the kill switch (rows already made stay in the app until
 #   Sidd undoes them).
+# AUTOMATIC CREW PLAN (2026-11-27, migration 073 must be live first). The
+# "17 * * * *" line runs runCrewPlanScan: it drafts the crew plan for the
+# coming days through hc_crew_plan_put and sends the timed crew and owner
+# banners. One setting, a secret, default off, never in this file:
+# CREW_PLAN_MODE - unset, blank or any other value is OFF: nothing is read,
+#   written or sent, and the departure plan is byte for byte as before (NJ
+#   garage start, invoice address first). 'practice': drafts, owner banners
+#   and the owner digest line. 'on': plus the 6 PM crew banners and the
+#   departure plan starts from the approved plan's place and address. The
+#   database mode (crew_plan_settings.mode, a runbook paste) is the second
+#   switch; the lower of the two wins. `wrangler secret put CREW_PLAN_MODE`
+#   (practice or on); `wrangler secret delete CREW_PLAN_MODE` is the kill
+#   switch (drafts already saved stay in HC App; crew banners stop and the
+#   departure plan goes back to the garage on its next tick).
