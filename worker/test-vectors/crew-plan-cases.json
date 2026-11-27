@@ -100,28 +100,28 @@
     "receive": "\"{from}: check in {boxes} box(es) when they arrive ({window_start} to {window_end}).\" With no window: \"{from}: check in {boxes} box(es) when they arrive.\"",
     "move": "\"After the boxes arrive ({window_start} to {window_end}): take {boxes} boxes from {from} to {to}. {cars}.\" With no window: \"After the boxes arrive: take ...\". A move after prep (job card prep base): \"After prep: take ...\"",
     "prep": "\"Any time at {place}: prep {client} for {job day}, {coconuts} coconuts, {cut} cut, branded.\" Parts drop out when unknown (no count, no cut) or not branded. No place: \"Any time: prep ... Place: Sidd will confirm.\"",
-    "deliver": "\"{start }{from}: pick up {boxes} box(es), {cars}. Deliver to {client} at {to_address}.\" then \" Address: Sidd will confirm.\" when to_address is null (and \"Deliver to {client}.\"), then \" Arrive by {arrival}.\" when an arrival time is known, then \" Time: Sidd will confirm.\" when there is no start and no arrival. Unknown count: \"pick up the boxes\". No from site (vegas owner row): the from part and its colon drop to \"{start}: pick up ...\".",
+    "deliver": "\"{start }{from}: pick up {boxes} box(es), {cars}. Deliver to {client} at {to_address}.\" then \" Address: Sidd will confirm.\" when to_address is null (and \"Deliver to {client}.\"), then \" Arrive by {arrival}.\" when the row carries its arrival, then \" Time: Sidd will confirm.\" when there is no start and no arrival. The arrival is read from the own fields of the row: busy_to minus unload_minutes when the row has a leave_by OR has no busy_from (the robot keeps busy_to = arrival + unload_minutes on every deliver row with a known arrival, and no busy_from while it has no start); else, with a leave_by and drive_min and no busy_to, leave_by + drive_min + 60. A crew start with no drive time yet (no leave_by) shows its start only. Unknown count: \"pick up the boxes\". No from site (vegas owner row): the from part and its colon drop to \"{start}: pick up ...\".",
     "cart_drop": "\"Be at {venue} by {start} with the {label lowercased first letter} (from {home}). {cars}.\" No home: no \"(from ...)\". No start: \"Be at {venue} with the ... {cars}. Time: Sidd will confirm.\"",
     "cart_pickup": "\"{start} to {end} at {venue}: pick up the {label} and bring it back to {home}. {cars}.\" No end: \"{start} at {venue}: ...\". No home: \"...: pick up the {label}. {cars}.\"",
     "on_site": "\"{start} to {end} at {venue}: stay with {client} (on site).\"",
     "other": "\"{start}: {label}.\" or \"{label}.\" when untimed."
   },
   "rules": {
-    "R1": "Days: day = 072 hc_order_family_day(coalesce(delivery_at_utc, event_start_at)): a 00:00 UTC marker is that date, any other time is its New York date. Window today - 1 to today + 8 in market time. Only markets with rule planned = 1 are planned (needs an active base with confirmed coordinates). Every job day in another market gets ONE owner-only market_not_planned day gap and no rows.",
-    "R2": "Jobs: stages invoiced, deposit_paid, paid_full only (leads and fulfilled or complete never). One job day per 072 family day with its OWN coconuts_qty; a child takes its head job card and, if it has no cut, the head cut. A child of a cancelled head, or a cancelled day, has no rows. day_not_linked: no external_invoice_id and no parent_order_id. count_missing: coconuts_qty null. count_disputed: an open or still_on 072 finding count_differs or days_differ on that order. calendar_check: any other open or still_on finding on that order (one entry per code per row). addon_not_on_card: a live, not voided, read add-on on the head whose line name matches /cart/i with no cart extra, /cooler/i with no cooler extra, or /staff|attendant/i with no on_site entries.",
+    "R1": "Days: day = 072 hc_order_family_day(coalesce(delivery_at_utc, event_start_at)): a 00:00 UTC marker is that date, any other time is its New York date. Window today - 1 to today + 8 in market time. Only markets with rule planned = 1 are planned (needs an active base with confirmed coordinates). Every job day in another of the four crew markets (ny, vegas, miami, la) gets ONE owner-only market_not_planned day gap and no rows; an order in any other market (other) makes no day at all (073 refuses such a p_market).",
+    "R2": "Jobs: stages invoiced, deposit_paid, paid_full only (leads and fulfilled or complete never). One job day per 072 family day with its OWN coconuts_qty; a child takes its head job card and, if it has no cut, the head cut. A child of a cancelled head, or a cancelled day, has no rows. day_not_linked: no external_invoice_id and no parent_order_id. count_missing: coconuts_qty null. count_disputed: an open or still_on 072 finding count_differs or days_differ on that order. calendar_check: any other open or still_on finding on that order (one entry per code per row). A finding keyed only by an invoice (order_id null, qbo_id set: 072 key <code>:qbo:<id>) belongs to the day 1 (no parent) whose external_invoice_id is that qbo_id. addon_not_on_card: a live, not voided, read add-on on the head whose line name matches /cart/i with no cart extra, /cooler/i with no cooler extra, or /staff|attendant/i with no on_site entries.",
     "R3": "Prep: card prep skip = no prep row. auto (and base, staging) ALWAYS make a prep row on the use day; cut = crack_type, else invoice cracking, else the family head cut (review counts as none); no cut = amber cut_unknown. Branding: card yes = branded, no = not; auto = branded when stamp ordered or received, logo_received true or logo_asset set; stamp not_needed = not branded, no gap; else amber branding_unknown.",
-    "R4": "boxes = ceil(coconuts / 9) per job (null when the count is missing; cars then assume 1). Use day = D - 1 when the job has a prep row, else D.",
+    "R4": "boxes = ceil(coconuts / 9) per job (null when the count is missing; cars then assume 1). Use day = D - 1 when the job has a prep row, else D. 073 ranges (hc_crew_task_norm): a row never carries more than 500 boxes or 5000 coconuts; a bigger count is left off that row (null, so the words say \"the boxes\") with red count_disputed (too_big words), never a wrong number.",
     "R5": "Supply (049's shared rule): counting rows are status confirmed with a delivery_date (and, in ny, ship_to_garage true) or status claimed. Short test per (market, P = D - 1) over that P's job days: need = ceil(sum of known coconuts / 9) + 1 per job with no count; email credit = drops taken first in, first out (delivery_date, then id) from those landing on or before the group's latest use day, groups in ascending P, until need is met; have = max(email credit, weee claims with prep_day P) + other-supplier claims with prep_day P; short = need - have. boxes_short (red, owner only) goes on every prep and deliver row of the group. Within a group the taken drops are split to jobs in R13 order of their deliver rows, each up to its own boxes (1 when unknown). no_supply_record: day gap on each job day of a planned market that has NO counting row in the window. Claims make no rows; a staged job leaning on a claim gets claim_no_drop_day.",
     "R6": "Staging per JOB: staged when the card says always, or auto and any of its drops waits (use day - landing day) more than the base hold_nights. hold_unconfirmed (amber) when the card is auto, an active cold storage exists, a drop waits 1 night or more and the base hold is not confirmed. never with too long a wait: red hold_too_long. Staged but no active cold storage WITH an address: red no_staging and the plan stays at the base. Staged and a drop waits more than the cold storage hold_nights, or hold_nights is null: red hold_unknown. A staged job's drops get ONE move row per drop on the landing day; boxes not moved get a receive row (one per drop).",
     "R7": "Prep place: not staged = the base. Staged: card staging = the cold storage; card base = the base, and the move happens AFTER prep on the use day (when any_time), with the R6 hold check at the base; card auto with cold storage can_prep yes = the cold storage; otherwise red prep_place_unknown and from_site null. Never a guessed place.",
-    "R8": "Times. receive: start, end = the drop window, time_source supply_window. move: start, end = the window, when after_drop. prep: when any_time; amber late_supply when a drop allocated to the job lands on the use day. deliver: arrival = the confirmed delivery_request window, else the invoice delivery_window (amber time_unconfirmed), parsed by parseArrivalTime on the job day; a pending order_time_proposals time that is earlier wins (amber time_proposal_pending); kind assumed = red needs_ampm and no arrival. leave_by = leaveByMs(arrival, drive, ferry) floored to the minute (60 min buffer, 30 min ferry). start = card crew_start (time_source crew_start; amber no_arrival when no arrival; amber start_after_leave_by when crew_start > leave_by - load_minutes), else leave_by - load_minutes (time_source arrival). Drive: for a base start the order_departures drive_seconds for the same order and dest_address first, else the route answer; no route answer yet = amber route_pending and no start; 3 failed runs = red no_time. No arrival and no crew start = red no_time. No address = no route tried. extras: start = the card time at the VENUE (time_source owner); missing time red equipment_no_time; missing home red equipment_no_home. on_site rows from the card. Amber early_start when start < earliest_start_min; amber site_closed when a row starts at a site before opens_at, or a move ends (window end + drive + unload_minutes) after the cold storage closes_at.",
-    "R8_busy": "Busy windows (busy_from, busy_to) for clash and long_day: deliver = start to arrival + unload_minutes; no arrival = start + drive + unload; no drive either = start + 2 h; no start = none. extras = start - drive (unknown: 60 min) to start + 30 min (pickup: to its end). on_site = start to end. move = window end to window end + drive (unknown: 60 min) + unload; no window = none. receive = the drop window, only when receive_people >= 1. prep = none. Overlap is strict (a.from < b.to and b.from < a.to).",
-    "R9": "Address: to_address = delivery_notes, else venue (Navigate). Neither = red no_address. address_conflict (red, owner only) when invoice_fulfillment.read_status is complete and its zip differs from the to_address zip. out_of_area (red, day gap, no prep and no deliver row; drops still checked in; the job still counts in R5) when the address names a state outside the market drive area, or the route answer ends more than 250 km from the base (routeSanity too_far).",
-    "R10": "Cars and people: move and deliver cars = ceil(boxes / boxes_per_car) (1 when boxes unknown); extras 1 car; receive, prep, on_site 0 cars. need = max(cars, 2 when boxes > two_people_over else 1, card people_min, extra people) for move, deliver and extras; receive need = receive_people; prep need 1; on_site need = its people. The first `cars` people drive cars 1..cars in order; the rest ride (car null). rule_unconfirmed (one entry per row) when boxes_per_car, two_people_over (move, deliver) or receive_people (receive) is not confirmed. A missing rule: red rule_missing, 1 car assumed.",
+    "R8": "Times. receive: start, end = the drop window, time_source supply_window. move: start, end = the window, when after_drop. prep: when any_time; amber late_supply when a drop allocated to the job lands on the use day. deliver: arrival = the confirmed delivery_request window, else the invoice delivery_window (amber time_unconfirmed), parsed by parseArrivalTime on the job day; a pending order_time_proposals time that is earlier wins (amber time_proposal_pending); kind assumed = red needs_ampm and no arrival. leave_by = leaveByMs(arrival, drive, ferry) floored to the minute (60 min buffer, 30 min ferry). start = card crew_start (time_source crew_start; amber no_arrival when no arrival; amber start_after_leave_by when crew_start > leave_by - load_minutes), else leave_by - load_minutes rounded DOWN to 5 minutes (time_source arrival). drive_min = the drive in whole minutes rounded UP (so leave_by is reproduced exactly from it). Drive: on an approved or changed day, a robot row whose from_site, to_site and to_address are unchanged keeps its own approved drive_min (the approved plan never drifts with traffic; the alarm still follows live traffic); otherwise, for a base start, the order_departures drive_seconds for the same order and dest_address (a draft day keeps its own stored drive_min while that live drive is within 10 minutes of it), else the route answer; no route answer yet = amber route_pending and no start; 3 failed runs = red no_time (the try count is a fact of the day, so each try is written; a failed route is tried again 24 hours after its last try). No arrival and no crew start = red no_time. No address = no route tried. An address with no state, zip or known town (departureDestination usable false) is never routed: red no_address (incomplete words), no route_pending. extras: start = the card time at the VENUE (time_source owner); missing time red equipment_no_time; missing home red equipment_no_home. on_site rows from the card. Amber early_start when start < earliest_start_min; amber site_closed when a row starts at a site before opens_at, or a move ends (window end + drive + unload_minutes) after the cold storage closes_at.",
+    "R8_busy": "Busy windows (busy_from, busy_to) for clash and long_day: deliver = start to arrival + unload_minutes; no arrival = start + drive + unload; no drive either = start + 2 h; no start = no busy_from (it never clashes), but a known arrival still keeps busy_to = arrival + unload_minutes (the arrival the server words read). extras = start - drive (unknown: 60 min) to start + 30 min (pickup: to its end). on_site = start to end. move = window end to window end + drive (unknown: 60 min) + unload; no window = none. receive = the drop window, only when receive_people >= 1. prep = none. Overlap is strict (a.from < b.to and b.from < a.to).",
+    "R9": "Address: to_address = delivery_notes, else venue (Navigate), normalized by the shared Navigate rule (rules.held): over 200 characters is none (red no_address, too_long words). Neither = red no_address. address_conflict (red, owner only) when invoice_fulfillment.read_status is complete and its zip differs from the to_address zip. out_of_area (red, day gap, no prep and no deliver row; drops still checked in; the job still counts in R5) when the address names a state outside the market drive area, or the route answer ends more than 250 km from the base (routeSanity too_far).",
+    "R10": "Cars and people: move and deliver cars = ceil(boxes / boxes_per_car) (1 when boxes unknown); extras 1 car; receive, prep, on_site 0 cars. need = max(cars, 2 when boxes > two_people_over else 1, card people_min, extra people) for move, deliver and extras; receive need = receive_people; prep need 1; on_site need = its people. The first `cars` people drive cars 1..cars in order; the rest ride (car null). rule_unconfirmed (one entry per row) when boxes_per_car, two_people_over (move, deliver) or receive_people (receive) is not confirmed. A missing rule: red rule_missing, 1 car assumed. 073 ranges: cars at most 6 and need at most 8 on a row; more is capped with red people_short (too_many_cars or too_many_people words: split the trip by hand). A person whose live market is blank is no market: never planned, never sent a banner.",
     "R11": "Who: pool = active crew_people passing hc_crew_person_ok for the market (roster: worker active, has a login, live field_workers.market = the market, not in never_schedule, not the App Review email; auto_pick yes; helpers: helper_market = the market, auto_pick ask; the owner row is auto_pick no and never auto-picked). Days in date order, rows in R13 order; candidates: the family continuity list first (people already on that job family, in order), then roster by rank, then fewest rows in the same Mon to Sun week (approved days included), then first name, then id; then helpers by rank, name. Approved days off are skipped silently; pending ones stay with amber pending_day_off. Take FREE candidates (no busy overlap that day) until need; if still short take busy candidates in order and flag red clash on this row; if still short red people_short (or red no_crew_in_market when the pool is empty). helper_ask (amber) on every row with a helper. drop_window_overlap (amber) on a receive or move row when receive_people >= 1 and one of its people has a timed row at another place starting inside the window or less than 2 hours before it. Never invents a person.",
     "R12": "long_day (amber) when one person's first busy_from to last busy_to that day is MORE than max_span_hours; on that person's first row.",
     "R13": "Output per market day: rows sorted by start (no start last), then kind, then key, in byte order; task gaps sorted; day gaps red first, then task_key (null first), then code. inputs_md5 = md5 of the sorted JSON of every fact used for that day (the job days on D and D + 1, the drops landing on D or allocated to those jobs, days off touching D, and the versions of settings, rules, sites, people and job cards). Same inputs give byte-identical output.",
-    "held": "Held at READ time, never stored: a row whose order (or its family head) is cancelled; a deliver row whose order job day is no longer its plan day (moved) or whose live Navigate address differs from its to_address (address). Fulfilled or complete is done, not held. A count change alone is not held. Non-owners see the held words and no place, time, boxes or cars; the owner sees held and hold_reason.",
+    "held": "Held at READ time, never stored: a row whose order (or its family head) is cancelled; a deliver row whose order job day is no longer its plan day (moved) or whose live Navigate address differs from its to_address (address). The live Navigate address uses the SAME rule the robot stores to_address by (READ-12): delivery_notes, else venue (blank after the next step counts as missing); every run of ASCII whitespace (space, tab, line feed, carriage return, form feed, vertical tab; SQL regex [ \\t\\n\\r\\f\\v]+) becomes one space and the ends are trimmed; when the result fails the word check, only its comma parts that pass the word check are kept, joined by \", \"; nothing left, or more than 200 characters, is none. Fulfilled or complete is done, not held. A count change alone is not held. Non-owners see the held words and no place, time, boxes or cars; the owner sees held and hold_reason.",
     "never": "Never: the App Review login or a never_schedule worker on any row (robot, put, save and notice each check), inactive rows, money, client contact, supplier or shortage words in crew text, the word billed, anything sent to a helper, Telegram to crew. With CREW_PLAN_MODE unset everything is off and the departure plan is byte-identical to today (garage origin)."
   },
   "contract_decisions": [
@@ -129,7 +129,10 @@
     "Stored gap words never name the supplier (no_supply_record and claim_no_drop_day included); HC App may add supplier words in its own owner UI from the fix text.",
     "Gap placement (gap_codes.placement), rule_unconfirmed as one entry per row, long_day on the first row, clash on the later row.",
     "auto prep always makes a prep row (skip is the only way to have none); whole is a cut type on file.",
-    "Busy windows when the design is silent: unknown drive 60 min for moves too; no window or no start means no busy window (route_pending rows never clash).",
+    "Busy windows when the design is silent: unknown drive 60 min for moves too; no window means no busy window; no start means no busy_from, so route_pending rows never clash (a deliver row with a known arrival keeps busy_to = arrival + unload_minutes as the carrier of its arrival for the server words).",
+    "hc_crew_plan_inputs sends every stored day WHOLE to the robot (PUT-11): besides the reply-shapes 4.1 keys, tasks, gaps, red_count, amber_count and proposal. The robot remembers drive times and failed route tries on its own stored draft rows; the strict 12-key shape starves routing (only the 3 soonest trips ever timed) and hides the practice scorecard.",
+    "One Navigate address rule for the robot and the hold check (rules.held, READ-12), so a messy address never reads as moved.",
+    "The worker request key for hc_crew_plan_put covers the run and the payload (md5 of tasks, gaps and reasons), so a put answered off is never replayed and a new route time is never a refused key; dedupe stays on inputs_md5 (same).",
     "Reply codes (reply-shapes-073.md): well formed refusals answer a code with a plain sentence and save nothing; a wrong caller raises 42501; bad content raises 22023. Day writes answer off in mode off; setup works in every mode.",
     "proposal.md5 is the inputs_md5 of the put that made it; kept compares inputs_md5. A kept put clears the waiting proposal and sets status approved.",
     "crew_tomorrow id = md5('hc-crew-tomorrow-v1' || market || day || approved_version || person_id)::uuid; it shares the day_before thread (day-<market>-<day>) with collapse id crew-<market>-<day>-tomorrow.",
@@ -150,6 +153,10 @@
       "owner_only": false,
       "placement": "deliver",
       "words": "No delivery address for {client}.",
+      "words_variants": {
+        "incomplete": "The address for {client} is not complete enough for a drive time or leave-by alarms (add the street, town and state).",
+        "too_long": "The delivery address for {client} is longer than 200 characters; shorten it in the delivery notes."
+      },
       "fix": "Edit the address",
       "in_design_4_6": true
     },
@@ -166,6 +173,10 @@
       "owner_only": false,
       "placement": "any",
       "words": "{n} more {driver|drivers|person|people} needed.",
+      "words_variants": {
+        "too_many_cars": "Needs {cars} cars; one row holds 6. Split the trip by hand (Add row).",
+        "too_many_people": "Needs {need} people; one row holds 8. Split the trip by hand (Add row)."
+      },
       "fix": "Pick a person or helper",
       "in_design_4_6": true
     },
@@ -258,12 +269,20 @@
       "level": "red",
       "owner_only": true,
       "placement": "deliver",
-      "words": "Invoiced with no invoice and not linked to a job.",
+      "words": "Marked invoiced but has no QuickBooks invoice and is not linked to a job.",
       "fix": "Link the day (072 owner link)",
       "in_design_4_6": true
     },
     "count_missing": {"level": "red", "owner_only": true, "placement": "deliver", "words": "Coconut count missing.", "fix": "Fix the count", "in_design_4_6": true},
-    "count_disputed": {"level": "red", "owner_only": true, "placement": "deliver", "words": "App count and invoice disagree.", "fix": "Fix the count", "in_design_4_6": true},
+    "count_disputed": {
+      "level": "red",
+      "owner_only": true,
+      "placement": "deliver",
+      "words": "App count and invoice disagree.",
+      "words_variants": {"too_big": "{Client}: {n} {boxes|coconuts} is more than one row holds ({500|5000}). Split it by hand (Add row)."},
+      "fix": "Fix the count",
+      "in_design_4_6": true
+    },
     "boxes_short": {
       "level": "red",
       "owner_only": true,
@@ -1364,7 +1383,7 @@
       },
       "expected": {
         "days": [
-          {"market": "ny", "day": "2026-12-03", "tasks": [{"key": "deliver:73d00000-0000-4000-8000-000000000003", "gaps": ["day_not_linked"]}], "gaps": [{"code": "day_not_linked", "level": "red", "owner_only": true, "task_key": "deliver:73d00000-0000-4000-8000-000000000003", "words": "Invoiced with no invoice and not linked to a job."}]},
+          {"market": "ny", "day": "2026-12-03", "tasks": [{"key": "deliver:73d00000-0000-4000-8000-000000000003", "gaps": ["day_not_linked"]}], "gaps": [{"code": "day_not_linked", "level": "red", "owner_only": true, "task_key": "deliver:73d00000-0000-4000-8000-000000000003", "words": "Marked invoiced but has no QuickBooks invoice and is not linked to a job."}]},
           {"market": "ny", "day": "2026-12-02", "tasks": [{"key": "prep:73d00000-0000-4000-8000-000000000003", "gaps": [], "words": "Any time at Garage G: prep Client P for Thu Dec 3, 75 coconuts, circle cut."}]}
         ]
       }
@@ -2273,13 +2292,13 @@
     {
       "id": "R8-06",
       "rule": "R8",
-      "about": "Arrival known but no drive time yet (route not run): amber route_pending; no start; the words still give the arrival.",
+      "about": "Arrival known but no drive time yet (route not run): amber route_pending; no start; no busy_from (it never clashes) but busy_to = arrival + unload, so the stored words still give the arrival.",
       "topics": [],
       "packages": ["worker"],
       "input": {"extends": "small_clean", "remove": {"route_answers": ["73c00000-0000-4000-8000-000000000001|Test Hall, 9 Test Ave, New York, NY 10001"]}},
       "expected": {
         "days": [
-          {"market": "ny", "day": "2026-12-03", "tasks": [{"key": "deliver:73d00000-0000-4000-8000-000000000003", "start": null, "leave_by": null, "busy_from": null, "gaps": ["route_pending"], "words": "Garage G: pick up 9 boxes, 1 car (Ana car 1). Deliver to Client P at Test Hall, 9 Test Ave, New York, NY 10001. Arrive by 10:00 AM."}], "gaps": [{"code": "route_pending", "level": "amber", "owner_only": false, "task_key": "deliver:73d00000-0000-4000-8000-000000000003", "words": "Drive time not worked out yet."}]}
+          {"market": "ny", "day": "2026-12-03", "tasks": [{"key": "deliver:73d00000-0000-4000-8000-000000000003", "start": null, "leave_by": null, "busy_from": null, "busy_to": "10:30", "gaps": ["route_pending"], "words": "Garage G: pick up 9 boxes, 1 car (Ana car 1). Deliver to Client P at Test Hall, 9 Test Ave, New York, NY 10001. Arrive by 10:00 AM."}], "gaps": [{"code": "route_pending", "level": "amber", "owner_only": false, "task_key": "deliver:73d00000-0000-4000-8000-000000000003", "words": "Drive time not worked out yet."}]}
         ]
       }
     },
@@ -2468,6 +2487,27 @@
       "expected": {
         "days": [
           {"market": "ny", "day": "2026-12-03", "tasks": [{"key": "deliver:73d00000-0000-4000-8000-000000000003", "to_address": null, "start": null, "gaps": ["no_address"], "words": "Garage G: pick up 9 boxes, 1 car (Ana car 1). Deliver to Client P. Address: Sidd will confirm. Arrive by 10:00 AM."}], "gaps": [{"code": "no_address", "level": "red", "owner_only": false, "task_key": "deliver:73d00000-0000-4000-8000-000000000003", "words": "No delivery address for Client P."}]}
+        ],
+        "gaps_absent": ["route_pending", "address_conflict"]
+      }
+    },
+    {
+      "id": "R9-07",
+      "rule": "R9",
+      "about": "A Navigate address the departure plan would never route (no state, no zip, no known town: \"Test Hall\"): red no_address with the incomplete words, NO route asked (never a geocoder guess), no route_pending; the row still names the place and the arrival.",
+      "topics": [],
+      "packages": ["worker"],
+      "input": {
+        "extends": "small_clean",
+        "rows": {
+          "orders": [
+            {"id": "73d00000-0000-4000-8000-000000000003", "client_name": "Client P", "market": "ny", "stage": "paid_full", "coconuts_qty": 75, "delivery_at_utc": "2026-12-03T00:00:00+00:00", "event_start_at": "2026-12-03T00:00:00+00:00", "venue": "Test Hall", "stamp_status": "not_needed", "external_invoice_id": "97303", "total_cents": 123400, "invoice_fulfillment": {"read_status": "complete", "address": "Test Hall, 9 Test Ave, New York, NY 10001", "delivery_window": null, "cracking": "cocktail", "delivery_date": "2026-12-03"}, "delivery_request": {"status": "confirmed", "window": "10:00 AM", "date": "2026-12-03", "source": "owner"}}
+          ]
+        }
+      },
+      "expected": {
+        "days": [
+          {"market": "ny", "day": "2026-12-03", "tasks": [{"key": "deliver:73d00000-0000-4000-8000-000000000003", "to_address": "Test Hall", "start": null, "leave_by": null, "drive_min": null, "busy_from": null, "busy_to": "10:30", "gaps": ["no_address"], "words": "Garage G: pick up 9 boxes, 1 car (Ana car 1). Deliver to Client P at Test Hall. Arrive by 10:00 AM."}], "gaps": [{"code": "no_address", "level": "red", "owner_only": false, "task_key": "deliver:73d00000-0000-4000-8000-000000000003", "words": "The address for Client P is not complete enough for a drive time or leave-by alarms (add the street, town and state)."}]}
         ],
         "gaps_absent": ["route_pending", "address_conflict"]
       }
@@ -3234,7 +3274,7 @@
     {
       "id": "PUT-11",
       "rule": "PUT",
-      "about": "hc_crew_plan_inputs (definer read for the robot): people carry live market, role, active, locked and has_push, never rates or emails beyond the login email; approved and pending days off come with no notes; job cards and day states come whole.",
+      "about": "hc_crew_plan_inputs (definer read for the robot): people carry live market, role, active, locked and has_push, never rates or emails beyond the login email; approved and pending days off come with no notes; job cards and day states come whole: every stored day also carries its tasks, gaps, red_count, amber_count and proposal (robot only), because the robot keeps its drive times and failed route tries on its own stored draft rows, and the owner nudges, the digest counts and the practice scorecard read them.",
       "topics": ["days_off", "never_schedule"],
       "packages": ["sql"],
       "input": {
@@ -3253,7 +3293,23 @@
       },
       "expected": {
         "replies": [
-          {"code": "ok", "mode": "on", "time_off": [{"worker_id": "73a00000-0000-4000-8000-000000000003", "start_day": "2026-12-01", "end_day": "2026-12-01", "status": "approved"}, {"worker_id": "73a00000-0000-4000-8000-000000000002", "start_day": "2026-12-03", "end_day": "2026-12-03", "status": "pending"}], "people_include": [{"person_id": "73b00000-0000-4000-8000-000000000004", "locked": true, "lock_reason": "never_schedule"}, {"person_id": "73b00000-0000-4000-8000-000000000002", "market": "ny", "role": "manager", "locked": false, "has_push": true}], "forbidden_keys": ["hourly_rate_cents", "note", "decision_note", "total_cents"]}
+          {
+            "code": "ok",
+            "mode": "on",
+            "time_off": [
+              {"worker_id": "73a00000-0000-4000-8000-000000000003", "start_day": "2026-12-01", "end_day": "2026-12-01", "status": "approved"},
+              {"worker_id": "73a00000-0000-4000-8000-000000000002", "start_day": "2026-12-03", "end_day": "2026-12-03", "status": "pending"}
+            ],
+            "people_include": [
+              {"person_id": "73b00000-0000-4000-8000-000000000004", "locked": true, "lock_reason": "never_schedule"},
+              {"person_id": "73b00000-0000-4000-8000-000000000002", "market": "ny", "role": "manager", "locked": false, "has_push": true}
+            ],
+            "day_checks": [
+              {"market": "ny", "day": "2026-12-01", "status": "draft", "red_count": 1, "proposal": null},
+              {"market": "ny", "day": "2026-12-03", "status": "draft", "red_count": 0, "proposal": null}
+            ],
+            "forbidden_keys": ["hourly_rate_cents", "note", "decision_note", "total_cents"]
+          }
         ]
       }
     },
@@ -3593,6 +3649,35 @@
         "then": [
           {"replies": [{"day_checks": [{"market": "ny", "day": "2026-11-30", "task_hold_reason": {"deliver:73d00000-0000-4000-8000-000000000001": "address"}}]}]},
           {"replies": [{"day_checks": [{"market": "ny", "day": "2026-11-30", "task_held": {"deliver:73d00000-0000-4000-8000-000000000001": false}}]}]}
+        ]
+      }
+    },
+    {
+      "id": "READ-12",
+      "rule": "READ",
+      "about": "The hold check reads the live Navigate address with the SAME rule the robot stores it by (rules.held): every run of ASCII whitespace becomes one space, ends trimmed; when the text fails the word check only its comma parts that pass are kept; over 200 characters is none. So a double space, a line break and a tab, or a part that fails the word check (a phone number, an email or a $ amount) typed into the notes, never read as a new address (no false \"On hold\", no dropped departure trip); a real change still does.",
+      "topics": ["held_after_cancel", "word_check"],
+      "packages": ["sql", "worker"],
+      "input": {
+        "extends": "approved_week",
+        "rows": {
+          "orders": [
+            {"id": "73d00000-0000-4000-8000-000000000001", "client_name": "Client W", "market": "ny", "stage": "paid_full", "coconuts_qty": 450, "delivery_at_utc": "2026-11-30T00:00:00+00:00", "event_start_at": "2026-11-30T00:00:00+00:00", "venue": "Test Pier", "delivery_notes": "Test Pier,  1 Test Pier,  New York, NY 10011", "stamp_status": "not_ordered", "external_invoice_id": "97301", "total_cents": 123400, "invoice_fulfillment": {"read_status": "complete", "address": "Test Hall, 9 Test Ave, New York, NY 10001", "delivery_window": null, "cracking": "straw_hole", "delivery_date": "2026-11-30"}}
+          ]
+        },
+        "calls": [{"as": "oli", "fn": "hc_crew_plan_read", "args": {"p_from": "2026-11-29", "p_to": "2026-12-03"}}],
+        "then": [
+          {"rows": {"orders": [{"id": "73d00000-0000-4000-8000-000000000001", "client_name": "Client W", "market": "ny", "stage": "paid_full", "coconuts_qty": 450, "delivery_at_utc": "2026-11-30T00:00:00+00:00", "event_start_at": "2026-11-30T00:00:00+00:00", "venue": "Test Pier", "delivery_notes": "Test Pier,\n1 Test Pier,\tNew York, NY 10011 ", "stamp_status": "not_ordered", "external_invoice_id": "97301", "total_cents": 123400, "invoice_fulfillment": {"read_status": "complete", "address": "Test Hall, 9 Test Ave, New York, NY 10001", "delivery_window": null, "cracking": "straw_hole", "delivery_date": "2026-11-30"}}]}, "calls": [{"as": "oli", "fn": "hc_crew_plan_read", "args": {"p_from": "2026-11-29", "p_to": "2026-12-03"}}]},
+          {"rows": {"orders": [{"id": "73d00000-0000-4000-8000-000000000001", "client_name": "Client W", "market": "ny", "stage": "paid_full", "coconuts_qty": 450, "delivery_at_utc": "2026-11-30T00:00:00+00:00", "event_start_at": "2026-11-30T00:00:00+00:00", "venue": "Test Pier", "delivery_notes": "Test Pier, 1 Test Pier, New York, NY 10011, gate fee $20", "stamp_status": "not_ordered", "external_invoice_id": "97301", "total_cents": 123400, "invoice_fulfillment": {"read_status": "complete", "address": "Test Hall, 9 Test Ave, New York, NY 10001", "delivery_window": null, "cracking": "straw_hole", "delivery_date": "2026-11-30"}}]}, "calls": [{"as": "oli", "fn": "hc_crew_plan_read", "args": {"p_from": "2026-11-29", "p_to": "2026-12-03"}}]},
+          {"rows": {"orders": [{"id": "73d00000-0000-4000-8000-000000000001", "client_name": "Client W", "market": "ny", "stage": "paid_full", "coconuts_qty": 450, "delivery_at_utc": "2026-11-30T00:00:00+00:00", "event_start_at": "2026-11-30T00:00:00+00:00", "venue": "Test Pier", "delivery_notes": "Test Dock, 7 Test Pl, New York, NY 10014", "stamp_status": "not_ordered", "external_invoice_id": "97301", "total_cents": 123400, "invoice_fulfillment": {"read_status": "complete", "address": "Test Hall, 9 Test Ave, New York, NY 10001", "delivery_window": null, "cracking": "straw_hole", "delivery_date": "2026-11-30"}}]}, "calls": [{"as": "oli", "fn": "hc_crew_plan_read", "args": {"p_from": "2026-11-29", "p_to": "2026-12-03"}}]}
+        ]
+      },
+      "expected": {
+        "replies": [{"day_checks": [{"market": "ny", "day": "2026-11-30", "task_hold_reason": {"deliver:73d00000-0000-4000-8000-000000000001": null}}]}],
+        "then": [
+          {"replies": [{"day_checks": [{"market": "ny", "day": "2026-11-30", "task_hold_reason": {"deliver:73d00000-0000-4000-8000-000000000001": null}}]}]},
+          {"replies": [{"day_checks": [{"market": "ny", "day": "2026-11-30", "task_hold_reason": {"deliver:73d00000-0000-4000-8000-000000000001": null}}]}]},
+          {"replies": [{"day_checks": [{"market": "ny", "day": "2026-11-30", "task_hold_reason": {"deliver:73d00000-0000-4000-8000-000000000001": "address"}}]}]}
         ]
       }
     },
@@ -4159,7 +4244,7 @@
     {
       "id": "WORDS-01",
       "rule": "WORDS",
-      "about": "hc_crew_words templates from structured fields only (the one wording source): singular box, no time, no address, count unknown, an owner row with a time, Vegas times carry PT, the held constant.",
+      "about": "hc_crew_words templates from structured fields only (the one wording source): singular box, no time, no address, count unknown, an owner row with a time, Vegas times carry PT, the held constant. The arrival (words.deliver): busy_to minus unload_minutes when the row has a leave_by OR no busy_from (no start yet, the route still pending); a crew start with no drive time yet, and a crew start with no arrival, show the start only.",
       "topics": ["word_check"],
       "packages": ["sql", "worker"],
       "input": {
@@ -4175,7 +4260,11 @@
           {"market": "ny", "task": {"kind": "deliver", "order_id": "73d00000-0000-4000-8000-000000000001", "from_site": "73c00000-0000-4000-8000-000000000001", "to_address": null, "boxes": null, "cars": 1, "people": [{"person_id": "73b00000-0000-4000-8000-000000000002", "car": 1}]}},
           {"market": "vegas", "task": {"kind": "other", "start": "09:00", "label": "Check the cart at the venue", "people": [{"person_id": "73b00000-0000-4000-8000-000000000006", "car": null}]}},
           {"market": "vegas", "task": {"kind": "deliver", "order_id": "73d00000-0000-4000-8000-000000000006", "from_site": null, "to_address": "Test Expo, 3 Test Blvd, Las Vegas, NV 89100", "boxes": 78, "cars": 4, "start": "07:30", "people": []}},
-          {"market": "ny", "held": true, "task": {"kind": "deliver", "order_id": "73d00000-0000-4000-8000-000000000001"}}
+          {"market": "ny", "held": true, "task": {"kind": "deliver", "order_id": "73d00000-0000-4000-8000-000000000001"}},
+          {"market": "ny", "task": {"kind": "deliver", "order_id": "73d00000-0000-4000-8000-000000000003", "from_site": "73c00000-0000-4000-8000-000000000001", "to_address": "Test Hall, 9 Test Ave, New York, NY 10001", "boxes": 9, "cars": 1, "people": [{"person_id": "73b00000-0000-4000-8000-000000000002", "car": 1}], "start": null, "busy_from": null, "busy_to": "10:30", "leave_by": null, "time_source": "none", "gaps": ["route_pending"]}},
+          {"market": "ny", "task": {"kind": "deliver", "order_id": "73d00000-0000-4000-8000-000000000003", "from_site": "73c00000-0000-4000-8000-000000000001", "to_address": "Test Hall, 9 Test Ave, New York, NY 10001", "boxes": 9, "cars": 1, "people": [{"person_id": "73b00000-0000-4000-8000-000000000002", "car": 1}], "start": "08:00", "busy_from": "08:00", "busy_to": "10:30", "leave_by": "08:15", "drive_min": 45, "time_source": "arrival"}},
+          {"market": "ny", "task": {"kind": "deliver", "order_id": "73d00000-0000-4000-8000-000000000003", "from_site": "73c00000-0000-4000-8000-000000000001", "to_address": "Test Hall, 9 Test Ave, New York, NY 10001", "boxes": 9, "cars": 1, "people": [{"person_id": "73b00000-0000-4000-8000-000000000002", "car": 1}], "start": "06:00", "busy_from": "06:00", "busy_to": "10:30", "leave_by": null, "time_source": "crew_start", "gaps": ["route_pending"]}},
+          {"market": "ny", "task": {"kind": "deliver", "order_id": "73d00000-0000-4000-8000-000000000003", "from_site": "73c00000-0000-4000-8000-000000000001", "to_address": "Test Hall, 9 Test Ave, New York, NY 10001", "boxes": 9, "cars": 1, "people": [{"person_id": "73b00000-0000-4000-8000-000000000002", "car": 1}], "start": "06:00", "busy_from": "06:00", "busy_to": "08:00", "leave_by": null, "time_source": "crew_start", "gaps": ["no_arrival"]}}
         ]
       },
       "expected": {
@@ -4185,7 +4274,11 @@
           "Garage G: pick up the boxes, 1 car (Ana car 1). Deliver to Client W. Address: Sidd will confirm. Time: Sidd will confirm.",
           "9:00 AM PT: Check the cart at the venue.",
           "7:30 AM PT: pick up 78 boxes, 4 cars. Deliver to Client V at Test Expo, 3 Test Blvd, Las Vegas, NV 89100.",
-          "On hold: Sidd is checking this job."
+          "On hold: Sidd is checking this job.",
+          "Garage G: pick up 9 boxes, 1 car (Ana car 1). Deliver to Client P at Test Hall, 9 Test Ave, New York, NY 10001. Arrive by 10:00 AM.",
+          "8:00 AM Garage G: pick up 9 boxes, 1 car (Ana car 1). Deliver to Client P at Test Hall, 9 Test Ave, New York, NY 10001. Arrive by 10:00 AM.",
+          "6:00 AM Garage G: pick up 9 boxes, 1 car (Ana car 1). Deliver to Client P at Test Hall, 9 Test Ave, New York, NY 10001.",
+          "6:00 AM Garage G: pick up 9 boxes, 1 car (Ana car 1). Deliver to Client P at Test Hall, 9 Test Ave, New York, NY 10001."
         ]
       }
     },
@@ -4406,6 +4499,32 @@
       }
     },
     {"id": "DEPART-05", "rule": "DEPART", "about": "movementState and the GPS pickup stamp take the site as base: a phone parked inside Cold storage B's fence reads at_origin (not moving_no_pickup) and stamps pickup_seen_at; with no base everything behaves as today.", "topics": ["departure"], "packages": ["worker"], "input": {"base": {"lat": 40.3, "lng": -73.9, "fence_m": 150}, "points": [{"lat": 40.3003, "lng": -73.9002, "at": "2026-11-30T10:40:00Z"}, {"lat": 40.3004, "lng": -73.9001, "at": "2026-11-30T10:45:00Z"}], "now": "2026-11-30T10:46:00Z"}, "expected": {"movement_with_base": "at_origin", "pickup_seen_with_base": true, "movement_without_base_unchanged": true}},
+    {
+      "id": "DEPART-07",
+      "rule": "DEPART",
+      "about": "An approved trip whose to_address the router may not be given (no state, zip or known town: \"Test Pier\") never replaces the destination used today: the scan keeps departureDestination of the order (here the complete invoice address), so the job keeps its leave-by alarm.",
+      "topics": ["departure"],
+      "packages": ["worker"],
+      "input": {
+        "extends": "approved_week",
+        "rows": {
+          "orders": [
+            {"id": "73d00000-0000-4000-8000-000000000001", "client_name": "Client W", "market": "ny", "stage": "paid_full", "coconuts_qty": 450, "delivery_at_utc": "2026-11-30T00:00:00+00:00", "event_start_at": "2026-11-30T00:00:00+00:00", "venue": "Test Pier", "delivery_notes": "Test Pier, 1 Test Pier, New York, NY 10011", "stamp_status": "not_ordered", "external_invoice_id": "97301", "total_cents": 123400, "invoice_fulfillment": {"read_status": "complete", "address": "Test Hall, 9 Test Ave, New York, NY 10001", "delivery_window": null, "cracking": "straw_hole", "delivery_date": "2026-11-30"}, "delivery_request": {"status": "confirmed", "window": "7:00 AM", "date": "2026-11-30", "source": "owner"}}
+          ]
+        },
+        "crew_origins_reply": {
+          "v": 1,
+          "code": "ok",
+          "trips": [
+            {"order_id": "73d00000-0000-4000-8000-000000000001", "market": "ny", "day": "2026-11-30", "start": "06:00", "to_address": "Test Pier", "origin": null}
+          ]
+        }
+      },
+      "expected": {
+        "departure": {"origin_kind": "garage", "origin_label": "NJ garage", "dest_source": "invoice", "dest_address": "Test Hall, 9 Test Ave, New York, NY 10001"},
+        "calls_crew_origins": true
+      }
+    },
     {"id": "DEPART-06", "rule": "DEPART", "about": "The origin check is only widened: order_departures accepts site and every old value; anything else is still refused.", "topics": ["departure"], "packages": ["sql"], "input": {"sql": ["insert origin_kind 'site'", "insert origin_kind 'garage'", "insert origin_kind 'clock_in'", "insert origin_kind 'last_clock_in'", "insert origin_kind 'none'", "insert origin_kind null", "insert origin_kind 'depot'"]}, "expected": {"accepted": ["site", "garage", "clock_in", "last_clock_in", "none", null], "refused": ["depot"], "check_text_after": "CHECK (((origin_kind IS NULL) OR (origin_kind = ANY (ARRAY['garage'::text, 'clock_in'::text, 'last_clock_in'::text, 'none'::text, 'site'::text]))))"}},
     {"id": "MODE-01", "rule": "MODE", "about": "CREW_PLAN_MODE unset is off: runCrewPlanScan reads nothing and writes nothing (no inputs call, no put, no run log), whatever the database says.", "topics": ["mode"], "packages": ["worker"], "input": {"extends": "sidd_week", "worker_mode": null, "settings": {"mode": "on"}}, "expected": {"calls": {"hc_crew_plan_inputs": 0, "hc_crew_plan_put": 0, "hc_crew_run_log": 0}, "crew_banners": 0}},
     {"id": "MODE-02", "rule": "MODE", "about": "The lower switch wins: database practice with the secret on behaves as practice (drafts and owner lines, no crew banners, departure from the garage); database off with the secret on is off (inputs answer off, no put).", "topics": ["mode"], "packages": ["worker"], "input": {"extends": "sidd_week", "worker_mode": "on", "settings": {"mode": "practice"}, "then": [{"settings": {"mode": "off"}}]}, "expected": {"effective": "practice", "crew_banners": 0, "departure_origin": "garage", "then": [{"effective": "off", "calls": {"hc_crew_plan_put": 0}}]}},

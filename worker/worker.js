@@ -5,7 +5,7 @@
 // The automatic crew plan's pure rules (migration 073), no network inside.
 import {
   planCrew, crewDayAdd, crewWeekStart, crewDayInZone, crewTomorrowSends, crewDayQuestions,
-  crewDayRowCount, crewDigestLine, md5Uuid, CREW_ROUTE_CALLS_MAX, CREW_ROUTE_CACHE_HOURS, CREW_APP_REVIEW_EMAIL,
+  crewDayRowCount, crewDigestLine, md5Uuid, md5Hex, stableJson, CREW_ROUTE_CALLS_MAX, CREW_ROUTE_CACHE_HOURS, CREW_APP_REVIEW_EMAIL,
 } from './crew-plan.js';
 
 const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
@@ -9397,7 +9397,11 @@ export async function runDeparturePlanScan(env) {
         // An approved crew trip (mode on only) names the address the crew
         // drive to, so leave-by and Navigate agree; null keeps today's rule.
         const trip = crewTrips ? crewTrips.get(o.id) || null : null;
-        const dest = trip && collapseSpaces(trip.to_address) ? { ...departureDestination({ delivery_notes: trip.to_address }), source: 'crew_plan' } : departureDestination(o);
+        // Only a trip address the router may be given replaces today's
+        // rule: an approved "Test Pier" (no state, zip or town) must never
+        // cost a job the complete invoice address it alarms from today.
+        const tripDest = trip && collapseSpaces(trip.to_address) ? departureDestination({ delivery_notes: trip.to_address }) : null;
+        const dest = tripDest && tripDest.usable ? { ...tripDest, source: 'crew_plan' } : departureDestination(o);
         const marketHasGarage = !!MARKET_BASES[market];
         if (!marketHasGarage && !lastShiftByMarket.has(market)) {
           const since60 = new Date(nowMs - 60 * 86400000).toISOString();
@@ -9538,10 +9542,39 @@ export async function runDeparturePlanScan(env) {
         let saved = await upsertDeparturePlan(env, row);
         if (!saved && row.origin_kind === 'site') {
           // A refused cold storage start (the 073 origin word missing) must
-          // never cost the job its alarm: save it from the garage instead;
-          // the next tick sees the changed origin and routes again.
+          // never cost the job its alarm: save it from the garage instead,
+          // with a GARAGE drive time and leave-by (never the cold storage's
+          // numbers under the garage's name). The last garage route is
+          // reused when the stored row has one for the same address, else
+          // the garage is routed now (budget allowing), else the route
+          // fields are cleared so the next tick routes it.
           const g = originFor({ market, openShifts, lastShift: lastShiftByMarket.get(market) || null });
           Object.assign(row, { origin_kind: g.kind, origin_lat: g.lat, origin_lng: g.lng, origin_label: g.label, origin_shift_id: g.shiftId });
+          const sameGarage = prev.origin_kind === g.kind && prev.dest_address === dest.address && finite(prev.drive_seconds);
+          const clearRoute = () => Object.assign(row, { dest_lat: null, dest_lng: null, drive_seconds: null, static_seconds: null, distance_meters: null,
+            has_ferry: false, route_source: 'none', route_error: null, computed_at: null });
+          if (sameGarage) {
+            Object.assign(row, { dest_lat: prev.dest_lat ?? null, dest_lng: prev.dest_lng ?? null, drive_seconds: prev.drive_seconds, static_seconds: prev.static_seconds ?? null,
+              distance_meters: prev.distance_meters ?? null, has_ferry: !!prev.has_ferry, route_source: prev.route_source || 'none', route_error: prev.route_error || null, computed_at: prev.computed_at || null });
+          } else if (dest.usable && counts.routeCalls < ROUTE_CALLS_PER_TICK_MAX) {
+            counts.routeCalls++;
+            const answer = await computeRoute(env, { originLat: g.lat, originLng: g.lng, destAddress: dest.address, destLat: null, destLng: null, needDirections: true, nowMs });
+            const sane = answer.ok ? routeSanity({ meters: answer.meters, driveSeconds: answer.driveSeconds, endLat: answer.destLat, endLng: answer.destLng, originLat: g.lat, originLng: g.lng, marketCenter: { lat: GARAGE_LAT, lng: GARAGE_LNG } }) : null;
+            if (sane && sane.ok) {
+              Object.assign(row, { dest_lat: answer.destLat, dest_lng: answer.destLng, drive_seconds: answer.driveSeconds, static_seconds: answer.staticSeconds,
+                distance_meters: answer.meters, has_ferry: answer.hasFerry, route_source: answer.provider, route_error: null, computed_at: nowIso });
+            } else {
+              clearRoute();
+            }
+          } else {
+            clearRoute();
+          }
+          row.leave_by_at = null; row.eta_at = null;
+          if (finite(arriveMs) && finite(row.drive_seconds)) {
+            const leaveMs = leaveByMs({ arriveAtMs: arriveMs, driveSeconds: row.drive_seconds, hasFerry: row.has_ferry });
+            row.leave_by_at = leaveMs ? new Date(leaveMs).toISOString() : null;
+          }
+          if (row.state === 'planned' && !finite(row.drive_seconds)) row.state = 'pending';
           console.error('departure scan: the crew plan start was refused for order ' + o.id + ', saved from the garage');
           saved = await upsertDeparturePlan(env, row);
         }
@@ -12177,7 +12210,9 @@ const CREW_MARKETS = ['ny', 'vegas', 'miami', 'la'];
 // Puts per run: the rest wait an hour (the free plan allows 50 requests a
 // run; reads, three routes, banners and the log take about 30).
 export const CREW_PUTS_PER_RUN_MAX = 12;
-const CREW_LIB = { parseArrivalTime, leaveByMs, routeSanity, marketZone };
+// departureDestination is the departure plan's own "may a router be given
+// this address" test: the robot never routes an address the alarm would not.
+export const CREW_LIB = { parseArrivalTime, leaveByMs, routeSanity, marketZone, departureDestination };
 const CREW_ORDER_COLUMNS = 'id,client_name,company,market,stage,coconuts_qty,delivery_at_utc,event_start_at,venue,delivery_notes,crack_type,stamp_status,logo_received,logo_asset,external_invoice_id,parent_order_id,cancelled_at,invoice_fulfillment,delivery_request';
 const CREW_FAMILY_EXTRA_COLUMNS = 'client_name,company,market,venue,delivery_notes,crack_type,stamp_status,logo_received,logo_asset,invoice_fulfillment,delivery_request';
 
@@ -12244,7 +12279,10 @@ export function crewRouteCache(days, nowMs) {
         if (!cur || cur.drive_seconds == null || String(t.route_at || '') > String(cur.at || '')) {
           byPair.set(key, { ...pair, drive_seconds: Number(t.drive_min) * 60, has_ferry: /Ferry on the route\./.test(why), fail_runs: 0, at: t.route_at || null });
         }
-      } else if (t.drive_min == null && /Route tries: (\d+)\./.test(why) && !cur) {
+      } else if (t.drive_min == null && /Route tries: (\d+)\./.test(why) && !cur && Number.isFinite(at) && nowMs - at < CREW_ROUTE_CACHE_HOURS * 3600000) {
+        // A failed try is remembered for 24 hours from the last try (its
+        // route_at), so red no_time after 3 tries heals itself a day later
+        // (an Apple outage never leaves a job red for good).
         byPair.set(key, { ...pair, drive_seconds: null, has_ferry: false, fail_runs: Number(/Route tries: (\d+)\./.exec(why)[1]), at: t.route_at || null });
       }
     }
@@ -12266,6 +12304,9 @@ async function crewRoutes(env, needs, input, nowMs) {
     if (out.calls >= CREW_ROUTE_CALLS_MAX) break;
     const from = sites.get(need.from_site);
     if (!confirmed(from)) continue;
+    // Never a geocoder's guess: an address the departure plan would not
+    // route (no state, zip or known town) is never sent to the router.
+    if (!need.to_site && !departureDestination({ delivery_notes: need.to_address }).usable) continue;
     let destLat = null, destLng = null, destAddress = need.to_address;
     if (need.to_site) {
       const to = sites.get(need.to_site);
@@ -12339,13 +12380,22 @@ async function crewGather(env, inputs, todayNy) {
   const supply = await familyGetAll(env, 'coconut_supply_orders?select=id,supplier,delivery_date,delivery_window,market,ship_to_garage,boxes,status,prep_day' +
     '&or=(and(status.eq.confirmed,delivery_date.gte.' + sLo + ',delivery_date.lte.' + sHi + '),and(status.eq.claimed,prep_day.gte.' + sLo + ',prep_day.lte.' + sHi + '))&order=id.asc');
   if (!supply.ok) return { error: 'supply read failed (' + supply.status + ')' };
-  // Open calendar findings (072). 404 before 072: none.
+  // Open calendar findings (072). 404 before 072: none. A finding can name
+  // an order or only day 1's invoice ('<code>:qbo:<id>'), so the read asks
+  // for both, as the reconfirmation scan does; planCrew maps an invoice to
+  // its day 1.
   const findings = [];
-  for (let i = 0; i < ids.length; i += 60) {
-    const r = await familyGetAll(env, 'hc_calendar_findings?select=id,order_id,code,status&status=in.(open,still_on)&order_id=in.(' + ids.slice(i, i + 60).join(',') + ')&order=id.asc');
+  const qbos = [...new Set(orders.filter((o) => !o.parent_order_id).map((o) => String(o.external_invoice_id == null ? '' : o.external_invoice_id).trim())
+    .filter((q) => /^[1-9][0-9]{0,19}$/.test(q)))].sort();
+  const seenFinding = new Set();
+  for (let i = 0; i < Math.max(ids.length, qbos.length); i += 60) {
+    const parts = [];
+    if (ids.slice(i, i + 60).length) parts.push('order_id.in.(' + ids.slice(i, i + 60).join(',') + ')');
+    if (qbos.slice(i, i + 60).length) parts.push('qbo_id.in.(' + qbos.slice(i, i + 60).join(',') + ')');
+    const r = await familyGetAll(env, 'hc_calendar_findings?select=id,order_id,qbo_id,code,status&status=in.(open,still_on)&or=(' + parts.join(',') + ')&order=id.asc');
     if (!r.ok && r.status === 404) break;
     if (!r.ok) return { error: 'calendar findings read failed (' + r.status + ')' };
-    findings.push(...r.rows);
+    for (const f of r.rows) { if (f && !seenFinding.has(f.id)) { seenFinding.add(f.id); findings.push(f); } }
   }
   // Pending coordinator times (042), the same read the departure scan makes.
   const proposals = [];
@@ -12439,7 +12489,11 @@ async function crewTimedBanners(env, mode, inputs, plan, ordersById, nowMs) {
   if (nyHour === 16 || nyHour === 17) {
     const tomorrow = crewDayAdd(todayNy, 1);
     const open = CREW_MARKETS.map((m) => crewOwnerDayState(stored, plan, m, tomorrow)).some((d) => d && d.status === 'draft' && crewDayRowCount(d) !== 0);
-    if (open) await owner("Tomorrow's crew plan is not approved. Crew get nothing until you approve.", md5Uuid('hc-crew-owner-v1' + tomorrow), 'crew-owner-' + tomorrow, tomorrow);
+    // In practice the crew get nothing even after an approval, so the
+    // nudge says so instead of "until you approve".
+    const words = mode === 'on' ? "Tomorrow's crew plan is not approved. Crew get nothing until you approve."
+      : "Tomorrow's crew plan is not approved. Practice: crew get nothing yet.";
+    if (open) await owner(words, md5Uuid('hc-crew-owner-v1' + tomorrow), 'crew-owner-' + tomorrow, tomorrow);
   }
   if (weekdayOf(todayNy) === 'Thu' && (nyHour === 18 || nyHour === 19)) {
     let daysWithRows = 0, questions = 0;
@@ -12458,6 +12512,13 @@ async function crewTimedBanners(env, mode, inputs, plan, ordersById, nowMs) {
     }
   }
   return sent;
+}
+
+// hc_crew_plan_put's request key: md5('hc-crew-put-v2' || run id || market
+// || day || inputs_md5 || version || md5 of the tasks, gaps and reasons).
+export function crewPutRequestKey(runId, d) {
+  return md5Uuid('hc-crew-put-v2' + String(runId) + d.market + d.day + d.inputs_md5 + String(d.version)
+    + md5Hex(stableJson({ tasks: d.tasks, gaps: d.gaps, reasons: d.reasons })));
 }
 
 // The hourly robot. Never throws. Returns its counts (and logs them).
@@ -12514,12 +12575,17 @@ export async function runCrewPlanScan(env) {
       if (d.quiet) counts.quiet++;
     }
     const puts = plan.days.filter((d) => d.put).sort((a, b) => (a.day + a.market < b.day + b.market ? -1 : a.day + a.market > b.day + b.market ? 1 : 0));
+    // The request key covers this run and everything sent: a put answered
+    // 'off' (the database mode pasted off mid run) is never replayed as
+    // 'off' next run, and a new route time is never "a key used for
+    // something else". The md5 still dedupes: same facts answer 'same'.
+    const runId = crypto.randomUUID();
     let n = 0;
     for (const d of puts) {
       if (n >= CREW_PUTS_PER_RUN_MAX) { counts.waiting++; continue; }
       n++;
       const res = await crewRpc(env, 'hc_crew_plan_put', {
-        p_request_key: md5Uuid('hc-crew-put-v1' + d.market + d.day + d.inputs_md5 + String(d.version)),
+        p_request_key: crewPutRequestKey(runId, d),
         p_market: d.market, p_day: d.day, p_inputs_md5: d.inputs_md5, p_expected_version: d.version,
         p_tasks: d.tasks, p_gaps: d.gaps, p_reasons: d.reasons,
       });

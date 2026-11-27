@@ -867,8 +867,8 @@ I have to do field team schedule by hand". Design (critic edits binding):
 workspace `handoff-2026-10-15/crew-schedule-2026-11-27/CREW-SCHEDULE-DESIGN.md`
 section 4, 6.1, 6.2 and package P2; contract: `worker/test-vectors/crew-plan-cases.json`
 (copied byte for byte from `HC Secure Backups/tools/crew/073/tests/`, sha256
-b9887715a68e9ceb5d9ca739fb8e6c3dcaaa18f243b93f62af3078bb1b77d0ab, marked -text in
-.gitattributes) and `reply-shapes-073.md` there. Nothing deployed. Needs migration
+072030b2dfd165823149a0e0afd1523caf326323812896b68d987608e7745af1 since the
+2026-11-27 review fixes, marked -text in .gitattributes) and `reply-shapes-073.md` there. Nothing deployed. Needs migration
 073 (package P1, not built in this repo) live first; before that every crew call
 answers 404 and the robot stops after one request.
 
@@ -901,9 +901,17 @@ answers 404 and the robot stops after one request.
   App Review and never_schedule workers are filtered by the robot too (second
   lock); roster people by their LIVE field_workers.market only; helpers are named
   on rows and never get a banner; crew words never carry money, email, phone,
-  supplier words or "billed" (`crewTextOk`, the 072 phone regex); a stored day
-  whose job was cancelled loses its robot rows (draft) or gets a proposal without
-  them whose first reason names it (approved).
+  supplier words or "billed" (`crewTextOk`, the 072 phone regex, and the
+  supplier and billed words 073 refuses); a stored day whose job was cancelled
+  loses its robot rows (draft) or gets a proposal without them whose first
+  reason names it (approved). Never sends what 073 refuses (the whole day would
+  silently never draft): cars over 6 and people over 8 are capped with red
+  people_short ("split the trip by hand"), more than 500 boxes or 5000 coconuts
+  on one row are left off it (the words say "the boxes") with red
+  count_disputed, an address over 200 characters is none (red no_address), gap
+  words are cut at 300, an order whose market is not ny, vegas, miami or la
+  (other) makes no day, and a person whose live market is blank is no market
+  (never planned, never sent anything).
 - Reads (service key, each paged past the 1000-row cap; ANY failed read or page
   means no put that run and one run log with the error): `hc_crew_plan_inputs`
   (073 definer read), orders in booked stages in the window, `loadJobFamilies`,
@@ -911,10 +919,22 @@ answers 404 and the robot stops after one request.
   doc_number; 404 before 072), `coconut_supply_orders` (confirmed by landing day,
   claims by prep day), `hc_calendar_findings` (open, still_on; 404 before 072),
   `order_time_proposals` (pending), `order_departures` (drive times reused for a
-  garage start). Routes: at most 3 `computeRoute` calls a run (deliveries first,
-  soonest first), cached on the stored rows (drive_min, route_at; the why line
-  carries "Ferry on the route." and "Route tries: N."), trusted 24 hours on a
-  draft day and kept on an approved day while both ends are the same. One pending
+  garage start; findings by order id AND by day 1's invoice id). Routes: at most
+  3 `computeRoute` calls a run (deliveries first, soonest first), cached on the
+  stored rows (drive_min, route_at; the why line carries "Ferry on the route."
+  and "Route tries: N."), trusted 24 hours on a draft day. DRIFT (review fix
+  2026-11-27): an approved or changed day ALWAYS keeps its own approved drive
+  time while a row's ends are the same, so live traffic in order_departures
+  never turns an approved day into "plan changed" (the alarm itself still
+  follows live traffic); a draft keeps its own stored drive while the live
+  departure drive is within 10 minutes (`CREW_DRIFT_MINUTES`). drive_min is
+  rounded UP (so the stored drive gives back the alarm's exact leave-by) and a
+  start from an arrival is leave-by minus load rounded DOWN to 5 minutes. An
+  address with no state, zip or known town ("Test Pier") is never routed (the
+  departure plan's own `departureDestination` test, in `CREW_LIB` and in
+  `crewRoutes`): red no_address, never a geocoder guess. A failed try count is
+  part of the md5 (each try is written), so the third failure is red no_time; a
+  failed route is tried again 24 hours after its last try. One pending
   place a run is geocoded and written ONCE (`hc_crew_site_geo_put`, found or
   failed; only Sidd confirms it; nothing routes from an unconfirmed place). Puts
   are capped at 12 a run (`CREW_PUTS_PER_RUN_MAX`), nearest days first, the rest
@@ -934,7 +954,8 @@ answers 404 and the robot stops after one request.
   opts.resolved). Never a helper, the owner role, a locked or never_schedule
   person, App Review, or anyone with an approved day off. Owner (practice or on):
   4 PM New York (16 and 17) "Tomorrow's crew plan is not approved. Crew get
-  nothing until you approve." when tomorrow has rows and is a draft; Thursday 6
+  nothing until you approve." when tomorrow has rows and is a draft (in practice:
+  "... Practice: crew get nothing yet."); Thursday 6
   PM (18 and 19) "Next week's crew plan is ready: N days, M questions." Stable
   ids, so a repeat tick is a no-op. The `crew_plan` and `crew_change` banners are
   the database's (073 trigger), not the worker's.
@@ -947,13 +968,18 @@ answers 404 and the robot stops after one request.
   makes ONE extra read a tick, `hc_crew_departure_origins` (it answers off unless
   the database mode is on too). An approved deliver trip gives the destination
   (dest_source `crew_plan`, so an address conflict never alarms toward the invoice
-  address) and, from a cold storage with confirmed coordinates, the start place
+  address) ONLY when its to_address is routable (`departureDestination` usable);
+  a trip to "Test Pier" keeps today's destination, so a job never loses the
+  complete invoice address it alarms from (DEPART-07). From a cold storage with
+  confirmed coordinates the trip also gives the start place
   (origin_kind `site`, its label and coordinates: "Leave Cold storage B by ...").
   `originFor` takes the site, `movementState` takes it as `base` (and its fence),
   and the GPS pickup stamp and the onShift atGarage flag use it. A base start or
   an unconfirmed place keeps the NJ garage exactly. If the 073 origin word is ever
-  missing, a refused site write is saved again from the garage, so a job never
-  loses its alarm. PROOF that unset and practice are today's behavior: the
+  missing, a refused site write is saved again from the garage WITH a garage drive
+  time and leave-by (the stored garage route for the same address, else one
+  garage route now, else no route so the next tick routes it), so a job never
+  loses its alarm and never alarms from the cold storage's numbers. PROOF that unset and practice are today's behavior: the
   existing departure and worker tests pass unchanged, and a side-by-side run of
   bad6b1b against this branch (same fake network; the departure scan at 5
   moments, all three existing crons, and the new cron) gave 40 of 40 identical
@@ -966,29 +992,42 @@ answers 404 and the robot stops after one request.
   try (design 4.1) instead of adding the line. Requests a run: about 9 reads, up
   to 3 routes (3 or 4 requests each), up to 12 puts, one geocode, the banners and
   one run log; check the CPU time of the first ticks in `npx wrangler tail`.
-- CONTRACT GAP for P1 (073 SQL): reply-shapes 4.1 lists 12 keys per day in
-  `hc_crew_plan_inputs` and no draft rows, gap entries or counts. The worker uses
-  `tasks`, `gaps`, `red_count`, `amber_count` and `proposal` when a day carries
-  them (PUT-11 says "day states come whole"; NOTICE-07 and NOTICE-08 need them)
-  and otherwise falls back to its own drafts: the owner nudges still go out, the
-  digest says "Tomorrow draft." without a count, the scorecard is skipped, and a
-  draft day's drive times are not remembered between runs, so a day more than 2
-  days out with a cold storage start may be rewritten each hour while Apple's
-  traffic time drifts (approved days keep theirs). Ask the P1 owner to return the
-  stored `tasks, gaps, red_count, amber_count, proposal` on every day (robot only).
+- CONTRACT for P1 (073 SQL), changed in the shared vectors on 2026-11-27 (073
+  repo, tests/): (1) PUT-11 now checks that `hc_crew_plan_inputs` sends every
+  stored day WHOLE (tasks, gaps, red_count, amber_count, proposal besides the
+  reply-shapes 4.1 keys; robot only). Without it only the 3 soonest trips are
+  ever timed, the try count never reaches 3, drafts are rewritten as traffic
+  drifts and the practice scorecard never shows: DO NOT START PRACTICE before
+  P1 ships it. The worker already uses the whole days and falls back safely
+  (nothing guessed) on the 12-key shape. (2) WORDS-01: hc_crew_words must give
+  the arrival when busy_to is set and busy_from is null (no start yet), not only
+  with a leave_by; the robot now keeps busy_to = arrival + unload on such rows.
+  (3) READ-12: hc_crew_hold_reason must read the live Navigate address with the
+  shared rule (ASCII whitespace runs to one space, failing comma parts dropped,
+  over 200 characters none), or a messy address reads On hold and drops the
+  departure trip. reply-shapes 4.1 is P1's file to update with (1).
 - Contract readings made here (said in the PR): day_not_linked only for stage
   `invoiced` (R10-02 expects none on a paid order with no invoice id); a pending
   coordinator time only counts when a time is on file (like the alarm); the
   NOTICE "then" steps run on the case state plus their own layers (a tick's own
   puts are not carried, which is how the contract computed its counts).
-- Tests: `node worker/test-crew-plan.mjs` (106 checks: every pure-rule case of the
+- Review fixes 2026-11-27 (package C findings C-S1 to C-S6, C-M1 to C-M7, C-1 to
+  C-9): `node worker/test-crew-plan.mjs` section 4 and the new departure checks
+  pin each one; 24 of 24 planted reverts are caught (scratchpad
+  crewfix/plant-reverts.mjs). The put request key is md5('hc-crew-put-v2' + run
+  id + market + day + inputs_md5 + version + md5 of tasks, gaps and reasons), so
+  a put answered off mid run is never replayed as off and a new route time is
+  never a refused key. Push tokens are read by exact lower-case email, the house
+  pattern: 041's hc_sync_notification_device writes lower(email).
+- Tests: `node worker/test-crew-plan.mjs` (121 checks: every pure-rule case of the
   vectors by name, the robot through a fake database and fake Apple Maps that
   answer from the fixtures, PUT-13, SETUP-08, WORDS-01, NOTICE-04 to 08 and 10,
   MODE-01 to 05, md5 against node:crypto, the 18:00 to 21:00 gate in both
   markets, stable ids, the strict reply shape, the scorecard, failed reads, the
-  cron wiring) and `node worker/test-departure-site-origin.mjs` (10 checks:
-  DEPART-01 to 05, held trips, a 404 before 073, the refused site write, the
-  site as pickup base, and unset, practice and on-without-a-trip identical). There
+  cron wiring, the review fixes, READ-12) and `node worker/test-departure-site-origin.mjs`
+  (13 checks: DEPART-01 to 05 and 07, held trips, a 404 before 073, the refused
+  site write and its garage leave-by, an unroutable trip address, the site as
+  pickup base, and unset, practice and on-without-a-trip identical). There
   are now 32 worker test files (33 with test-dashboard-client-security.mjs). Known
   laptop flake, not this branch: test-deal-facts "a long dense paragraph stays
   fast" (a timing check) fails the same way on bad6b1b.
@@ -1010,10 +1049,15 @@ answers 404 and the robot stops after one request.
   secret put CREW_PLAN_MODE` = practice. On (step C6, after 2 practice weeks):
   073's on paste, then the secret = on; watch the first On day (push_queue rows
   and order_departures origin_kind).
-  Undo: `wrangler secret delete CREW_PLAN_MODE` stops everything at the next tick
-  (drafts already saved stay in HC App; crew banners stop; the departure plan is
-  back on the garage at its next 5-minute tick). Code undo: `npx --no-install
-  wrangler rollback <the id written down>`.
+  Undo: `wrangler secret delete CREW_PLAN_MODE` stops the ROBOT at the next tick:
+  no drafts, no worker banners (crew_tomorrow and the owner nudges), no digest
+  lines, and the departure plan is back on the garage and today's address at its
+  next 5-minute tick (drafts already saved stay in HC App). It does NOT stop the
+  database's own banners or reads: 073's trigger still sends crew_plan banners
+  when Sidd approves a day, and crew still read approved days, while the
+  database mode is on (hc_crew_notice checks only the database mode). To stop
+  crew banners and crew reads, paste 073's practice or off switch (design C6).
+  Code undo: `npx --no-install wrangler rollback <the id written down>`.
 
 ## Current uncommitted state (as of 2026-07-07)
 

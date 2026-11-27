@@ -26,14 +26,19 @@ const COLD = { lat: 40.3, lng: -73.9 };
 const W1 = '73d00000-0000-4000-8000-000000000001';
 
 const raw = readFileSync(new URL('./test-vectors/crew-plan-cases.json', import.meta.url));
-assert.equal(createHash('sha256').update(raw).digest('hex'), 'b9887715a68e9ceb5d9ca739fb8e6c3dcaaa18f243b93f62af3078bb1b77d0ab');
+assert.equal(createHash('sha256').update(raw).digest('hex'), '072030b2dfd165823149a0e0afd1523caf326323812896b68d987608e7745af1');
 const V = JSON.parse(raw.toString('utf8'));
 const caseById = (id) => V.cases.find((c) => c.id === id);
 const departCases = V.cases.filter((c) => c.rule === 'DEPART' && c.packages.includes('worker'));
-assert.equal(departCases.length, 5);
-pass('vectors file is the pinned copy; 5 DEPART cases for the worker');
+assert.equal(departCases.length, 6);
+pass('vectors file is the pinned copy; 6 DEPART cases for the worker');
 
 const reply = (status, data) => ({ ok: status >= 200 && status < 300, status, async json() { return data; }, async text() { return data == null ? '' : JSON.stringify(data); } });
+async function fakeAppleKeyPem() {
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const der = new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey));
+  return '-----BEGIN PRIVATE KEY-----\n' + Buffer.from(der).toString('base64').replace(/(.{64})/g, '$1\n') + '\n-----END PRIVATE KEY-----\n';
+}
 const realNow = Date.now;
 async function at(iso, fn) { Date.now = () => Date.parse(iso); try { return await fn(); } finally { Date.now = realNow; } }
 const ORDER_DEFAULTS = { venue: null, delivery_notes: null, delivery_request: null, invoice_fulfillment: null, coconuts_qty: null };
@@ -56,6 +61,19 @@ function world(opts = {}) {
     const method = options.method || 'GET';
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ url, method, body });
+    if (opts.apple && url.startsWith('https://maps-api.apple.com/')) {
+      // A fake Apple Maps: 20 minutes from the cold storage, 45 from the NJ
+      // garage, to one spot in Manhattan.
+      const u = new URL(url);
+      if (u.pathname === '/v1/token') return reply(200, { accessToken: 'fake-access', expiresInSeconds: 1800 });
+      if (u.pathname === '/v1/geocode') return reply(200, { results: [{ coordinate: { latitude: 40.75, longitude: -73.99 } }] });
+      const [olat] = String(u.searchParams.get('origin')).split(',').map(Number);
+      const secs = Math.abs(olat - COLD.lat) < 1e-6 ? 1200 : 2700;
+      const meters = Math.abs(olat - COLD.lat) < 1e-6 ? 65000 : 45000;
+      if (u.pathname === '/v1/directions') return reply(200, { routes: [{ name: 'Test Rd', distanceMeters: meters, durationSeconds: secs }], steps: [{ instructions: 'Head north' }] });
+      if (u.pathname === '/v1/etas') return reply(200, { etas: [{ expectedTravelTimeSeconds: secs, staticTravelTimeSeconds: secs, distanceMeters: meters }] });
+      return reply(404, {});
+    }
     if (!url.startsWith(SB + '/rest/v1/')) throw new Error('unexpected offline fetch: ' + method + ' ' + url);
     const path = url.slice((SB + '/rest/v1/').length);
     if (method === 'POST' && path === 'rpc/hc_crew_departure_origins') {
@@ -123,7 +141,7 @@ const lastUpsert = (w) => w.upserts().filter((u) => u.order_id === W1).slice(-1)
   pass('DEPART-01: CREW_PLAN_MODE unset and practice: NJ garage, the invoice address wins, hc_crew_departure_origins is never called');
 }
 // -- DEPART-02 to 04: mode on ----------------------------------------
-for (const id of ['DEPART-02', 'DEPART-03', 'DEPART-04']) {
+for (const id of ['DEPART-02', 'DEPART-03', 'DEPART-04', 'DEPART-07']) {
   const c = caseById(id);
   const { w } = await depScan(modeEnv('on'), { orders: [orderOf(c)], originsReply: c.input.crew_origins_reply });
   const up = lastUpsert(w);
@@ -156,6 +174,45 @@ for (const id of ['DEPART-02', 'DEPART-03', 'DEPART-04']) {
   assert.equal(w.plans.get(W1).origin_kind, 'garage');
   assert.equal(counts.failed, 0);
   pass('a refused cold storage start (the origin check without "site") never costs the job its alarm: saved from the garage instead');
+}
+{
+  // C-8: the garage fallback carries a GARAGE drive time and leave-by,
+  // never the cold storage's numbers under the garage's name. With the
+  // router: the site route (20 min) is refused, the garage is routed (45
+  // min) and the leave-by follows it. With a stored garage route for the
+  // same address: that route is reused, no extra call.
+  const c = caseById('DEPART-02');
+  const APPLE_ENV = { ...modeEnv('on'), APPLE_MAPS_KEY_ID: 'ABCDEFGHIJ', APPLE_MAPS_TEAM_ID: 'TEAM123456', APPLE_MAPS_PRIVATE_KEY: await fakeAppleKeyPem() };
+  const { w } = await depScan(APPLE_ENV, { orders: [orderOf(c)], originsReply: c.input.crew_origins_reply, refuseSite: true, apple: true });
+  const ups = w.upserts();
+  assert.equal(ups.length, 2);
+  assert.deepEqual([ups[0].origin_kind, ups[0].drive_seconds], ['site', 1200]);
+  assert.deepEqual([ups[1].origin_kind, ups[1].drive_seconds], ['garage', 2700], 'the fallback is routed from the garage');
+  // 7:00 AM ET on Mon Nov 30 is 12:00 UTC; minus 60 min buffer and 45 min drive.
+  assert.equal(ups[1].leave_by_at, '2026-11-30T10:15:00.000Z', "the leave-by is the garage's");
+  const stored = { order_id: W1, plan_date: '2026-11-30', market: 'ny', state: 'planned', window_text: '7:00 AM', arrive_source: 'delivery_request', arrive_kind: 'exact',
+    arrive_at: '2026-11-30T12:00:00.000Z', origin_kind: 'garage', origin_lat: GARAGE.lat, origin_lng: GARAGE.lng, origin_label: 'NJ garage', dest_source: 'crew_plan',
+    dest_address: c.input.crew_origins_reply.trips[0].to_address, dest_lat: 40.75, dest_lng: -73.99, drive_seconds: 2700, has_ferry: false, route_source: 'apple_maps',
+    leave_by_at: '2026-11-30T10:15:00.000Z', computed_at: '2026-11-29T22:00:00Z', alerts: {}, movement: 'nobody' };
+  const again = await depScan(modeEnv('on'), { orders: [orderOf(c)], originsReply: c.input.crew_origins_reply, refuseSite: true, plans: [stored] });
+  const last = again.w.upserts().slice(-1)[0];
+  assert.deepEqual([last.origin_kind, last.drive_seconds, last.leave_by_at], ['garage', 2700, '2026-11-30T10:15:00.000Z'], 'a stored garage route for the same address is carried');
+  pass('C-8: a refused cold storage start is saved from the garage with the garage drive time and leave-by (routed now, or the stored garage route carried), never the cold storage numbers');
+}
+{
+  // C-S2: an approved trip address the router may not be given ("Test
+  // Pier", or "Test Pier, New York": no state, zip or known town) never
+  // replaces today's complete invoice address: the alarm keeps working.
+  const c = caseById('DEPART-03');
+  for (const [to, source] of [['Test Pier', 'invoice'], ['Test Pier, New York', 'invoice'], ['Test Pier, 1 Test Pier, New York, NY 10011', 'crew_plan']]) {
+    const reply2 = { v: 1, code: 'ok', trips: [{ ...c.input.crew_origins_reply.trips[0], to_address: to }] };
+    const { w } = await depScan(modeEnv('on'), { orders: [orderOf(c)], originsReply: reply2 });
+    const up = lastUpsert(w);
+    assert.equal(up.dest_source, source, to + ': dest_source');
+    assert.notEqual(up.state, 'no_address', to + ': the job keeps an address it can alarm from');
+    if (source === 'invoice') assert.equal(up.dest_address, 'Test Hall, 9 Test Ave, New York, NY 10001');
+  }
+  pass('C-S2: with CREW_PLAN_MODE on, an approved trip to "Test Pier" (not routable) keeps the complete invoice address; a complete trip address still wins');
 }
 // -- DEPART-05: the site as base for movement and the GPS pickup stamp -
 {

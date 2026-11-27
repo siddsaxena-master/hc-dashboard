@@ -119,6 +119,13 @@ export const CREW_GAPS = {
 export const CREW_ROUTE_CALLS_MAX = 3;
 export const CREW_ROUTE_CACHE_HOURS = 24;
 export const CREW_ROUTE_FAIL_RUNS = 3;
+// A draft day keeps its own stored drive time while the departure plan's
+// live-traffic drive is within this many minutes of it (the departure
+// plan's own "ETA moved 10 or more minutes" rule).
+export const CREW_DRIFT_MINUTES = 10;
+// 073's stored task ranges (hc_crew_task_norm): a value outside them makes
+// the server refuse the WHOLE day, so the robot never sends one.
+export const CREW_LIMITS = { cars: 6, need: 8, boxes: 500, coconuts: 5000 };
 
 // ---------------------------------------------------------------- small helpers
 const isFiniteNum = (v) => typeof v === 'number' && Number.isFinite(v);
@@ -130,6 +137,13 @@ function idOf(v) {
 export function crewMarketKey(market) {
   const key = trimText(market).toLowerCase();
   return key || 'ny';
+}
+// A PERSON's live market (field_workers.market, a helper's helper_market):
+// blank is no market at all, so a person with no market is never planned
+// and never sent a crew banner (073 refuses them in every market).
+export function crewLiveMarket(market) {
+  const key = trimText(market).toLowerCase();
+  return key || null;
 }
 function posInt(v) {
   const n = Number(v);
@@ -202,7 +216,9 @@ export function crewMinInZone(ms, tz) { return zoneParts(ms, tz).min; }
 
 // ---------------------------------------------------------------- the word check
 // hc_crew_text_ok: no @, no $, no phone shape (072's regex), no run of 7 or
-// more digits, no link, no control character.
+// more digits, no link, no control character, and never the supplier's name
+// or the word billed as a whole word (073 refuses all of these, so a text
+// that fails here would make the server refuse the whole day).
 const PHONE_RE = /\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}/;
 export function crewTextOk(text) {
   const s = String(text == null ? '' : text);
@@ -211,18 +227,27 @@ export function crewTextOk(text) {
   if (/[0-9]{7,}/.test(s)) return false;
   if (/http/i.test(s)) return false;
   if (/[\u0000-\u001f\u007f]/.test(s)) return false;
+  if (/\b(weee|billed)\b/i.test(s)) return false;
   return true;
 }
-// An address text the crew can read: the comma parts that fail the word
-// check (a phone or an email typed into the notes) are left out. Null when
-// nothing usable is left. Never adds anything.
+// THE Navigate address rule, shared with the database's hold check (contract
+// rules.held): every run of ASCII whitespace (space, tab, line break) becomes
+// one space and the ends are trimmed; when the result fails the word check,
+// only its comma parts that pass are kept, joined by ", "; nothing left, or
+// more than 200 characters (073's to_address limit), is none. Never adds
+// anything. ASCII whitespace only, so SQL's '[ \t\n\r\f\v]+' matches it.
+const NAV_WS = /[ \t\n\r\f\v]+/g;
+export const CREW_ADDRESS_MAX = 200;
+const navSpaces = (v) => String(v == null ? '' : v).replace(NAV_WS, ' ').trim();
 export function crewCleanAddress(text) {
-  const s = trimText(text).slice(0, 400);
+  const s = navSpaces(text);
   if (!s) return null;
-  if (crewTextOk(s)) return s;
-  const kept = s.split(',').map((p) => p.trim()).filter((p) => p && crewTextOk(p));
-  const out = kept.join(', ');
-  return out && crewTextOk(out) ? out : null;
+  let out = s;
+  if (!crewTextOk(out)) {
+    out = s.split(',').map((p) => p.trim()).filter((p) => p && crewTextOk(p)).join(', ');
+    if (!out || !crewTextOk(out)) return null;
+  }
+  return out.length > CREW_ADDRESS_MAX ? null : out;
 }
 // company when not blank, else client_name, trimmed, first 40 characters.
 export function crewClientLabel(order) {
@@ -300,10 +325,18 @@ function orderCut(o) {
 function isCancelled(o) {
   return String((o && o.stage) || '') === 'cancelled' || !!(o && o.cancelled_at != null && trimText(o.cancelled_at));
 }
-// The Navigate rule: delivery_notes, else venue.
+// The Navigate rule: delivery_notes, else venue (blank after the whitespace
+// rule counts as missing), cleaned by crewCleanAddress.
 export function crewNavAddress(order) {
   const o = order || {};
-  return crewCleanAddress(trimText(o.delivery_notes) || trimText(o.venue));
+  return crewCleanAddress(navSpaces(o.delivery_notes) || navSpaces(o.venue));
+}
+// Why the Navigate address is not on the row: 'long' when the text is there
+// but longer than 200 characters, else 'none'.
+function navMissingReason(order) {
+  const o = order || {};
+  const raw = navSpaces(o.delivery_notes) || navSpaces(o.venue);
+  return raw && raw.length > CREW_ADDRESS_MAX ? 'long' : 'none';
 }
 const DEFAULT_CARD = { stage: 'auto', prep: 'auto', branding: 'auto', crew_start: null, people_min: null, extras: [], on_site: [] };
 // R3 branding: card yes or no wins; auto brands when the stamp is ordered
@@ -351,9 +384,19 @@ function personFirstName(p) {
 }
 
 // ---------------------------------------------------------------- gap words
+// 073 takes gap words of 1 to 300 characters that pass the word check and
+// refuses the WHOLE day otherwise, so a long label is cut and a word that
+// fails the check falls back to a plain sentence (Sidd still sees the code).
+export const CREW_GAP_WORDS_MAX = 300;
+function gapWords(words) {
+  let s = String(words == null ? '' : words).replace(NAV_WS, ' ').trim();
+  if (!s || !crewTextOk(s)) return 'Check this row.';
+  if (s.length > CREW_GAP_WORDS_MAX) s = s.slice(0, CREW_GAP_WORDS_MAX - 4).trimEnd() + ' ...';
+  return s;
+}
 function gapEntry(code, taskKey, words) {
   const g = CREW_GAPS[code] || ['red', true];
-  return { code, level: g[0], owner_only: g[1], task_key: taskKey == null ? null : taskKey, words };
+  return { code, level: g[0], owner_only: g[1], task_key: taskKey == null ? null : taskKey, words: gapWords(words) };
 }
 // Stored order: red first, then task_key (null first, byte order), then code.
 export function crewSortGaps(list) {
@@ -377,8 +420,24 @@ function ruleWords(key, value) {
 }
 
 // ---------------------------------------------------------------- the words (one place)
+// The arrival a deliver row carries, read from its fields exactly as 073's
+// hc_crew_words reads it (contract words.deliver): busy_to minus the unload
+// minutes, when the row has a leave_by or has no busy_from (a robot deliver
+// row with a known arrival always keeps busy_to = arrival + unload, and a
+// row with no start keeps no busy_from, so it never clashes). A row with a
+// crew start and no drive time yet has neither, so it shows its start only.
+export function crewTaskArrivalMin(task, unloadMin) {
+  const t = task || {};
+  if (t.kind !== 'deliver') return null;
+  const busyTo = crewHmToMin(t.busy_to), busyFrom = crewHmToMin(t.busy_from), leave = crewHmToMin(t.leave_by);
+  if (leave == null && !(busyFrom == null && busyTo != null)) return null;
+  const unload = unloadMin != null && Number.isFinite(Number(unloadMin)) ? Math.round(Number(unloadMin)) : 30;
+  if (busyTo != null) return busyTo - unload;
+  if (leave != null && t.drive_min != null && Number.isFinite(Number(t.drive_min))) return leave + Number(t.drive_min) + 60;
+  return null;
+}
 // Builds a task's crew sentence from structured fields only. ctx:
-// { market, siteLabel(id), personName(id), client(order_id), arrivalMin(task),
+// { market, siteLabel(id), personName(id), client(order_id), unloadMin,
 //   jobDayWords(task), prepFacts(task) {cut, branded}, extraLabel(task),
 //   held }. Every result passes crewTextOk or the caller gets the held
 // constant's plain fallback.
@@ -417,7 +476,7 @@ export function crewWords(task, ctx) {
     if (f.branded) what += ', branded';
     s = from ? 'Any time at ' + from + ': ' + what + '.' : 'Any time: ' + what + '. Place: Sidd will confirm.';
   } else if (t.kind === 'deliver') {
-    const arrival = ctx.arrivalMin ? ctx.arrivalMin(t) : null;
+    const arrival = crewTaskArrivalMin(t, ctx.unloadMin);
     const prefix = [startMin != null ? clock(startMin) : null, from].filter(Boolean).join(' ');
     const what = t.boxes != null ? 'pick up ' + boxesText(Number(t.boxes)) : 'pick up the boxes';
     s = (prefix ? prefix + ': ' + what : capFirst(what)) + ', ' + carsText(t.cars || 0, t.people, ctx) + '.';
@@ -447,7 +506,8 @@ export function crewWords(task, ctx) {
 
 // The same words for a task built outside a planner run (a stored row, an
 // owner row, the test vectors' words_from). facts: { now, sites, people,
-// orders, jobs (job cards), proposals, held }.
+// orders, jobs (job cards), rules, held }. Like 073's hc_crew_words, it
+// reads only the task's own fields (and the orders' labels).
 export function crewWordsFor(task, market, facts, lib) {
   const f = facts || {};
   const m = crewMarketKey(market);
@@ -457,13 +517,7 @@ export function crewWordsFor(task, market, facts, lib) {
   const ordersById = new Map((f.orders || []).filter((o) => o && o.id).map((o) => [idOf(o.id), o]));
   const cards = new Map((f.jobs || []).filter((j) => j && j.order_id).map((j) => [idOf(j.order_id), j]));
   const thisYear = crewDayInZone(Date.parse(f.now), zone('ny')).slice(0, 4);
-  const props = new Map();
-  for (const p of f.proposals || []) {
-    const ms = Date.parse(p && p.proposed_arrive_at);
-    const id = idOf(p && p.order_id);
-    if (!id || !Number.isFinite(ms) || (p.status && p.status !== 'pending')) continue;
-    if (!props.has(id) || ms < props.get(id).ms) props.set(id, { ms });
-  }
+  const unloadRule = (f.rules || []).find((r) => r && crewMarketKey(r.market) === m && r.key === 'unload_minutes');
   const headOf = (o) => (o && idOf(o.parent_order_id) ? ordersById.get(idOf(o.parent_order_id)) || null : null);
   const ctx = {
     market: m,
@@ -471,10 +525,7 @@ export function crewWordsFor(task, market, facts, lib) {
     siteLabel: (id) => { const s = sitesById.get(idOf(id)); return s ? trimText(s.label) : null; },
     personName: (id) => personFirstName(peopleById.get(idOf(id))),
     client: (id) => { const o = ordersById.get(idOf(id)); return o ? crewClientLabel(o) : 'the client'; },
-    arrivalMin: (t) => {
-      const o = ordersById.get(idOf(t.order_id));
-      return o ? crewArrivalOf(o, crewOrderDay(o), zone(m), props.get(idOf(o.id)) || null, lib).min : null;
-    },
+    unloadMin: unloadRule && Number.isFinite(Number(unloadRule.value)) ? Number(unloadRule.value) : 30,
     jobDayWords: (t) => { const o = ordersById.get(idOf(t.order_id)); return o ? crewDayWords(crewOrderDay(o), thisYear) : ''; },
     prepFacts: (t) => {
       const o = ordersById.get(idOf(t.order_id));
@@ -565,13 +616,28 @@ export function planCrew(input, lib) {
     ordersById.set(id, o);
     orders.push(o);
   }
+  // 072 calendar findings: keyed by an order, or only by day 1's invoice
+  // ('<code>:qbo:<id>', order_id null). An invoice-keyed one belongs to the
+  // day 1 (no parent) whose external_invoice_id is that invoice, as the
+  // reconfirmation scan maps it, so the plan never looks cleaner than the
+  // calendar.
+  const headsByQbo = new Map();
+  for (const o of orders) {
+    const q = trimText(o.external_invoice_id);
+    if (!q || idOf(o.parent_order_id)) continue;
+    if (!headsByQbo.has(q)) headsByQbo.set(q, []);
+    headsByQbo.get(q).push(idOf(o.id));
+  }
   const findingsByOrder = new Map();
+  const addFinding = (id, code) => {
+    if (!findingsByOrder.has(id)) findingsByOrder.set(id, []);
+    if (!findingsByOrder.get(id).includes(code)) findingsByOrder.get(id).push(code);
+  };
   for (const f of inp.findings || []) {
     if (!f || !(f.status === 'open' || f.status === 'still_on')) continue;
     const id = idOf(f.order_id);
-    if (!id) continue;
-    if (!findingsByOrder.has(id)) findingsByOrder.set(id, []);
-    findingsByOrder.get(id).push(String(f.code));
+    if (id) { addFinding(id, String(f.code)); continue; }
+    for (const head of headsByQbo.get(trimText(f.qbo_id)) || []) addFinding(head, String(f.code));
   }
   const addonsByHead = new Map();
   for (const a of inp.attachments || []) {
@@ -610,18 +676,58 @@ export function planCrew(input, lib) {
       routeNeeds.set(key, { key, from_site: idOf(fromId), to_site: toSite ? idOf(toSite) : null, to_address: toSite ? null : toAddress, priority, day });
     }
   };
-  // A usable drive time: {seconds, ferry, at} | {failed: true} | null.
+  // An address a router may be given: departureDestination's own test (a
+  // comma and a state, a zip or a known town). "Test Pier" never is, so the
+  // robot never times a trip from a geocoder's guess (no route, a gap).
+  const addressUsable = (address) => {
+    if (!trimText(address)) return false;
+    if (!lib || typeof lib.departureDestination !== 'function') return true;
+    const d = lib.departureDestination({ delivery_notes: address });
+    return !!(d && d.usable);
+  };
+  // A usable drive time: {seconds, ferry, at} | {failed, tries, at} |
+  // {pending, tries, at} | null.
   const driveFor = (fromId, toSite, toAddress) => {
     if (!fromId) return null;
     const site = sitesById.get(idOf(fromId));
     if (!coordsOk(site)) return null; // an unconfirmed place is never routed from
+    if (!toSite && !addressUsable(toAddress)) return null;
     const to = toSite ? idOf(toSite) : trimText(toAddress);
     if (!to) return null;
     const r = routes.get(idOf(fromId) + '|' + to);
     if (!r) return null;
     if (isFiniteNum(r.drive_seconds) && r.drive_seconds >= 0) return { seconds: r.drive_seconds, ferry: r.has_ferry === true, at: r.at || null };
-    if (Number(r.fail_runs) >= CREW_ROUTE_FAIL_RUNS) return { failed: true };
-    return Number(r.fail_runs) > 0 ? { pending: true, tries: Number(r.fail_runs) } : null;
+    if (Number(r.fail_runs) >= CREW_ROUTE_FAIL_RUNS) return { failed: true, tries: Number(r.fail_runs), at: r.at || null };
+    return Number(r.fail_runs) > 0 ? { pending: true, tries: Number(r.fail_runs), at: r.at || null } : null;
+  };
+  // drive_min is the drive in whole minutes ROUNDED UP: leaveByMs floors to
+  // the minute, so arrival - buffer - ceil(drive) is the alarm's own
+  // leave-by, and a stored drive_min gives back exactly the same leave-by.
+  const driveMinutes = (seconds) => Math.ceil(seconds / 60);
+  // The robot row stored for (market, day, key): an approved or changed
+  // day's approved row, or a draft day's own row when the database sends
+  // the day whole. Its drive time is reused while its ends (from_site,
+  // to_site, to_address) are the same: on an approved day ALWAYS (the
+  // approved plan never drifts with traffic; the departure plan's alarm
+  // still follows live traffic), on a draft day while a fresh departure
+  // drive is within CREW_DRIFT_MINUTES of it (so a draft is not rewritten,
+  // and Sidd's approve tap made stale, every hour).
+  const storedRobotRow = (m, day, key) => {
+    const sd = storedDays.get(m + '|' + day);
+    if (!sd) return null;
+    const approved = sd.status === 'approved' || sd.status === 'changed';
+    const list = approved ? (sd.approved_tasks || []) : (Array.isArray(sd.tasks) ? sd.tasks : []);
+    const t = list.find((x) => x && x.source !== 'owner' && String(x.key) === key);
+    return t ? { t, approved } : null;
+  };
+  const keptDrive = (m, day, key, fromSite, toSite, toAddress) => {
+    const s = storedRobotRow(m, day, key);
+    if (!s) return null;
+    const t = s.t;
+    if (idOf(t.from_site) !== idOf(fromSite) || idOf(t.to_site) !== idOf(toSite) || (t.to_address || null) !== (toAddress || null)) return null;
+    const dm = Number(t.drive_min);
+    if (t.drive_min == null || !Number.isInteger(dm) || dm < 0) return null;
+    return { approved: s.approved, minutes: dm, drive: { seconds: dm * 60, ferry: /Ferry on the route\./.test(String(t.why || '')), at: t.route_at || null } };
   };
 
   // -- R1 and R2: the job days
@@ -631,6 +737,9 @@ export function planCrew(input, lib) {
     const day = crewOrderDay(o);
     if (!day) continue;
     const market = crewMarketKey(o.market);
+    // Only the four crew markets have plan days (073 refuses any other
+    // p_market, so a market like 'other' would fail its put every hour).
+    if (!Object.prototype.hasOwnProperty.call(CREW_MARKET_WORDS, market)) continue;
     const today = todayOf(market);
     if (day < crewDayAdd(today, -1) || day > crewDayAdd(today, 8)) continue;
     if (isCancelled(o)) continue;
@@ -681,6 +790,7 @@ export function planCrew(input, lib) {
     j.card = cardOf(j.headId);
     j.client = crewClientLabel(o);
     j.toAddress = crewNavAddress(o);
+    j.addrUsable = addressUsable(j.toAddress);
     j.coconuts = posInt(o.coconuts_qty);
     j.boxes = j.coconuts ? Math.ceil(j.coconuts / 9) : null;
     j.hasPrep = j.card.prep !== 'skip';
@@ -922,7 +1032,7 @@ export function planCrew(input, lib) {
     ruleGaps(row, ['boxes_per_car', 'two_people_over']);
     // R2 gaps. day_not_linked is an INVOICED day with no invoice and no
     // family link (a paid order with no invoice id is Sidd's own entry).
-    if (String(o.stage || '') === 'invoiced' && !idOf(o.external_invoice_id) && !idOf(o.parent_order_id)) addGap(row, 'day_not_linked', 'Invoiced with no invoice and not linked to a job.');
+    if (String(o.stage || '') === 'invoiced' && !idOf(o.external_invoice_id) && !idOf(o.parent_order_id)) addGap(row, 'day_not_linked', 'Marked invoiced but has no QuickBooks invoice and is not linked to a job.');
     if (!j.coconuts) addGap(row, 'count_missing', 'Coconut count missing.');
     const codes = findingsByOrder.get(j.id) || [];
     if (codes.some((c) => c === 'count_differs' || c === 'days_differ')) addGap(row, 'count_disputed', 'App count and invoice disagree.');
@@ -961,23 +1071,31 @@ export function planCrew(input, lib) {
     // drive time from the trip's start place (asked for only when it is
     // used: a known arrival or a crew start)
     const crewStart = crewHmToMin(j.card.crew_start);
-    let drive = null, routeFailed = false, routeTries = 0;
-    if (j.toAddress && row.from_site && (arrivalMs != null || crewStart != null)) {
-      if (j.base && row.from_site === idOf(j.base.id)) {
+    let drive = null, routeFailed = false, routeTries = 0, routeTryAt = null;
+    const routable = !!j.toAddress && j.addrUsable;
+    if (routable && row.from_site && (arrivalMs != null || crewStart != null)) {
+      const kept = keptDrive(j.market, j.day, row.key, row.from_site, null, j.toAddress);
+      if (kept && kept.approved) drive = kept.drive; // an approved day keeps its own drive time
+      if (!drive && j.base && row.from_site === idOf(j.base.id)) {
         const dep = departures.find((x) => idOf(x.order_id) === j.id && trimText(x.dest_address) === j.toAddress && isFiniteNum(x.drive_seconds));
-        if (dep) drive = { seconds: dep.drive_seconds, ferry: dep.has_ferry === true, at: dep.computed_at || null };
+        if (dep) {
+          drive = kept && Math.abs(driveMinutes(dep.drive_seconds) - kept.minutes) < CREW_DRIFT_MINUTES
+            ? kept.drive : { seconds: dep.drive_seconds, ferry: dep.has_ferry === true, at: dep.computed_at || null };
+        }
       }
       if (!drive) {
         const r = driveFor(row.from_site, null, j.toAddress);
-        if (r && r.failed) routeFailed = true;
+        if (r && r.failed) { routeFailed = true; routeTries = r.tries; routeTryAt = r.at; }
         else if (r && !r.pending) drive = r;
         else {
-          routeTries = r && r.pending ? r.tries : 0;
+          if (r && r.pending) { routeTries = r.tries; routeTryAt = r.at; }
           if (coordsOk(sitesById.get(row.from_site))) needRoute(row.from_site, null, j.toAddress, 0, j.day);
         }
       }
     }
-    if (drive) { row.drive_min = Math.round(drive.seconds / 60); row.route_at = drive.at || null; }
+    if (drive) { row.drive_min = driveMinutes(drive.seconds); row.route_at = drive.at || null; }
+    else if (routeTryAt) row.route_at = routeTryAt; // when the last failed try was (a failed route is tried again after 24 hours)
+    row._tries = drive ? 0 : routeTries;
     let leaveMs = null;
     if (arrivalMs != null && drive && lib && lib.leaveByMs) {
       leaveMs = lib.leaveByMs({ arriveAtMs: arrivalMs, driveSeconds: drive.seconds, hasFerry: drive.ferry });
@@ -988,20 +1106,31 @@ export function planCrew(input, lib) {
       row.startMin = crewStart; row.time_source = 'crew_start';
       if (arrivalMs == null && !needsAmpm) addGap(row, 'no_arrival', 'Start set by you, no arrival time, so no leave-by alarms.');
       if (row.leaveMin != null && crewStart > row.leaveMin - ld) addGap(row, 'start_after_leave_by', 'Start ' + crewClock(crewStart, j.market) + ' is after the leave-by ' + crewClock(row.leaveMin, j.market) + '.');
-      if (arrivalMs != null && j.toAddress && !drive) addGap(row, 'route_pending', 'Drive time not worked out yet.');
+      if (arrivalMs != null && routable && !drive) addGap(row, 'route_pending', 'Drive time not worked out yet.');
     } else if (row.leaveMin != null) {
-      row.startMin = row.leaveMin - ld; row.time_source = 'arrival';
+      // Leave-by minus the load time, rounded DOWN to 5 minutes (never later).
+      row.startMin = Math.floor((row.leaveMin - ld) / 5) * 5; row.time_source = 'arrival';
     } else if (!needsAmpm) {
       if (arrivalMs == null) addGap(row, 'no_time', 'No arrival time and no crew start on file.');
-      else if (j.toAddress && routeFailed) addGap(row, 'no_time', 'No drive time from ' + (siteLabel(row.from_site) || 'the base') + ' after 3 tries.');
-      else if (j.toAddress) addGap(row, 'route_pending', 'Drive time not worked out yet.');
+      else if (routable && routeFailed) addGap(row, 'no_time', 'No drive time from ' + (siteLabel(row.from_site) || 'the base') + ' after 3 tries.');
+      else if (routable) addGap(row, 'route_pending', 'Drive time not worked out yet.');
     }
-    if (!j.toAddress) addGap(row, 'no_address', 'No delivery address for ' + j.client + '.');
+    if (!j.toAddress) {
+      addGap(row, 'no_address', navMissingReason(o) === 'long'
+        ? 'The delivery address for ' + j.client + ' is longer than 200 characters; shorten it in the delivery notes.'
+        : 'No delivery address for ' + j.client + '.');
+    } else if (!j.addrUsable) {
+      addGap(row, 'no_address', 'The address for ' + j.client + ' is not complete enough for a drive time or leave-by alarms (add the street, town and state).');
+    }
     if (row.startMin != null) {
       row.busyFrom = row.startMin;
       if (arrivalMin != null) row.busyTo = arrivalMin + unload(j.market);
-      else if (drive) row.busyTo = row.startMin + Math.round(drive.seconds / 60) + unload(j.market);
+      else if (drive) row.busyTo = row.startMin + driveMinutes(drive.seconds) + unload(j.market);
       else row.busyTo = row.startMin + 120;
+    } else if (arrivalMin != null) {
+      // No start yet: no busy_from (so the row never clashes), but busy_to
+      // carries the arrival, so the server words still say "Arrive by".
+      row.busyTo = arrivalMin + unload(j.market);
     }
     timedChecks(row);
     for (const [code, words] of j.deliverGaps) addGap(row, code, words);
@@ -1035,8 +1164,7 @@ export function planCrew(input, lib) {
       const home = e.home_site_id && sitesById.get(idOf(e.home_site_id)) ? idOf(e.home_site_id) : null;
       const homeDrive = home && toAddress ? driveFor(home, null, toAddress) : null;
       const homeKnown = !!homeDrive && isFiniteNum(homeDrive.seconds);
-      if (home && toAddress && !homeKnown && !(homeDrive && homeDrive.failed) && coordsOk(sitesById.get(home))) needRoute(home, null, toAddress, 2, head.day);
-      const driveMin = homeKnown ? Math.round(homeDrive.seconds / 60) : null;
+      if (home && toAddress && addressUsable(toAddress) && !homeKnown && !(homeDrive && homeDrive.failed) && coordsOk(sitesById.get(home))) needRoute(home, null, toAddress, 2, head.day);
       for (const part of ['drop', 'pickup']) {
         const slot = e[part] && typeof e[part] === 'object' ? e[part] : null;
         if (!slot) continue;
@@ -1046,13 +1174,17 @@ export function planCrew(input, lib) {
         const row = newRow({ key: (isDrop ? 'extra_drop:' : 'extra_pickup:') + headId + ':' + e.key, kind: isDrop ? 'cart_drop' : 'cart_pickup',
           order_id: headId, from_site: isDrop ? home : null, to_site: isDrop ? null : home, to_address: toAddress, boxes: 0,
           market: m, day, fam: headId, job: head, extra: e, place: venueLabel, why: 'Job card: ' + (isDrop ? 'drop' : 'pickup') + ' at the venue.' });
+        // An approved day keeps its own drive time for the same ends.
+        const kept = keptDrive(m, day, row.key, row.from_site, row.to_site, row.to_address);
+        const rowDrive = kept && kept.approved ? kept.drive : (homeKnown ? homeDrive : null);
+        const driveMin = rowDrive ? driveMinutes(rowDrive.seconds) : null;
         row.cars = 1;
         row.need = Math.max(1, Math.min(4, posInt(e.people) || 1), posInt(card.people_min) || 0);
         row.time_source = 'owner';
         row.startMin = crewHmToMin(slot.start);
         row.endMin = crewHmToMin(slot.end);
         row.drive_min = driveMin;
-        if (homeKnown) row.route_at = homeDrive.at || null;
+        if (rowDrive) row.route_at = rowDrive.at || null;
         if (row.startMin == null) addGap(row, 'equipment_no_time', capFirst(label) + ' time is missing.');
         if (!home) addGap(row, 'equipment_no_home', 'Where is the ' + lowFirst(label) + ' kept?');
         if (row.startMin != null) {
@@ -1090,16 +1222,19 @@ export function planCrew(input, lib) {
       const firstMoveDay = jobs.filter((j) => j.market === m && j.stagedCold).map((j) => j.useDay).sort()[0];
       if (firstMoveDay) needRoute(idOf(base.id), idOf(cold.id), null, 1, firstMoveDay);
     }
-    const moveMin = moveKnown ? Math.round(moveDrive.seconds / 60) : null;
     const moveRow = (key, day, boxes, when, win, served) => {
       const row = newRow({ key, kind: 'move', supply_id: Number(key.split(':')[1]), from_site: idOf(base.id), to_site: idOf(cold.id), boxes,
         when, market: m, day, place: trimText(base.label), servedJobs: served,
         why: when === 'any_time' ? 'Moved to cold storage after prep.' : 'Kept in cold storage until the job.' });
+      // An approved day keeps its own drive time for the same ends.
+      const kept = keptDrive(m, day, key, row.from_site, row.to_site, null);
+      const rowDrive = kept && kept.approved ? kept.drive : (moveKnown ? moveDrive : null);
+      const moveMin = rowDrive ? driveMinutes(rowDrive.seconds) : null;
       row.cars = carsFor(row, boxes);
       row.need = Math.max(row.cars, boxes > twoOver(m) ? 2 : 1, ...served.map((j) => posInt(j.card.people_min) || 0));
       ruleGaps(row, ['boxes_per_car', 'two_people_over']);
       row.drive_min = moveMin;
-      if (moveKnown) row.route_at = moveDrive.at || null;
+      if (rowDrive) row.route_at = rowDrive.at || null;
       if (win) {
         row.startMin = win.start; row.endMin = win.end; row.time_source = 'supply_window';
         row.busyFrom = win.end;
@@ -1161,6 +1296,33 @@ export function planCrew(input, lib) {
     }
   }
 
+  // -- 073's ranges (CREW_LIMITS): a value outside them makes the server
+  // refuse the whole day, so the day would silently never draft. Never a
+  // wrong number: a box or coconut count too big for one row is left off the
+  // row (the crew words then say "the boxes"), and cars and people are capped,
+  // each with a red gap so Sidd splits the trip by hand.
+  for (const d of days.values()) {
+    for (const row of d.rows) {
+      const who = row.order_id ? crewClientLabel(ordersById.get(idOf(row.order_id))) : 'A box drop';
+      if (row.cars > CREW_LIMITS.cars) {
+        addGap(row, 'people_short', 'Needs ' + row.cars + ' cars; one row holds ' + CREW_LIMITS.cars + '. Split the trip by hand (Add row).');
+        row.cars = CREW_LIMITS.cars;
+      }
+      if (row.need > CREW_LIMITS.need) {
+        addGap(row, 'people_short', 'Needs ' + row.need + ' people; one row holds ' + CREW_LIMITS.need + '. Split the trip by hand (Add row).');
+        row.need = CREW_LIMITS.need;
+      }
+      if (row.boxes != null && row.boxes > CREW_LIMITS.boxes) {
+        addGap(row, 'count_disputed', capFirst(who) + ': ' + row.boxes + ' boxes is more than one row holds (' + CREW_LIMITS.boxes + '). Split it by hand (Add row).');
+        row.boxes = null;
+      }
+      if (row.coconuts != null && row.coconuts > CREW_LIMITS.coconuts) {
+        addGap(row, 'count_disputed', capFirst(who) + ': ' + row.coconuts + ' coconuts is more than one row holds (' + CREW_LIMITS.coconuts + '). Split it by hand (Add row).');
+        row.coconuts = null;
+      }
+    }
+  }
+
   // -- R11 who, R12 long day: per market, days in date order, rows in R13 order
   const r13 = (a, b) => {
     const sa = a.startMin, sb = b.startMin;
@@ -1202,12 +1364,14 @@ export function planCrew(input, lib) {
   // hc_crew_person_ok, as the put checks it: active, not locked, not in
   // never_schedule, not the App Review login, and a roster person's LIVE
   // market is the day's market (the owner's own row passes in any market).
+  // A blank live market is NO market (073 reads nullif(lower(btrim(market)),
+  // '')), never New York: fail closed.
   const rowEligible = (p, m) => {
     if (!p || p.active === false || p.locked === true) return false;
     if (p.worker_id && never.has(idOf(p.worker_id))) return false;
     if (trimText(p.email).toLowerCase() === CREW_APP_REVIEW_EMAIL) return false;
-    if (p.kind === 'roster') return String(p.role || '') === 'owner' || crewMarketKey(p.market) === m;
-    return p.kind === 'helper' && crewMarketKey(p.helper_market || p.market) === m;
+    if (p.kind === 'roster') return String(p.role || '') === 'owner' || crewLiveMarket(p.market) === m;
+    return p.kind === 'helper' && crewLiveMarket(p.helper_market || p.market) === m;
   };
   const marketsInPlay = [...new Set([...days.values()].map((d) => d.market))].sort();
   for (const m of marketsInPlay) {
@@ -1215,8 +1379,8 @@ export function planCrew(input, lib) {
       if (p.active === false || p.locked === true) return false;
       if (p.worker_id && never.has(idOf(p.worker_id))) return false;
       if (trimText(p.email).toLowerCase() === CREW_APP_REVIEW_EMAIL) return false;
-      if (p.kind === 'roster') return p.auto_pick === 'yes' && crewMarketKey(p.market) === m && p.has_login !== false && String(p.role || '') !== 'owner';
-      if (p.kind === 'helper') return p.auto_pick === 'ask' && crewMarketKey(p.helper_market || p.market) === m;
+      if (p.kind === 'roster') return p.auto_pick === 'yes' && crewLiveMarket(p.market) === m && p.has_login !== false && String(p.role || '') !== 'owner';
+      if (p.kind === 'helper') return p.auto_pick === 'ask' && crewLiveMarket(p.helper_market || p.market) === m;
       return false;
     });
     const poolIds = new Set(pool.map((p) => idOf(p.person_id)));
@@ -1340,7 +1504,7 @@ export function planCrew(input, lib) {
     settings: settings.version == null ? null : settings.version,
     rules: (inp.rules || []).filter(Boolean).map((r) => [crewMarketKey(r.market), String(r.key), r.version == null ? null : r.version, Number(r.value), r.confirmed === true]).sort((a, b) => (a.join('|') < b.join('|') ? -1 : 1)),
     sites: (inp.sites || []).filter((s) => s && s.id).map((s) => [idOf(s.id), s.version == null ? null : s.version]).sort(),
-    people: people.map((p) => [idOf(p.person_id), p.version == null ? null : p.version, p.locked === true, crewMarketKey(p.kind === 'helper' ? p.helper_market : p.market), p.active !== false]).sort(),
+    people: people.map((p) => [idOf(p.person_id), p.version == null ? null : p.version, p.locked === true, crewLiveMarket(p.kind === 'helper' ? p.helper_market : p.market), p.active !== false]).sort(),
     jobs: [...cards.keys()].map((id) => [id, cards.get(id).version == null ? null : cards.get(id).version]).sort(),
   };
   const jobFact = (j) => {
@@ -1358,7 +1522,7 @@ export function planCrew(input, lib) {
       people: row.people.map((p) => ({ person_id: p.person_id, car: p.car })), start: crewMinToHm(row.startMin), end: crewMinToHm(row.endMin),
       busy_from: crewMinToHm(row.busyFrom), busy_to: crewMinToHm(row.busyTo), when: row.when, time_source: row.time_source,
       leave_by: crewMinToHm(row.leaveMin), drive_min: row.drive_min, route_at: row.route_at, gaps: [...row.gapWords.keys()].sort(),
-      label: null, words: '', why: row.why && crewTextOk(row.why) ? row.why : null,
+      label: null, words: '', why: row.why && crewTextOk(row.why) && row.why.length <= 200 ? row.why : null,
     };
     t.words = crewWords(t, ctx);
     return t;
@@ -1370,7 +1534,7 @@ export function planCrew(input, lib) {
     siteLabel,
     personName,
     client: (id) => { const o = ordersById.get(idOf(id)); return o ? crewClientLabel(o) : 'the client'; },
-    arrivalMin: (t) => { const row = rowByKey.get(m + '|' + day + '|' + t.key); return row ? row._arrivalMin : null; },
+    unloadMin: unload(m),
     jobDayWords: (t) => { const o = ordersById.get(idOf(t.order_id)); return o ? crewDayWords(crewOrderDay(o), thisYear) : ''; },
     prepFacts: (t) => { const row = rowByKey.get(m + '|' + day + '|' + t.key); return row && row._job ? { cut: row._job.cut, branded: !!row._job.branded } : {}; },
     extraLabel: (t) => { const row = rowByKey.get(m + '|' + day + '|' + t.key); return row && row._extra ? (trimText(row._extra.label) || 'cart') : 'cart'; },
@@ -1405,6 +1569,10 @@ export function planCrew(input, lib) {
           ? (sd.approved_tasks || []).filter((t) => t && t.source !== 'owner').map((t) => [t.key, (t.people || []).map((p) => idOf(p.person_id))]) : null,
       },
       out: { tasks: tasks.map((t) => { const { words, why, route_at, ...rest } = t; return rest; }), gaps },
+      // The failed route tries are a fact of the day (they live only in the
+      // stored why line): a new try must be written, or the count never
+      // reaches 3 and red no_time never comes.
+      route_tries: d.rows.filter((r) => r._tries > 0).map((r) => [r.key, r._tries]),
     };
     const inputsMd5 = md5Hex(stableJson(facts));
     const today = todayOf(d.market);
@@ -1453,7 +1621,8 @@ export function crewReasons(approvedTasks, newTasks, gaps, ctx) {
   for (const [k, t] of after) {
     const b = before.get(k);
     if (!b) { add('New row: ' + (t.kind === 'deliver' ? 'delivery for ' + client(t.order_id) : t.kind.replace('_', ' ')) + '.'); continue; }
-    if (t.kind === 'deliver' && (b.start !== t.start || b.leave_by !== t.leave_by)) add('Delivery time now ' + (t.start ? crewClock(crewHmToMin(t.start), ctx.market) : 'not set') + '.');
+    if (t.kind === 'deliver' && b.start !== t.start) add('Delivery time now ' + (t.start ? crewClock(crewHmToMin(t.start), ctx.market) : 'not set') + '.');
+    else if (t.kind === 'deliver' && b.leave_by !== t.leave_by) add('Leave-by now ' + (t.leave_by ? crewClock(crewHmToMin(t.leave_by), ctx.market) : 'not set') + '.');
     if (b.boxes !== t.boxes) add(client(t.order_id) + ': ' + (t.boxes == null ? 'box count unknown' : plural(t.boxes, 'box', 'boxes')) + ' now.');
     if (stableJson(b.people) !== stableJson(t.people)) add('Crew changed for ' + (t.order_id ? client(t.order_id) : 'a box drop') + '.');
     if (b.from_site !== t.from_site || b.to_address !== t.to_address) add('Place changed for ' + (t.order_id ? client(t.order_id) : 'a box drop') + '.');
@@ -1491,7 +1660,7 @@ export function crewTomorrowSends(day, people, ordersById, timeOff, settings, th
     if (person.worker_id && never.has(idOf(person.worker_id))) continue;
     const email = trimText(person.email).toLowerCase();
     if (!email || email === CREW_APP_REVIEW_EMAIL) continue;
-    if (crewMarketKey(person.market) !== market) continue;
+    if (crewLiveMarket(person.market) !== market) continue; // a blank live market is no market
     if (person.worker_id && (timeOff || []).some((x) => x && x.status === 'approved' && idOf(x.worker_id) === idOf(person.worker_id)
       && String(x.start_day).slice(0, 10) <= planDay && String(x.end_day || x.start_day).slice(0, 10) >= planDay)) continue;
     const mine = tasks.filter((t) => (t.people || []).some((p) => idOf(p && p.person_id) === pid));

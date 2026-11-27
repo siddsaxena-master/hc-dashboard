@@ -20,15 +20,18 @@ let passed = 0;
 const pass = (m) => { passed++; console.log('PASS: ' + m); };
 
 // -- the contract file, pinned ---------------------------------------
-const VECTORS_SHA256 = 'b9887715a68e9ceb5d9ca739fb8e6c3dcaaa18f243b93f62af3078bb1b77d0ab';
+const VECTORS_SHA256 = '072030b2dfd165823149a0e0afd1523caf326323812896b68d987608e7745af1';
 const rawVectors = readFileSync(new URL('./test-vectors/crew-plan-cases.json', import.meta.url));
 assert.equal(createHash('sha256').update(rawVectors).digest('hex'), VECTORS_SHA256, 'crew-plan-cases.json must be the pinned copy, byte for byte');
 const V = JSON.parse(rawVectors.toString('utf8'));
 const WORKER_CASES = V.cases.filter((c) => c.packages.includes('worker'));
-assert.equal(WORKER_CASES.length, 97, 'the contract lists 97 worker cases');
-pass('vectors file is the pinned copy (sha256 b9887715...), 97 worker cases');
+assert.equal(WORKER_CASES.length, 100, 'the contract lists 100 worker cases');
+pass('vectors file is the pinned copy (sha256 072030b2...), 100 worker cases');
 
-const LIB = { parseArrivalTime: W.parseArrivalTime, leaveByMs: W.leaveByMs, routeSanity: W.routeSanity, marketZone: W.marketZone };
+// The robot's own library (CREW_LIB), so the tests plan with exactly what
+// runCrewPlanScan passes (departureDestination included).
+const LIB = W.CREW_LIB;
+assert.deepEqual(Object.keys(LIB).sort(), ['departureDestination', 'leaveByMs', 'marketZone', 'parseArrivalTime', 'routeSanity']);
 const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 const APP_REVIEW = 'appreview@hamptonscoconuts.com';
 
@@ -306,7 +309,7 @@ const distM = (a, b) => { const R = 6371000, r = (x) => x * Math.PI / 180; const
 function crewWorld(state, opts = {}) {
   const rows = state.rows;
   rows.crew_plan_days = rows.crew_plan_days || [];
-  const calls = [], puts = [], runLogs = [], geoPuts = [], queue = [], rpc = {};
+  const calls = [], puts = [], runLogs = [], geoPuts = [], queue = [], rpc = {}, refused = [];
   const apple = { token: 0, geocode: 0, directions: 0, etas: 0 };
   const settings = () => ({ mode: 'off', notify: false, manager_can_approve: false, never_schedule: [], version: 1, ...state.settings });
   const todayOf = (m) => crew.crewDayInZone(Date.now(), W.marketZone(m));
@@ -338,9 +341,48 @@ function crewWorld(state, opts = {}) {
     const pi = plannerInput(state, { whole: opts.whole !== false });
     return { ...base, rules: pi.rules, sites: pi.sites, people: pi.people, jobs: pi.jobs, days: pi.days.filter((d) => d.day >= b.p_from && d.day <= b.p_to), time_off: pi.time_off, message: null };
   };
+  // 073's put checks, mirrored from hc_crew_plan_put and hc_crew_task_norm
+  // (an independent copy, not the robot's code): one value out of range, a
+  // text over its limit or failing the word check, refuses the WHOLE day.
+  const sqlTextOk = (v, max) => typeof v === 'string' && v.length >= 1 && v.length <= max && !/[@$]/.test(v)
+    && !/\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}/.test(v) && !/[0-9]{7,}/.test(v) && !/http/i.test(v)
+    && !/[\u0000-\u001f\u007f]/.test(v) && !/\b(weee|billed)\b/i.test(v);
+  const intIn = (v, lo, hi) => v == null || (Number.isInteger(v) && v >= lo && v <= hi);
+  const putRefusal = (b) => {
+    if (!['ny', 'vegas', 'miami', 'la'].includes(b.p_market)) return 'Some details are not valid. Nothing changed.';
+    if (!Array.isArray(b.p_tasks) || b.p_tasks.length > 40 || (b.p_reasons || []).length > 10) return 'Some details are not valid. Nothing changed.';
+    for (const r of b.p_reasons || []) if (!sqlTextOk(r, 200)) return 'Some words are not allowed: no @, $, phone numbers, long numbers or links.';
+    for (const t of b.p_tasks) {
+      if (!intIn(t.boxes, 0, 500) || !intIn(t.coconuts, 0, 5000) || !intIn(t.cars, 0, 6) || !intIn(t.need, 0, 8) || !intIn(t.drive_min, 0, 1440)) return 'Some details are not valid. Nothing changed.';
+      if ((t.people || []).length > 8) return 'Some details are not valid. Nothing changed.';
+      if ((t.to_address != null && !sqlTextOk(t.to_address, 200)) || (t.why != null && !sqlTextOk(t.why, 200))) return 'Some words are not allowed: no @, $, phone numbers, long numbers or links.';
+    }
+    for (const g of b.p_gaps || []) if (!sqlTextOk(g.words, 300)) return 'Some words are not allowed: no @, $, phone numbers, long numbers or links.';
+    return null;
+  };
+  // 073's request key rule (072's request_key plus args md5): the same key
+  // with the same arguments replays the first answer; with other arguments
+  // it is refused.
+  // The key memory lives on the state, so it survives from one run to the next.
+  if (!(state.__putKeys instanceof Map)) Object.defineProperty(state, '__putKeys', { value: new Map(), enumerable: false, writable: true, configurable: true });
+  const keys = state.__putKeys;
+  let offPuts = opts.offPuts || 0;
+  const putReply = (b) => {
+    const { p_request_key, ...args } = b;
+    const argsText = JSON.stringify(args);
+    const prev = keys.get(p_request_key);
+    if (prev) return prev.args === argsText ? [200, { ...prev.reply, repeat: true }] : [400, { code: '22023', message: 'That request key was already used for something else. Nothing changed.' }];
+    const refusal = putRefusal(b);
+    if (refusal) return [400, { code: '22023', message: refusal }];
+    const reply = applyPut(b);
+    keys.set(p_request_key, { args: argsText, reply });
+    return [200, reply];
+  };
   const applyPut = (b) => {
     const s = settings();
     const out = (code, message, d) => ({ v: 1, code, message, repeat: false, market: b.p_market, day: b.p_day, status: d ? d.status : null, version: d ? d.version : null, inputs_md5: d ? d.inputs_md5 : null });
+    // offPuts: the database mode was pasted off between the inputs read and the put.
+    if (offPuts > 0) { offPuts--; return out('off', 'The crew plan is off. Nothing was saved.', null); }
     if (s.mode === 'off') return out('off', 'The crew plan is off. Nothing was saved.', null);
     if (b.p_day < todayOf(b.p_market)) return out('frozen', 'That day is over. Nothing was saved.', null);
     let i = rows.crew_plan_days.findIndex((x) => x.market === b.p_market && x.plan_day === b.p_day);
@@ -393,8 +435,11 @@ function crewWorld(state, opts = {}) {
     } else if (table === 'coconut_supply_orders') {
       out = (rows.coconut_supply_orders || []).filter((r) => r.status === 'confirmed' || r.status === 'claimed');
     } else if (table === 'hc_calendar_findings') {
-      const ids = inList(q.get('order_id')) || [];
-      out = (rows.hc_calendar_findings || []).filter((f) => ids.includes(f.order_id) && (f.status === 'open' || f.status === 'still_on'));
+      // or=(order_id.in.(...),qbo_id.in.(...)) or the plain order_id filter.
+      const or = q.get('or') || '';
+      const ids = or ? ((/order_id\.in\.\(([^)]*)\)/.exec(or) || [])[1] || '').split(',').filter(Boolean) : (inList(q.get('order_id')) || []);
+      const qbos = or ? ((/qbo_id\.in\.\(([^)]*)\)/.exec(or) || [])[1] || '').split(',').filter(Boolean) : [];
+      out = (rows.hc_calendar_findings || []).filter((f) => (ids.includes(f.order_id) || (f.qbo_id != null && qbos.includes(String(f.qbo_id)))) && (f.status === 'open' || f.status === 'still_on'));
     } else if (table === 'order_time_proposals') {
       const ids = inList(q.get('order_id')) || [];
       out = (rows.order_time_proposals || []).filter((p) => ids.includes(p.order_id) && (p.status || 'pending') === 'pending');
@@ -429,7 +474,7 @@ function crewWorld(state, opts = {}) {
       rpc[name] = (rpc[name] || 0) + 1;
       if (opts.missingRpc) return reply(404, { code: 'PGRST202', message: 'not found' });
       if (name === 'hc_crew_plan_inputs') return reply(200, inputsReply(body));
-      if (name === 'hc_crew_plan_put') { puts.push(clone(body)); return reply(200, applyPut(body)); }
+      if (name === 'hc_crew_plan_put') { puts.push(clone(body)); const [st, data] = putReply(body); if (st !== 200) refused.push({ body: clone(body), data }); return reply(st, data); }
       if (name === 'hc_crew_run_log') { runLogs.push(clone(body)); return reply(200, { v: 1, code: 'done', message: 'Logged.', repeat: false, id: runLogs.length }); }
       if (name === 'hc_crew_site_geo_put') {
         geoPuts.push(clone(body));
@@ -454,7 +499,7 @@ function crewWorld(state, opts = {}) {
     return { kind: p.body.kind, person_id: person ? person.id : null, to: workers.length && workers.every((w) => w && w.role === 'owner') ? 'owner' : null, id: row.id,
       title: p.aps.alert.title, body: p.aps.alert.body, thread_id: p.aps['thread-id'] || null, collapse_id: p.headers.collapse_id, time_sensitive: p.aps['interruption-level'] === 'time-sensitive', tokens: p.tokens };
   });
-  return { calls, puts, runLogs, geoPuts, queue, rpc, apple, sends, restore: () => { globalThis.fetch = original; } };
+  return { calls, puts, refused, runLogs, geoPuts, queue, rpc, apple, sends, restore: () => { globalThis.fetch = original; } };
 }
 async function scan(state, opts = {}) {
   const w = crewWorld(state, opts);
@@ -585,7 +630,7 @@ const DAY_KEYS = ['tasks', 'gaps', 'red_count', 'amber_count'];
   const state = resolveCase(c);
   const pi = plannerInput(state);
   c.input = expandTasks(c.input);
-  const got = c.input.words_from.map((x) => crew.crewWordsFor(x.task, x.market, { now: state.now, sites: pi.sites, people: pi.people, orders: pi.orders, jobs: pi.jobs, proposals: pi.proposals, held: x.held === true }, LIB));
+  const got = c.input.words_from.map((x) => crew.crewWordsFor(x.task, x.market, { now: state.now, sites: pi.sites, people: pi.people, orders: pi.orders, jobs: pi.jobs, rules: pi.rules, held: x.held === true }, LIB));
   assert.deepEqual(got, c.expected.words);
   for (const s of got) assert.ok(crew.crewTextOk(s), 'WORDS-01: words pass the word check: ' + s);
   pass('WORDS-01: singular box, no time, no address, count unknown, an owner row, Vegas PT, the held constant, all from structured fields');
@@ -849,6 +894,303 @@ for (const id of ['NOTICE-04', 'NOTICE-05', 'NOTICE-06', 'NOTICE-07']) {
   assert.ok(w.rpc.hc_crew_plan_put >= 5, 'and wrote the drafts');
   assert.equal(w.rpc.hc_crew_run_log, 1);
   pass('cron wiring: wrangler.toml lists 4 crons, and the "17 * * * *" tick runs runCrewPlanScan only (inputs once, drafts, one run log)');
+}
+
+// -- 4. the 2026-11-27 review fixes (package C) ---------------------
+// Each block names its finding; each failed on the code before its fix
+// (see the PR for the before and after runs).
+const O_P = '73d00000-0000-4000-8000-000000000003';
+const HALL = 'Test Hall, 9 Test Ave, New York, NY 10001';
+const planOf = (s, opts) => crew.planCrew(plannerInput(s, opts), LIB);
+const deliverOf = (d) => d && d.tasks.find((t) => t.kind === 'deliver');
+{
+  // C-S1 / C-1: the departure plan re-routes with live traffic (hourly from
+  // 30 hours out). An APPROVED garage-start day keeps its own drive time, so
+  // a 1, 7 or 16 minute drift makes no proposal (no "plan changed" banner,
+  // no "Your Sat changed" for the crew). A DRAFT keeps its drive while the
+  // live drive is within 10 minutes, then follows it.
+  const base = () => {
+    const s = resolveFixture('small_clean');
+    s.rows.order_departures = [{ order_id: O_P, plan_date: '2026-12-03', market: 'ny', origin_kind: 'garage', dest_address: HALL, drive_seconds: 2710, has_ferry: false, computed_at: '2026-11-27T00:30:00Z', state: 'planned' }];
+    return s;
+  };
+  const d0 = findDay(planOf(base()), 'ny', '2026-12-03');
+  const del0 = deliverOf(d0);
+  assert.equal(del0.drive_min, 46, 'drive_min is the drive in whole minutes ROUNDED UP (2710 s is 46, never 45)');
+  assert.equal(del0.leave_by, '08:14', "leave_by is the alarm's own: 10:00 AM - 60 min - 45.2 min, floored to the minute");
+  assert.equal(del0.start, '07:55', 'start = leave_by - 15 min load, rounded DOWN to 5 minutes');
+  for (const status of ['approved', 'draft']) {
+    for (const secs of [2790, 3150, 3700]) {
+      const s = base();
+      s.rows.crew_plan_days = [{ market: 'ny', plan_day: '2026-12-03', status, tasks: clone(d0.tasks), gaps: clone(d0.gaps), red_count: d0.red_count, amber_count: d0.amber_count,
+        inputs_md5: d0.inputs_md5, version: 2, approved_version: status === 'approved' ? 1 : 0 }];
+      s.rows.order_departures[0].drive_seconds = secs;
+      const d = findDay(planOf(s), 'ny', '2026-12-03');
+      const keeps = status === 'approved' || Math.abs(Math.ceil(secs / 60) - 46) < crew.CREW_DRIFT_MINUTES;
+      if (keeps) {
+        assert.equal(d.put, false, status + ' day, departure drive ' + secs + ' s: no put');
+        assert.equal(JSON.stringify(d.tasks), JSON.stringify(d0.tasks), status + ' day, drive ' + secs + ' s: byte-identical rows');
+      } else {
+        assert.equal(d.put, true, 'a draft follows a drift of 10 minutes or more');
+        assert.deepEqual([deliverOf(d).drive_min, deliverOf(d).leave_by, deliverOf(d).start], [62, '07:58', '07:40']);
+      }
+    }
+  }
+  // The same through the robot: an approved day with a drifted departure row gets no put at all.
+  const s = base();
+  s.rows.crew_plan_days = [{ market: 'ny', plan_day: '2026-12-03', status: 'approved', tasks: clone(d0.tasks), gaps: clone(d0.gaps), red_count: d0.red_count, amber_count: d0.amber_count,
+    inputs_md5: d0.inputs_md5, version: 2, approved_version: 1 }];
+  for (const [secs, iso] of [[2790, '2026-11-27T01:58:00Z'], [3150, '2026-11-27T02:58:00Z'], [3700, '2026-11-27T03:58:00Z']]) {
+    s.rows.order_departures[0].drive_seconds = secs;
+    const { w } = await scan(s, { now: iso });
+    assert.ok(!w.puts.some((p) => p.p_day === '2026-12-03'), 'robot run at ' + iso + ': the approved day gets no put');
+  }
+  assert.equal(s.rows.crew_plan_days[0].status, 'approved', 'the day never flips to changed');
+  // A reason that names what really moved: only the leave-by, not the start.
+  const before = [{ ...del0 }];
+  const after = [{ ...del0, leave_by: '08:10' }];
+  const liveOrders = new Map(plannerInput(base()).orders.map((o) => [o.id, o]));
+  assert.deepEqual(crew.crewReasons(before, after, [], { market: 'ny', day: '2026-12-03', ordersById: liveOrders, personName: () => 'Ana', thisYear: '2026' }), ['Leave-by now 8:10 AM.']);
+  pass('C-S1/C-1: an approved garage-start day keeps its drive time through 1, 7 and 16 minutes of traffic drift (no put, no proposal, byte-identical rows); a draft keeps it inside 10 minutes; drive_min is rounded up and starts round down to 5 minutes');
+}
+{
+  // C-S3: an address with no state, zip or known town ("Test Hall") is never
+  // routed (the departure plan's own test): red no_address with plain words,
+  // no route_pending, no route asked, never a geocoder's guess. The words
+  // still name the place and the confirmed arrival.
+  const s = resolveFixture('small_clean');
+  s.rows.orders[0] = { ...s.rows.orders[0], delivery_notes: null, venue: 'Test Hall' };
+  s.rows.route_answers = [];
+  const plan = planOf(s);
+  const del = deliverOf(findDay(plan, 'ny', '2026-12-03'));
+  assert.equal(del.to_address, 'Test Hall');
+  assert.deepEqual(del.gaps, ['no_address']);
+  assert.equal(del.start, null); assert.equal(del.busy_from, null); assert.equal(del.busy_to, '10:30');
+  assert.ok(del.words.endsWith('Deliver to Client P at Test Hall. Arrive by 10:00 AM.'), del.words);
+  assert.ok(findDay(plan, 'ny', '2026-12-03').gaps.some((g) => g.code === 'no_address' && /not complete enough/.test(g.words)));
+  assert.ok(!plan.routeNeeds.some((n) => n.to_address === 'Test Hall'), 'no route is asked for');
+  const { w } = await scan(s, { apple: true, anyRoute: true });
+  assert.ok(!w.calls.some((c) => c.url.includes('maps-api.apple.com') && /Test(\+|%20)Hall(&|$)/.test(c.url)), 'the router never sees "Test Hall"');
+  pass('C-S3: "Test Hall" alone is never routed: red no_address ("not complete enough"), no route_pending, no route call; the words still say where and when');
+}
+{
+  // C-S4: the failed try count reaches 3. A never-routable address: tries 1
+  // and 2 are written (the count is a fact of the day), the third is red
+  // no_time with no more route calls, and a day after the last try the
+  // route is tried again (an outage never leaves a job red for good).
+  const s = resolveFixture('setup');
+  const OA = '73d00000-0000-4000-8000-000000000301';
+  s.rows.orders = [{ id: OA, client_name: 'Client A', market: 'ny', stage: 'paid_full', coconuts_qty: 45, delivery_at_utc: '2026-12-02T00:00:00+00:00', event_start_at: '2026-12-02T00:00:00+00:00',
+    delivery_notes: 'Nowhere Hall, 1 Lost Rd, Nowhere, NY 12999', stamp_status: 'not_needed', external_invoice_id: '901', delivery_request: { status: 'confirmed', window: '10:00 AM', date: '2026-12-02', source: 'owner' } }];
+  s.rows.coconut_supply_orders = [{ id: 7399, supplier: 'weee', delivery_date: '2026-11-30', delivery_window: 'Arrival 10:00 AM - 06:00 PM', market: 'ny', ship_to_garage: true, boxes: 30, status: 'confirmed', source: 'weee_email', recorded_by: 'poller' }];
+  s.rows.crew_jobs = [{ order_id: OA, stage: 'never', prep: 'skip', branding: 'auto', extras: [], on_site: [], version: 1 }];
+  const seen = [];
+  for (const iso of ['2026-11-27T00:58:00Z', '2026-11-27T01:58:00Z', '2026-11-27T02:58:00Z', '2026-11-27T03:58:00Z', '2026-11-28T03:17:00Z']) {
+    const { w, counts } = await scan(s, { apple: true, now: iso });
+    const put = w.puts.find((p) => p.p_day === '2026-12-02');
+    const del = put ? put.p_tasks.find((t) => t.kind === 'deliver') : null;
+    seen.push([counts.routes, del ? del.gaps.filter((g) => g === 'no_time' || g === 'route_pending').join('+') : 'no put', del ? (/Route tries: (\d)\./.exec(del.why || '') || [])[1] || '-' : '-']);
+  }
+  assert.deepEqual(seen, [[1, 'route_pending', '1'], [1, 'route_pending', '2'], [1, 'no_time', '3'], [0, 'no put', '-'], [1, 'route_pending', '1']]);
+  pass('C-S4: a never-routable trip goes route_pending (try 1, try 2, each written) to red no_time after the 3rd try, makes no more calls, and is tried again a day later');
+}
+{
+  // C-S5 / C-2 (the worker half; the database half is the contract PUT-11):
+  // with the stored day states sent whole, every timed job gets its start
+  // within two runs; with the strict 12-key shape the robot never invents
+  // one (the trips it cannot remember stay amber route_pending).
+  const five = () => {
+    const s5 = resolveFixture('setup');
+    const addresses = ['Test Hall, 9 Test Ave, New York, NY 10001', 'Test Loft, 5 Test St, New York, NY 10002', 'Test Dock, 7 Test Pl, New York, NY 10014', 'Test Pier, 1 Test Pier, New York, NY 10011', 'Test Yard, 2 Test Ct, New York, NY 10003'];
+    s5.rows.orders = addresses.map((a, i) => ({ id: '73d00000-0000-4000-8000-0000000003' + String(i).padStart(2, '0'), client_name: 'Client ' + 'ABCDE'[i], market: 'ny', stage: 'paid_full', coconuts_qty: 45, delivery_at_utc: '2026-12-0' + (i % 3 + 1) + 'T00:00:00+00:00', delivery_notes: a, stamp_status: 'not_needed', external_invoice_id: '9' + i, delivery_request: { status: 'confirmed', window: '10:00 AM', date: '2026-12-0' + (i % 3 + 1), source: 'owner' } }));
+    s5.rows.coconut_supply_orders = [{ id: 7399, supplier: 'weee', delivery_date: '2026-11-28', delivery_window: 'Arrival 10:00 AM - 06:00 PM', market: 'ny', ship_to_garage: true, boxes: 30, status: 'confirmed', source: 'weee_email', recorded_by: 'poller' }];
+    s5.rows.crew_jobs = s5.rows.orders.map((o) => ({ order_id: o.id, stage: 'never', prep: 'skip', branding: 'auto', extras: [], on_site: [], version: 1 }));
+    return s5;
+  };
+  for (const whole of [true, false]) {
+    const s5 = five();
+    for (const iso of ['2026-11-27T00:58:00Z', '2026-11-27T01:58:00Z']) await scan(s5, { apple: true, anyRoute: true, whole, now: iso });
+    const dels = s5.rows.crew_plan_days.flatMap((d) => d.tasks).filter((t) => t.kind === 'deliver');
+    assert.equal(dels.length, 5);
+    if (whole) assert.equal(dels.filter((t) => t.start).length, 5, 'days sent whole: all 5 timed by the second run');
+    else {
+      assert.ok(dels.every((t) => (t.start && t.drive_min != null) || (!t.start && t.gaps.includes('route_pending'))), 'strict shape: a start only with a drive time, else amber route_pending');
+    }
+  }
+  pass('C-S5/C-2 (worker half): with whole day states all 5 timed jobs get a start in two runs; with the strict shape nothing is guessed (route_pending stays amber until P1 sends the days whole)');
+}
+{
+  // C-M1 / C-5: values 073 refuses are never sent. 1400 coconuts (7 cars),
+  // 5200 coconuts (578 boxes), a 600-box drop and a 232-character address:
+  // the fake put (073's own checks) refuses nothing, and every row is in range.
+  const s = resolveFixture('small_clean');
+  const O2 = '73d00000-0000-4000-8000-000000000402', O3 = '73d00000-0000-4000-8000-000000000403';
+  const longNotes = 'Test Hall, ' + 'Suite 9 Test Ave, '.repeat(12) + 'New York, NY 10001';
+  assert.ok(longNotes.length > 200);
+  s.rows.orders[0] = { ...s.rows.orders[0], coconuts_qty: 1400 };
+  s.rows.orders.push({ ...s.rows.orders[0], id: O2, client_name: 'Client Q', coconuts_qty: 5200, external_invoice_id: '97402', delivery_at_utc: '2026-12-04T00:00:00+00:00', event_start_at: '2026-12-04T00:00:00+00:00' });
+  s.rows.orders.push({ ...s.rows.orders[0], id: O3, client_name: 'Client R', coconuts_qty: 45, external_invoice_id: '97403', delivery_notes: longNotes, delivery_at_utc: '2026-12-02T00:00:00+00:00', event_start_at: '2026-12-02T00:00:00+00:00' });
+  s.rows.coconut_supply_orders.push({ id: 7398, supplier: 'weee', delivery_date: '2026-11-29', delivery_window: 'Arrival 10:00 AM - 06:00 PM', market: 'ny', ship_to_garage: true, boxes: 600, status: 'confirmed', source: 'weee_email', recorded_by: 'poller' });
+  const plan = planOf(s);
+  const all = plan.days.flatMap((d) => d.tasks);
+  for (const t of all) {
+    for (const [k, max] of Object.entries(crew.CREW_LIMITS)) assert.ok(t[k] == null || t[k] <= max, t.key + ' ' + k + ' ' + t[k] + ' is within 073\'s range');
+    assert.ok(t.to_address == null || t.to_address.length <= 200);
+  }
+  for (const d of plan.days) for (const g of d.gaps) assert.ok(g.words.length <= 300 && crew.crewTextOk(g.words), 'gap words fit 073');
+  const big = deliverOf(findDay(plan, 'ny', '2026-12-03'));
+  assert.equal(big.cars, 6); assert.ok(big.gaps.includes('people_short'));
+  assert.ok(findDay(plan, 'ny', '2026-12-03').gaps.some((g) => g.code === 'people_short' && g.words === 'Needs 7 cars; one row holds 6. Split the trip by hand (Add row).'));
+  const huge = deliverOf(findDay(plan, 'ny', '2026-12-04'));
+  assert.equal(huge.boxes, null); assert.equal(huge.coconuts, null); assert.ok(huge.gaps.includes('count_disputed'));
+  assert.ok(huge.words.includes('pick up the boxes'), 'never a wrong number in the crew words');
+  const far = deliverOf(findDay(plan, 'ny', '2026-12-02'));
+  assert.equal(far.to_address, null);
+  assert.ok(findDay(plan, 'ny', '2026-12-02').gaps.some((g) => g.code === 'no_address' && /longer than 200 characters/.test(g.words)));
+  const moved = all.find((t) => t.key === 'move:7398');
+  assert.ok(moved && moved.boxes === null && moved.gaps.includes('count_disputed'), 'the 600-box drop moved to cold storage is left off the row with a red flag');
+  const s2 = resolveFixture('setup');
+  s2.rows.orders = [];
+  s2.rows.coconut_supply_orders = [{ ...s.rows.coconut_supply_orders.find((r) => r.id === 7398) }];
+  const recv = planOf(s2).days.flatMap((d) => d.tasks).find((t) => t.key === 'receive:7398');
+  assert.ok(recv && recv.boxes === null && recv.gaps.includes('count_disputed'), 'a 600-box drop to check in is left off the row with a red flag');
+  const { w, counts } = await scan(s);
+  assert.deepEqual(w.refused, [], 'the fake 073 put refuses nothing');
+  assert.equal(counts.failed, 0);
+  pass('C-M1/C-5: 7 cars, 578 boxes, a 600-box drop and a 232-character address never reach the put: capped or left off with red gaps; 073\'s own range checks refuse nothing');
+}
+{
+  // C-M2: a booked order whose market is "other" (not one of the four crew
+  // markets) makes no plan day and no put (073 refuses p_market other).
+  const s = resolveFixture('small_clean');
+  s.rows.orders.push({ id: '73d00000-0000-4000-8000-0000000000e1', client_name: 'Client E', market: 'other', stage: 'invoiced', coconuts_qty: 60,
+    delivery_at_utc: '2026-12-02T00:00:00+00:00', delivery_notes: 'Test Barn, 4 Test Rd, Testtown, IL 60000', external_invoice_id: '9501', stamp_status: 'not_needed' });
+  assert.ok(!planOf(s).days.some((d) => d.market === 'other'));
+  const { w } = await scan(s);
+  assert.ok(!w.puts.some((p) => p.p_market === 'other'));
+  assert.deepEqual(w.refused, []);
+  pass('C-M2: a booked order in market "other" makes no day and no put the server would refuse every hour');
+}
+{
+  // C-M3: a blank field_workers.market is no market (as 073 reads it), never
+  // New York: nobody with a blank market is picked or sent crew_tomorrow.
+  const s = resolveFixture('small_clean');
+  for (const fw of s.rows.field_workers) if (fw.role !== 'owner') fw.market = '';
+  const plan = planOf(s);
+  const roster = new Set(s.rows.crew_people.filter((p) => p.kind === 'roster').map((p) => p.id));
+  assert.ok(!plan.days.flatMap((d) => d.tasks).some((t) => t.people.some((p) => roster.has(p.person_id))), 'no roster person with a blank market is on a row');
+  const { w } = await scan(s);
+  assert.deepEqual(w.refused, [], 'and so no put is refused for "works in another market"');
+  const people = peopleView(s);
+  const day = { market: 'ny', day: '2026-12-03', status: 'approved', approved_version: 1, approved_tasks: [{ ...V.named_tasks.T_P_DEL, people: [{ person_id: '73b00000-0000-4000-8000-000000000002', car: 1 }] }] };
+  assert.deepEqual(crew.crewTomorrowSends(day, people, new Map(), [], s.settings, '2026'), [], 'a blank-market person gets no crew_tomorrow');
+  pass('C-M3: a roster person whose live market is blank is never planned and never sent crew_tomorrow (fail closed, like 073)');
+}
+{
+  // C-M4: a calendar finding keyed only by day 1's invoice ('<code>:qbo:<id>')
+  // still flags the job: the robot reads by order ids AND invoice ids.
+  const s = resolveFixture('small_clean');
+  s.rows.hc_calendar_findings = [{ id: 9101, order_id: null, qbo_id: '97303', code: 'day_link', status: 'open' }, { id: 9102, order_id: null, qbo_id: '97303', code: 'count_differs', status: 'still_on' }];
+  const del = deliverOf(findDay(planOf(s), 'ny', '2026-12-03'));
+  assert.ok(del.gaps.includes('calendar_check') && del.gaps.includes('count_disputed'), del.gaps.join(','));
+  const { w } = await scan(s);
+  const read = w.calls.find((c) => c.url.includes('/hc_calendar_findings?'));
+  assert.ok(read && decodeURIComponent(read.url).includes('qbo_id.in.(97303)'), 'the findings read names day 1\'s invoice');
+  const put = w.puts.find((p) => p.p_day === '2026-12-03');
+  assert.ok(put.p_tasks.find((t) => t.kind === 'deliver').gaps.includes('calendar_check'));
+  pass('C-M4: an invoice-keyed calendar finding reaches the plan (read by order ids and invoice ids, mapped to day 1): red calendar_check and count_disputed');
+}
+{
+  // C-M5: the request key covers the run and the payload. A put answered
+  // "off" (the database mode pasted off between the read and the put) is
+  // not replayed as "off" next run: the next run writes the day.
+  const s = resolveFixture('small_clean');
+  const first = await scan(s, { offPuts: 99 });
+  assert.ok(first.w.puts.length >= 1 && first.counts.off === first.w.puts.length, 'run 1: every put answered off');
+  assert.equal(s.rows.crew_plan_days.length, 0);
+  const second = await scan(s, { now: '2026-11-27T01:58:00Z' });
+  assert.ok(second.counts.written >= 1, 'run 2: the days are written, not replayed as off');
+  assert.ok(!second.w.puts.some((p) => first.w.puts.some((q) => q.p_request_key === p.p_request_key)), 'run 2 sends new request keys');
+  assert.deepEqual(second.w.refused, []);
+  pass('C-M5: a put answered "off" mid run is written on the next run (new request key per run and payload), never replayed or refused');
+}
+{
+  // C-6: the robot's own second lock, alone. If the database ever sent a
+  // never_schedule worker or the App Review login with locked false, the
+  // robot still never picks them (R11-01's people, unlocked by hand).
+  const c = caseById('R11-01');
+  const pi = plannerInput(resolveCase(c));
+  pi.people = pi.people.map((p) => ({ ...p, locked: false, lock_reason: null }));
+  const tasks = crew.planCrew(pi, LIB).days.flatMap((d) => d.tasks);
+  for (const p of c.expected.never_people) assert.ok(!tasks.some((t) => t.people.some((x) => x.person_id === p)), 'never ' + p);
+  assert.ok(tasks.some((t) => t.people.length), 'someone else is still planned');
+  pass('C-6: with locked false from the database, the robot still never picks the never_schedule worker or the App Review login');
+}
+{
+  // C-9: the 4 PM nudge in practice says practice (crew get nothing even
+  // after an approval there).
+  const c = caseById('NOTICE-07');
+  const s = resolveCase(c);
+  s.settings = { ...s.settings, mode: 'practice' };
+  const { w } = await scan(s);
+  const nudge = w.sends().find((x) => x.kind === 'crew_owner');
+  assert.equal(nudge && nudge.body, "Tomorrow's crew plan is not approved. Practice: crew get nothing yet.");
+  pass('C-9: in practice the 4 PM nudge says "Practice: crew get nothing yet." (mode on keeps the contract words)');
+}
+{
+  // C-3 (the robot half): a deliver row with a known arrival keeps
+  // busy_to = arrival + unload even without a start (busy_from null, so no
+  // clash), and the words read the arrival from the row's fields like 073's
+  // hc_crew_words. A crew start with no drive time yet shows its start only.
+  const s = resolveFixture('small_clean');
+  s.rows.route_answers = [];
+  s.rows.crew_jobs = [{ order_id: O_P, stage: 'never', prep: 'skip', branding: 'auto', crew_start: '06:00', extras: [], on_site: [], version: 1 }];
+  const del = deliverOf(findDay(planOf(s), 'ny', '2026-12-03'));
+  assert.deepEqual([del.start, del.busy_from, del.busy_to, del.leave_by], ['06:00', '06:00', '10:30', null]);
+  assert.ok(!del.words.includes('Arrive by'), del.words);
+  assert.equal(crew.crewTaskArrivalMin(del, 30), null);
+  assert.equal(crew.crewTaskArrivalMin({ kind: 'deliver', busy_from: null, busy_to: '10:30', leave_by: null }, 30), 600);
+  assert.equal(crew.crewTaskArrivalMin({ kind: 'deliver', busy_from: '08:00', busy_to: '10:30', leave_by: '08:15' }, 30), 600);
+  assert.equal(crew.crewTaskArrivalMin({ kind: 'deliver', busy_from: '06:00', busy_to: '08:00', leave_by: null }, 30), null, 'a crew start with no arrival never reads as one');
+  pass('C-3 (robot half): the arrival rides in busy_to (no busy_from without a start); words read it from the row like 073 does; a crew start alone never reads as an arrival');
+}
+{
+  // The word check matches 073's hc_crew_text_ok: the supplier's name and
+  // "billed" fail it too (073 refuses the whole day on them).
+  assert.equal(crew.crewTextOk('Weee drop at 10'), false);
+  assert.equal(crew.crewTextOk('Not billed'), false);
+  assert.equal(crew.crewTextOk('Billedge Rd'), true, 'whole words only');
+  assert.equal(crew.crewCleanAddress('Test Hall,  9 Test Ave,\n New York, NY 10001'), HALL, 'whitespace runs collapse');
+  assert.equal(crew.crewCleanAddress('Test Hall, 9 Test Ave, New York, NY 10001, call 212-555-0100'), HALL);
+  assert.equal(crew.crewCleanAddress('x'.repeat(201)), null, 'over 200 characters is none');
+  pass('the word check and the Navigate address rule match 073 (supplier and billed refused, whitespace collapsed, phone parts dropped, 200-character limit)');
+}
+{
+  // C-S6 / C-4, READ-12 (sql + worker): the hold check reads the live
+  // Navigate address with the same rule the robot stores it by, so a double
+  // space, a line break and a tab, or a part that fails the word check never
+  // read as a new address; a real change still does. The SQL twin runs the
+  // same steps through hc_crew_plan_read.
+  const c = caseById('READ-12');
+  const state = resolveCase(c);
+  const layers = (expandTasks(c.input).then) || [];
+  const steps = [{ layer: null, replies: c.expected.replies }, ...layers.map((layer, i) => ({ layer, replies: c.expected.then[i].replies }))];
+  let checked = 0;
+  for (const step of steps) {
+    if (step.layer) applyLayer(state, step.layer);
+    const pi = plannerInput(state);
+    const ordersById = new Map(pi.orders.map((o) => [o.id, o]));
+    for (const dc of step.replies[0].day_checks) {
+      const day = pi.days.find((d) => d.market === dc.market && d.day === dc.day);
+      for (const [key, want] of Object.entries(dc.task_hold_reason)) {
+        const t = day.approved_tasks.find((x) => x.key === key);
+        assert.equal(crew.crewHeldReason(t, dc.day, ordersById), want, 'READ-12 ' + key + ' with notes ' + JSON.stringify(ordersById.get(t.order_id).delivery_notes));
+        checked++;
+      }
+    }
+  }
+  assert.equal(checked, 4);
+  pass('READ-12 (C-S6/C-4): the hold check normalizes the live Navigate address like the stored one: extra spaces, a line break, a tab or a $ part are not "On hold"; a new address is');
 }
 
 console.log('\n' + passed + ' crew plan checks passed. Fake network only: no database, no Apple, no Telegram, no phone.');
